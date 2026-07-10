@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
 import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { assertSupportedPiVersion, PiVersionError } from './version.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -129,6 +130,19 @@ export class PiRpcProcess {
   static async spawn(params: SpawnParams): Promise<PiRpcProcess> {
     // On Windows, npm commonly creates pi.cmd / pi.bat launcher scripts.
     const cmd = getPiCommand(params.piCommand)
+
+    // Fail closed on unsupported/unknown pi versions before spawning the RPC
+    // subprocess (see MIN_PI_VERSION): the ACP prompt lifecycle depends on
+    // pi's `agent_settled` event. Launch failures return null here and are
+    // surfaced by the detailed spawn error handling below instead.
+    try {
+      assertSupportedPiVersion(cmd)
+    } catch (e) {
+      if (e instanceof PiVersionError) {
+        throw new PiRpcSpawnError(e.message, { code: 'UNSUPPORTED_PI_VERSION', cause: e })
+      }
+      throw e
+    }
 
     // Speed/robustness for ACP:
     // - themes are irrelevant in rpc mode and can be noisy/slow to load.

@@ -21,7 +21,8 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
   writeFileSync(join(dir, 'settings.json'), JSON.stringify({ quietStartup: true }, null, 2), 'utf-8')
   process.env.PI_CODING_AGENT_DIR = dir
 
-  // Spy on setTimeout calls (agent schedules startup info + available commands)
+  // Spy on setTimeout calls (agent schedules available commands; startup info
+  // is no longer scheduled out-of-turn and is flushed on the first prompt)
   const realSetTimeout = globalThis.setTimeout
   const timeouts: Array<unknown> = []
   ;(globalThis as any).setTimeout = (fn: unknown, _ms?: number) => {
@@ -68,11 +69,12 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
     if (startupInfo) {
       assert.match(startupInfo, /New version available/)
       assert.equal(setStartupInfoCalled, true)
-      assert.equal(timeouts.length, 2)
     } else {
       assert.equal(setStartupInfoCalled, false)
-      assert.equal(timeouts.length, 1)
     }
+    // Only the available-commands advertisement is scheduled; the startup
+    // banner must not be scheduled out-of-turn (ACP protocol; issue #59).
+    assert.equal(timeouts.length, 1)
   } finally {
     ;(globalThis as any).setTimeout = realSetTimeout
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR

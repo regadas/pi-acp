@@ -30,6 +30,11 @@ export class FakePiRpcProcess {
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
 
+  // Mutable fake pi state returned by getState(). Defaults to an active agent
+  // run so lifecycle tests behave like a real running pi; tests exercising
+  // the no-agent-run acceptance path set `state = { isStreaming: false }`.
+  state: Record<string, unknown> = { isStreaming: true }
+
   onEvent(handler: (ev: PiRpcEvent) => void): () => void {
     this.handlers.push(handler)
     return () => {
@@ -54,7 +59,7 @@ export class FakePiRpcProcess {
   }
 
   async getState(): Promise<any> {
-    return {}
+    return this.state
   }
 
   async getAvailableModels(): Promise<any> {

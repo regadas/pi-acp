@@ -636,7 +636,7 @@ test('PiAcpSession: omits edit tool line when oldText matches multiple times', a
   assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: filePath }])
 })
 
-test('PiAcpSession: prompt resolves end_turn on agent_end', async () => {
+test('PiAcpSession: prompt resolves end_turn only at agent_settled, not agent_end', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -650,14 +650,26 @@ test('PiAcpSession: prompt resolves end_turn on agent_end', async () => {
   })
 
   const p = session.prompt('hello')
+  let resolved = false
+  void p.then(() => {
+    resolved = true
+  })
+
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
+
+  // `agent_end` is only a low-level run boundary; pi may continue with
+  // retries/compaction/queued continuations. The ACP prompt must stay open.
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(resolved, false)
+
+  proc.emit({ type: 'agent_settled' })
   const reason = await p
   assert.equal(reason, 'end_turn')
 })
 
-test('PiAcpSession: does not re-emit startup info on first prompt after it was already sent', async () => {
+test('PiAcpSession: emits startup info once, in-turn, on the first prompt only', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -671,30 +683,43 @@ test('PiAcpSession: does not re-emit startup info on first prompt after it was a
   })
 
   const notice = 'New version available: v0.74.0 (installed v0.73.1).'
-
   session.setStartupInfo(notice)
-  session.sendStartupInfoIfPending()
+
+  // No prompt is active yet: nothing may be emitted out-of-turn.
   await new Promise(r => setTimeout(r, 0))
+  assert.equal(conn.updates.length, 0)
 
-  const p = session.prompt('hello')
-  await new Promise(r => setTimeout(r, 0))
+  const startupUpdates = () =>
+    conn.updates.filter(
+      entry =>
+        entry.update.sessionUpdate === 'agent_message_chunk' &&
+        (entry.update as any).content?.type === 'text' &&
+        (entry.update as any).content?.text === notice
+    )
 
-  assert.equal(proc.prompts.length, 1)
-  assert.equal(proc.prompts[0]!.message, 'hello')
-  const startupUpdates = conn.updates.filter(
-    entry =>
-      entry.update.sessionUpdate === 'agent_message_chunk' &&
-      (entry.update as any).content?.type === 'text' &&
-      (entry.update as any).content?.text === notice
-  )
-  assert.equal(startupUpdates.length, 1)
-
+  const first = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await first, 'end_turn')
 
-  const reason = await p
-  assert.equal(reason, 'end_turn')
+  assert.equal(proc.prompts.length, 1)
+  assert.equal(proc.prompts[0]!.message, 'hello')
+  assert.equal(startupUpdates().length, 1)
+
+  // The banner must be the first turn-bound chunk of the first turn.
+  const firstChunk = conn.updates.find(entry => entry.update.sessionUpdate === 'agent_message_chunk')
+  assert.equal((firstChunk!.update as any).content.text, notice)
+
+  const second = session.prompt('again')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'turn_end' })
+  proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await second, 'end_turn')
+
+  assert.equal(startupUpdates().length, 1)
 })
 
 test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
@@ -715,13 +740,14 @@ test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
   const reason = await p
 
   assert.equal(proc.abortCount, 1)
   assert.equal(reason, 'cancelled')
 })
 
-test('PiAcpSession: queues concurrent prompt and starts it after agent_end', async () => {
+test('PiAcpSession: queues concurrent prompt and starts it only after agent_settled', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -744,6 +770,12 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_end', asy
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
 
+  // The queued prompt must NOT start at the low-level agent_end boundary.
+  await new Promise(r => setTimeout(r, 0))
+  assert.equal(proc.prompts.length, 1)
+
+  proc.emit({ type: 'agent_settled' })
+
   const r1 = await first
   assert.equal(r1, 'end_turn')
 
@@ -753,6 +785,7 @@ test('PiAcpSession: queues concurrent prompt and starts it after agent_end', asy
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
 
   const r2 = await second
   assert.equal(r2, 'end_turn')
@@ -780,6 +813,7 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
 
   const r1 = await first
   const r2 = await second
@@ -815,6 +849,7 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })
   proc.emit({ type: 'agent_end' })
+  proc.emit({ type: 'agent_settled' })
 
   const reason = await p
   assert.equal(reason, 'end_turn')
