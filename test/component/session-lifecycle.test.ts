@@ -88,6 +88,67 @@ test('PiAcpSession: retry/continuation updates after agent_end stay in-turn and 
   )
 })
 
+test(
+  'PiAcpSession: prompts arriving during completion flush remain FIFO and no pending turn is overwritten',
+  { timeout: 2000 },
+  async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+
+    let releaseFirstUpdate!: () => void
+    const firstUpdateGate = new Promise<void>(resolve => {
+      releaseFirstUpdate = resolve
+    })
+    const sendUpdate = conn.sessionUpdate.bind(conn)
+    let blockFirstUpdate = true
+    conn.sessionUpdate = async msg => {
+      if (blockFirstUpdate) {
+        blockFirstUpdate = false
+        await firstUpdateGate
+      }
+      await sendUpdate(msg)
+    }
+
+    const first = session.prompt('first')
+    proc.emit({ type: 'agent_start' })
+    const second = session.prompt('second')
+
+    // Completion begins while the first notification is deliberately blocked.
+    // A third request arriving now must queue behind the already-queued second
+    // request rather than starting and being overwritten when the flush ends.
+    proc.emit({ type: 'agent_settled' })
+    const third = session.prompt('third')
+    await tick()
+    assert.deepEqual(
+      proc.prompts.map(prompt => prompt.message),
+      ['first'],
+      'no later prompt may reach pi while the completing turn is flushing'
+    )
+
+    releaseFirstUpdate()
+    assert.equal(await first, 'end_turn')
+    await tick()
+    assert.deepEqual(
+      proc.prompts.map(prompt => prompt.message),
+      ['first', 'second']
+    )
+
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    assert.equal(await second, 'end_turn')
+    await tick()
+    assert.deepEqual(
+      proc.prompts.map(prompt => prompt.message),
+      ['first', 'second', 'third']
+    )
+
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    assert.equal(await third, 'end_turn')
+  }
+)
+
 test('PiAcpSession: cancellation resolves cancelled at agent_settled with no turn-bound update after the response', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

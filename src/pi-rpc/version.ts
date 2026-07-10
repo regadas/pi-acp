@@ -60,36 +60,64 @@ export function clearPiVersionCacheForTests(): void {
  *
  * Policy:
  * - Version parsed and `>= MIN_PI_VERSION`: returns the version (cached per
- *   command for this process).
+ *   command and working directory for this process).
  * - Version parsed and too old: throws {@link PiVersionError} explaining the
  *   `agent_settled` requirement.
- * - `--version` ran (exit 0) but printed something unparseable: throws
- *   {@link PiVersionError}. An unknown version must fail explicitly rather
- *   than risk a later hang or a falsely settled ACP turn.
- * - `--version` could not be launched or did not exit cleanly (missing
- *   binary, permissions, timeout, nonzero exit): returns null and defers to
- *   the real spawn, which surfaces an accurate launch error (e.g. ENOENT).
+ * - The executable runs but `--version` fails, is interrupted, times out, or
+ *   prints something unparseable: throws {@link PiVersionError}. An unknown
+ *   version must fail explicitly rather than risk a later hang or a falsely
+ *   settled ACP turn.
+ * - Genuine launch failures (such as a missing or non-executable binary)
+ *   return null and defer to the real spawn, which surfaces its more specific
+ *   launch error.
  */
-export function assertSupportedPiVersion(piCommand: string): string | null {
-  const cached = versionCache.get(piCommand)
+export function assertSupportedPiVersion(piCommand: string, cwd: string = process.cwd()): string | null {
+  const cacheKey = JSON.stringify([piCommand, cwd])
+  const cached = versionCache.get(cacheKey)
   if (cached) return cached
 
   let result: ReturnType<typeof spawnSync>
   try {
     result = spawnSync(piCommand, ['--version'], {
+      cwd,
       encoding: 'utf-8',
       timeout: 15000,
       shell: shouldUseShellForPiCommand(piCommand)
     })
-  } catch {
-    return null
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null | undefined)?.code
+    if (code === 'ENOENT' || code === 'EACCES' || code === 'EPERM' || code === 'ENOEXEC') return null
+    throw new PiVersionError(
+      `Could not determine the pi version: \`${piCommand} --version\` could not be checked from ${cwd}: ${String(err)}. ` +
+        `pi-acp requires pi >= ${MIN_PI_VERSION} (for the \`agent_settled\` RPC event).`
+    )
   }
 
-  if (result.error || result.signal || result.status !== 0) {
+  const launchErrorCode = (result.error as NodeJS.ErrnoException | undefined)?.code
+  if (
+    launchErrorCode === 'ENOENT' ||
+    launchErrorCode === 'EACCES' ||
+    launchErrorCode === 'EPERM' ||
+    launchErrorCode === 'ENOEXEC'
+  ) {
     return null
   }
 
   const output = String(result.stdout ?? '').trim() || String(result.stderr ?? '').trim()
+  if (result.error || result.signal || result.status !== 0) {
+    const detail = result.error
+      ? String(result.error)
+      : result.signal
+        ? `terminated by signal ${result.signal}`
+        : `exited with status ${String(result.status)}`
+    throw new PiVersionError(
+      `Could not determine the pi version: \`${piCommand} --version\` ${detail}` +
+        `${output ? ` after printing ${JSON.stringify(output.slice(0, 120))}` : ''}. ` +
+        `pi-acp requires pi >= ${MIN_PI_VERSION} (for the \`agent_settled\` RPC event) and fails closed on unknown ` +
+        `versions instead of risking hangs or premature ACP turn completion.`
+    )
+  }
+
   const version = parsePiVersion(output)
 
   if (!version) {
@@ -108,6 +136,6 @@ export function assertSupportedPiVersion(piCommand: string): string | null {
     )
   }
 
-  versionCache.set(piCommand, version)
+  versionCache.set(cacheKey, version)
   return version
 }

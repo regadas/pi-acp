@@ -136,7 +136,7 @@ export class PiRpcProcess {
     // pi's `agent_settled` event. Launch failures return null here and are
     // surfaced by the detailed spawn error handling below instead.
     try {
-      assertSupportedPiVersion(cmd)
+      assertSupportedPiVersion(cmd, params.cwd)
     } catch (e) {
       if (e instanceof PiVersionError) {
         throw new PiRpcSpawnError(e.message, { code: 'UNSUPPORTED_PI_VERSION', cause: e })

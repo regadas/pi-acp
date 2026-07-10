@@ -41,6 +41,7 @@ export type StopReason = 'end_turn' | 'cancelled' | 'error'
 type PendingTurn = {
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+  completionStarted: boolean
 }
 
 type QueuedTurn = {
@@ -481,7 +482,7 @@ export class PiAcpSession {
     this.cancelRequested = false
     this.agentRunObserved = false
 
-    const turn: PendingTurn = { resolve: t.resolve, reject: t.reject }
+    const turn: PendingTurn = { resolve: t.resolve, reject: t.reject, completionStarted: false }
     this.pendingTurn = turn
 
     // Flush the deferred startup banner (pi version / context / skills) as the
@@ -521,11 +522,11 @@ export class PiAcpSession {
    * instead of hanging forever.
    */
   private handlePromptAccepted(turn: PendingTurn): void {
-    if (this.pendingTurn !== turn || this.agentRunObserved) return
+    if (this.pendingTurn !== turn || turn.completionStarted || this.agentRunObserved) return
 
     void this.proc.getState().then(
       state => {
-        if (this.pendingTurn !== turn || this.agentRunObserved) return
+        if (this.pendingTurn !== turn || turn.completionStarted || this.agentRunObserved) return
         const isStreaming = Boolean((state as { isStreaming?: unknown } | null | undefined)?.isStreaming)
         // pi sets `isStreaming` synchronously before its agent run starts and
         // writes RPC output in order: when a run is active, its `agent_start`
@@ -537,7 +538,7 @@ export class PiAcpSession {
       () => {
         // State probe failed (pi exited or the RPC channel broke). Complete
         // rather than hang; a dead subprocess cannot emit agent_settled.
-        if (this.pendingTurn !== turn || this.agentRunObserved) return
+        if (this.pendingTurn !== turn || turn.completionStarted || this.agentRunObserved) return
         this.completeTurn(turn)
       }
     )
@@ -551,22 +552,29 @@ export class PiAcpSession {
    * resolve, and only then start the next queued adapter prompt.
    */
   private completeTurn(turn: PendingTurn): void {
-    if (this.pendingTurn !== turn) return
-    this.pendingTurn = null
+    if (this.pendingTurn !== turn || turn.completionStarted) return
+    turn.completionStarted = true
     const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
 
     void this.flushEmits().finally(() => {
+      // Keep the completing turn installed until its updates have flushed. New
+      // prompts must remain queued behind it; clearing pendingTurn earlier lets
+      // a newcomer start and then get overwritten by startNextQueuedTurn().
+      this.pendingTurn = null
       turn.resolve(reason)
       this.startNextQueuedTurn()
     })
   }
 
   private failTurn(turn: PendingTurn, err: unknown): void {
-    if (this.pendingTurn !== turn) return
-    this.pendingTurn = null
+    if (this.pendingTurn !== turn || turn.completionStarted) return
+    turn.completionStarted = true
 
-    // Ensure any already-enqueued updates are flushed first.
+    // Ensure any already-enqueued updates are flushed first. Keep pendingTurn
+    // installed during the flush so another prompt cannot start concurrently.
     void this.flushEmits().finally(() => {
+      this.pendingTurn = null
+
       // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
       const authErr = maybeAuthRequiredError(err)
       if (authErr) {
