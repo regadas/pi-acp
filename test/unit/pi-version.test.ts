@@ -49,24 +49,24 @@ test('comparePiVersions orders x.y.z numerically', () => {
   assert.equal(comparePiVersions('1.0.0', '0.99.99'), 1)
 })
 
-test('resolveWindowsScriptCommand searches cwd, PATH, and explicit paths with Windows semantics', () => {
-  const exists = (...paths: string[]) => {
-    const files = new Set(paths.map(path => path.toLowerCase()))
-    return (path: string) => files.has(path.toLowerCase())
-  }
+function fakeWindowsFiles(...paths: string[]): (path: string) => boolean {
+  const files = new Set(paths.map(path => path.toLowerCase()))
+  return path => files.has(path.toLowerCase())
+}
 
+test('resolveWindowsScriptCommand searches cwd, PATH, and explicit paths with Windows semantics', () => {
   assert.equal(
     resolveWindowsScriptCommand(
       'pi.cmd',
       'C:\\workspace',
       'C:\\bin;D:\\tools',
-      exists('C:\\workspace\\pi.cmd', 'D:\\tools\\pi.cmd')
+      fakeWindowsFiles('C:\\workspace\\pi.cmd', 'D:\\tools\\pi.cmd')
     ),
     'C:\\workspace\\pi.cmd',
     'cwd takes precedence over PATH'
   )
   assert.equal(
-    resolveWindowsScriptCommand('pi.cmd', 'C:\\workspace', 'C:\\bin;D:\\tools', exists('D:\\tools\\pi.cmd')),
+    resolveWindowsScriptCommand('pi.cmd', 'C:\\workspace', 'C:\\bin;D:\\tools', fakeWindowsFiles('D:\\tools\\pi.cmd')),
     'D:\\tools\\pi.cmd'
   )
   assert.equal(
@@ -74,17 +74,54 @@ test('resolveWindowsScriptCommand searches cwd, PATH, and explicit paths with Wi
       '.\\scripts\\pi.bat',
       'C:\\workspace',
       'D:\\tools',
-      exists('C:\\workspace\\scripts\\pi.bat')
+      fakeWindowsFiles('C:\\workspace\\scripts\\pi.bat')
     ),
     'C:\\workspace\\scripts\\pi.bat'
   )
   assert.equal(
-    resolveWindowsScriptCommand('D:\\custom\\pi.cmd', 'C:\\workspace', 'C:\\bin', exists('D:\\custom\\pi.cmd')),
+    resolveWindowsScriptCommand(
+      'D:\\custom\\pi.cmd',
+      'C:\\workspace',
+      'C:\\bin',
+      fakeWindowsFiles('D:\\custom\\pi.cmd')
+    ),
     'D:\\custom\\pi.cmd'
   )
   assert.equal(
     resolveWindowsScriptCommand('missing.cmd', 'C:\\workspace', 'C:\\bin;D:\\tools', () => false),
     null
+  )
+})
+
+test('resolveWindowsScriptCommand anchors relative PATH entries to cwd and supports paths with spaces', () => {
+  assert.equal(
+    resolveWindowsScriptCommand(
+      'pi.cmd',
+      'C:\\workspace',
+      'tools;D:\\fallback',
+      fakeWindowsFiles('C:\\workspace\\tools\\pi.cmd')
+    ),
+    'C:\\workspace\\tools\\pi.cmd',
+    'relative PATH entries use the supplied session cwd'
+  )
+  assert.equal(
+    resolveWindowsScriptCommand(
+      'pi.cmd',
+      'C:\\workspace',
+      'C:\\Program Files\\Pi;D:\\fallback',
+      fakeWindowsFiles('C:\\Program Files\\Pi\\pi.cmd')
+    ),
+    'C:\\Program Files\\Pi\\pi.cmd'
+  )
+  assert.equal(
+    resolveWindowsScriptCommand(
+      'pi.cmd',
+      'C:\\workspace',
+      '"C:\\Program Files\\Pi";D:\\fallback',
+      fakeWindowsFiles('C:\\Program Files\\Pi\\pi.cmd')
+    ),
+    'C:\\Program Files\\Pi\\pi.cmd',
+    'surrounding quotes on a PATH entry are ignored'
   )
 })
 

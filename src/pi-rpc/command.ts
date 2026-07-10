@@ -45,7 +45,10 @@ export function resolveWindowsScriptCommand(
     ? [win32.resolve(cwd, normalized)]
     : [
         win32.resolve(cwd, normalized),
-        ...pathValue.split(win32.delimiter).map(dir => win32.resolve(dir || cwd, normalized))
+        ...pathValue.split(win32.delimiter).map(rawDir => {
+          const dir = rawDir.startsWith('"') && rawDir.endsWith('"') ? rawDir.slice(1, -1) : rawDir
+          return win32.resolve(cwd, dir || '.', normalized)
+        })
       ]
 
   const seen = new Set<string>()
@@ -58,8 +61,8 @@ export function resolveWindowsScriptCommand(
   return null
 }
 
-/** Resolve shell-based Windows launchers before probing them with --version. */
-export function resolvePiCommandForVersionProbe(cmd: string, cwd: string): string | null {
+/** Resolve shell-based Windows launchers only to preflight missing-command errors. */
+export function resolvePiCommandForVersionPreflight(cmd: string, cwd: string): string | null {
   if (!shouldUseShellForPiCommand(cmd)) return cmd
 
   const pathValue = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'path')?.[1] ?? ''

@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
-import { getPiCommand, resolvePiCommandForVersionProbe, shouldUseShellForPiCommand } from './command.js'
+import { getPiCommand, resolvePiCommandForVersionPreflight, shouldUseShellForPiCommand } from './command.js'
 import { assertSupportedPiVersion, PiVersionError } from './version.js'
 
 export class PiRpcSpawnError extends Error {
@@ -138,18 +138,20 @@ export class PiRpcProcess {
     // On Windows, npm commonly creates pi.cmd / pi.bat launcher scripts.
     const cmd = getPiCommand(params.piCommand)
 
-    // Resolve Windows command scripts before probing them through a shell.
-    // Otherwise a missing pi.cmd/pi.bat looks like a shell exit status and is
-    // incorrectly reported as an unsupported version rather than ENOENT.
-    const versionProbeCommand = resolvePiCommandForVersionProbe(cmd, params.cwd)
-    if (!versionProbeCommand) throw piExecutableNotFoundError(cmd)
+    // Preflight Windows command scripts before probing them through a shell.
+    // The resolved path is used only to classify a missing pi.cmd/pi.bat as
+    // ENOENT. The probe itself must use the original command: converting a
+    // bare launcher to an absolute path containing spaces can make cmd.exe
+    // tokenize a valid installation incorrectly.
+    const versionPreflightCommand = resolvePiCommandForVersionPreflight(cmd, params.cwd)
+    if (!versionPreflightCommand) throw piExecutableNotFoundError(cmd)
 
     // Fail closed on unsupported/unknown pi versions before spawning the RPC
     // subprocess (see MIN_PI_VERSION): the ACP prompt lifecycle depends on
     // pi's `agent_settled` event. Launch failures return null here and are
     // surfaced by the detailed spawn error handling below instead.
     try {
-      assertSupportedPiVersion(versionProbeCommand, params.cwd)
+      assertSupportedPiVersion(cmd, params.cwd)
     } catch (e) {
       if (e instanceof PiVersionError) {
         throw new PiRpcSpawnError(e.message, { code: 'UNSUPPORTED_PI_VERSION', cause: e })
