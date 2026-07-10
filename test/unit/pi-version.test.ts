@@ -11,6 +11,7 @@ import {
   comparePiVersions,
   parsePiVersion
 } from '../../src/pi-rpc/version.js'
+import { resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
 import { PiRpcProcess, PiRpcSpawnError } from '../../src/pi-rpc/process.js'
 
 const isWindows = process.platform === 'win32'
@@ -46,6 +47,45 @@ test('comparePiVersions orders x.y.z numerically', () => {
   assert.equal(comparePiVersions('0.80.3', '0.80.4'), -1)
   assert.equal(comparePiVersions('0.79.10', '0.80.0'), -1)
   assert.equal(comparePiVersions('1.0.0', '0.99.99'), 1)
+})
+
+test('resolveWindowsScriptCommand searches cwd, PATH, and explicit paths with Windows semantics', () => {
+  const exists = (...paths: string[]) => {
+    const files = new Set(paths.map(path => path.toLowerCase()))
+    return (path: string) => files.has(path.toLowerCase())
+  }
+
+  assert.equal(
+    resolveWindowsScriptCommand(
+      'pi.cmd',
+      'C:\\workspace',
+      'C:\\bin;D:\\tools',
+      exists('C:\\workspace\\pi.cmd', 'D:\\tools\\pi.cmd')
+    ),
+    'C:\\workspace\\pi.cmd',
+    'cwd takes precedence over PATH'
+  )
+  assert.equal(
+    resolveWindowsScriptCommand('pi.cmd', 'C:\\workspace', 'C:\\bin;D:\\tools', exists('D:\\tools\\pi.cmd')),
+    'D:\\tools\\pi.cmd'
+  )
+  assert.equal(
+    resolveWindowsScriptCommand(
+      '.\\scripts\\pi.bat',
+      'C:\\workspace',
+      'D:\\tools',
+      exists('C:\\workspace\\scripts\\pi.bat')
+    ),
+    'C:\\workspace\\scripts\\pi.bat'
+  )
+  assert.equal(
+    resolveWindowsScriptCommand('D:\\custom\\pi.cmd', 'C:\\workspace', 'C:\\bin', exists('D:\\custom\\pi.cmd')),
+    'D:\\custom\\pi.cmd'
+  )
+  assert.equal(
+    resolveWindowsScriptCommand('missing.cmd', 'C:\\workspace', 'C:\\bin;D:\\tools', () => false),
+    null
+  )
 })
 
 test('assertSupportedPiVersion accepts the minimum and newer versions', { skip: isWindows }, () => {
@@ -125,6 +165,18 @@ test(
     )
   }
 )
+
+test('PiRpcProcess.spawn reports a missing Windows command script as ENOENT', { skip: !isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  await assert.rejects(
+    PiRpcProcess.spawn({ cwd: process.cwd(), piCommand: 'pi-acp-definitely-missing.cmd' }),
+    (err: unknown) =>
+      err instanceof PiRpcSpawnError &&
+      err.code === 'ENOENT' &&
+      err.message.includes('executable not found') &&
+      !err.message.includes('UNSUPPORTED_PI_VERSION')
+  )
+})
 
 test('PiRpcProcess.spawn rejects unsupported pi versions with a clear error', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()

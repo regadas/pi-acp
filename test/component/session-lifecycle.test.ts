@@ -149,6 +149,93 @@ test(
   }
 )
 
+test(
+  'PiAcpSession: prompt failure drains queued requests after flushing their updates without auto-starting them',
+  { timeout: 2000 },
+  async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+
+    let releaseFirstUpdate!: () => void
+    const firstUpdateGate = new Promise<void>(resolve => {
+      releaseFirstUpdate = resolve
+    })
+    const sendUpdate = conn.sessionUpdate.bind(conn)
+    let blockFirstUpdate = true
+    conn.sessionUpdate = async msg => {
+      if (blockFirstUpdate) {
+        blockFirstUpdate = false
+        await firstUpdateGate
+      }
+      await sendUpdate(msg)
+    }
+
+    let rejectFirstPrompt!: (error: Error) => void
+    proc.prompt = (message, attachments = []) => {
+      proc.prompts.push({ message, attachments })
+      if (message !== 'first') return Promise.resolve()
+      return new Promise<void>((_resolve, reject) => {
+        rejectFirstPrompt = reject
+      })
+    }
+
+    const first = session.prompt('first')
+    const second = session.prompt('second')
+    rejectFirstPrompt(new Error('pi prompt failed'))
+    await tick()
+
+    // failTurn is now waiting on the blocked first update. This request must
+    // join the failure drain along with the already-queued second request.
+    const third = session.prompt('third')
+    let settled = false
+    let turnBoundAtSettle = -1
+    const all = Promise.all([first, second, third]).then(reasons => {
+      settled = true
+      turnBoundAtSettle = conn.updates.filter(update => TURN_BOUND_UPDATES.has(update.update.sessionUpdate)).length
+      return reasons
+    })
+
+    await tick()
+    assert.equal(settled, false, 'failed and queued requests must wait for queued notifications to flush')
+    assert.deepEqual(
+      proc.prompts.map(prompt => prompt.message),
+      ['first']
+    )
+
+    releaseFirstUpdate()
+    assert.deepEqual(await all, ['error', 'error', 'error'])
+    assert.deepEqual(
+      proc.prompts.map(prompt => prompt.message),
+      ['first'],
+      'queued prompts must not auto-run'
+    )
+
+    const queuedNotices = conn.updates.filter(
+      update =>
+        update.update.sessionUpdate === 'agent_message_chunk' &&
+        (update.update as any).content?.text?.startsWith('Queued message')
+    )
+    assert.equal(queuedNotices.length, 2, 'both queued notifications must be delivered before responses settle')
+
+    await tick()
+    assert.equal(
+      conn.updates.filter(update => TURN_BOUND_UPDATES.has(update.update.sessionUpdate)).length,
+      turnBoundAtSettle,
+      'no queued turn-bound notification may arrive after the drained responses'
+    )
+
+    const fourth = session.prompt('fourth')
+    assert.deepEqual(
+      proc.prompts.map(prompt => prompt.message),
+      ['first', 'fourth']
+    )
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    assert.equal(await fourth, 'end_turn', 'a fresh prompt can start after the failed queue is drained')
+  }
+)
+
 test('PiAcpSession: cancellation resolves cancelled at agent_settled with no turn-bound update after the response', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

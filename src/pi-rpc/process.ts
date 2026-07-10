@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import * as readline from 'node:readline'
-import { getPiCommand, shouldUseShellForPiCommand } from './command.js'
+import { getPiCommand, resolvePiCommandForVersionProbe, shouldUseShellForPiCommand } from './command.js'
 import { assertSupportedPiVersion, PiVersionError } from './version.js'
 
 export class PiRpcSpawnError extends Error {
@@ -13,6 +13,13 @@ export class PiRpcSpawnError extends Error {
     this.code = opts?.code
     ;(this as any).cause = opts?.cause
   }
+}
+
+function piExecutableNotFoundError(cmd: string, cause?: unknown): PiRpcSpawnError {
+  return new PiRpcSpawnError(
+    `Could not start pi: executable not found (command: ${cmd}). Pi needs to be installed before it can run in ACP clients. Install it via \`npm install -g @earendil-works/pi-coding-agent\` or ensure \`pi\` is on your PATH. Then try again.`,
+    { code: 'ENOENT', cause }
+  )
 }
 
 const ESC = String.fromCharCode(0x1b)
@@ -131,12 +138,18 @@ export class PiRpcProcess {
     // On Windows, npm commonly creates pi.cmd / pi.bat launcher scripts.
     const cmd = getPiCommand(params.piCommand)
 
+    // Resolve Windows command scripts before probing them through a shell.
+    // Otherwise a missing pi.cmd/pi.bat looks like a shell exit status and is
+    // incorrectly reported as an unsupported version rather than ENOENT.
+    const versionProbeCommand = resolvePiCommandForVersionProbe(cmd, params.cwd)
+    if (!versionProbeCommand) throw piExecutableNotFoundError(cmd)
+
     // Fail closed on unsupported/unknown pi versions before spawning the RPC
     // subprocess (see MIN_PI_VERSION): the ACP prompt lifecycle depends on
     // pi's `agent_settled` event. Launch failures return null here and are
     // surfaced by the detailed spawn error handling below instead.
     try {
-      assertSupportedPiVersion(cmd, params.cwd)
+      assertSupportedPiVersion(versionProbeCommand, params.cwd)
     } catch (e) {
       if (e instanceof PiVersionError) {
         throw new PiRpcSpawnError(e.message, { code: 'UNSUPPORTED_PI_VERSION', cause: e })
@@ -181,10 +194,7 @@ export class PiRpcProcess {
     } catch (e: any) {
       const code = typeof e?.code === 'string' ? e.code : undefined
       if (code === 'ENOENT') {
-        throw new PiRpcSpawnError(
-          `Could not start pi: executable not found (command: ${cmd}). Pi needs to be installed before it can run in ACP clients. Install it via \`npm install -g @earendil-works/pi-coding-agent\` or ensure \`pi\` is on your PATH. Then try again.`,
-          { code, cause: e }
-        )
+        throw piExecutableNotFoundError(cmd, e)
       }
 
       if (code === 'EACCES') {

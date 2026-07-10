@@ -570,24 +570,38 @@ export class PiAcpSession {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
 
-    // Ensure any already-enqueued updates are flushed first. Keep pendingTurn
-    // installed during the flush so another prompt cannot start concurrently.
+    const authErr = maybeAuthRequiredError(err)
+
+    // Keep the failed turn installed while its existing updates flush so any
+    // concurrent prompts queue rather than leapfrog it. Once that first flush
+    // completes, JS run-to-completion makes the queue drain + pendingTurn clear
+    // atomic with respect to new prompt requests.
     void this.flushEmits().finally(() => {
+      const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
+      const queued = this.turnQueue.splice(0, this.turnQueue.length)
       this.pendingTurn = null
 
-      // If this looks like an auth/config issue, surface AUTH_REQUIRED so clients can offer terminal login.
-      const authErr = maybeAuthRequiredError(err)
-      if (authErr) {
-        turn.reject(authErr)
-      } else {
-        turn.resolve(this.cancelRequested ? 'cancelled' : 'error')
-      }
+      // Queue notifications may have been appended while the first flush was
+      // blocked. Capture and flush them after closing the queue, before settling
+      // either the failed request or any drained queued requests.
+      void this.flushEmits().finally(() => {
+        if (authErr) {
+          turn.reject(authErr)
+          for (const queuedTurn of queued) queuedTurn.reject(authErr)
+        } else {
+          turn.resolve(reason)
+          for (const queuedTurn of queued) queuedTurn.resolve(reason)
+        }
 
-      // If the prompt failed, do not automatically proceed—pi may be unhealthy.
-      // But we still clear the queueDepth metadata.
-      this.emit({
-        sessionUpdate: 'session_info_update',
-        _meta: { piAcp: { queueDepth: this.turnQueue.length, running: false } }
+        // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
+        // new prompt can start after the atomic queue close above; in that case
+        // its own running metadata is authoritative and must not be overwritten.
+        if (!this.pendingTurn) {
+          this.emit({
+            sessionUpdate: 'session_info_update',
+            _meta: { piAcp: { queueDepth: 0, running: false } }
+          })
+        }
       })
     })
   }
