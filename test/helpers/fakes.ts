@@ -1,7 +1,8 @@
-import type { AgentSideConnection } from '@agentclientprotocol/sdk'
+import type { SessionNotification } from '@agentclientprotocol/sdk'
+import type { AcpClient } from '../../src/acp/client.js'
 import type { PiRpcEvent } from '../../src/pi-rpc/process.js'
 
-type SessionUpdateMsg = Parameters<AgentSideConnection['sessionUpdate']>[0]
+type SessionUpdateMsg = SessionNotification
 
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
@@ -29,6 +30,7 @@ export class FakePiRpcProcess {
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
+  disposeCount = 0
 
   // Mutable fake pi state returned by getState(). Defaults to an active agent
   // run so lifecycle tests behave like a real running pi; tests exercising
@@ -54,6 +56,10 @@ export class FakePiRpcProcess {
     this.abortCount += 1
   }
 
+  dispose(): void {
+    this.disposeCount += 1
+  }
+
   async sendExtensionUiResponse(response: unknown): Promise<void> {
     this.extensionUiResponses.push(response)
   }
@@ -71,7 +77,7 @@ export class FakePiRpcProcess {
   }
 }
 
-export function asAgentConn(conn: FakeAgentSideConnection): AgentSideConnection {
+export function asAgentConn(conn: FakeAgentSideConnection): AcpClient {
   // We only implement the method(s) used by PiAcpSession in tests.
-  return conn as unknown as AgentSideConnection
+  return conn as unknown as AcpClient
 }

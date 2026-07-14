@@ -55,7 +55,9 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
   )
 
   const oldEnv = process.env.PI_CODING_AGENT_DIR
+  const oldAcpDir = process.env.PI_ACP_DIR
   process.env.PI_CODING_AGENT_DIR = root
+  process.env.PI_ACP_DIR = mkdtempSync(join(tmpdir(), 'pi-acp-load-store-'))
 
   try {
     const conn = new FakeAgentSideConnection()
@@ -94,6 +96,11 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
     }
 
     try {
+      await assert.rejects(
+        () => agent.loadSession({ sessionId: 'sess-1', cwd: '/different/project', mcpServers: [], _meta: null } as any),
+        /does not match the session's recorded cwd/i
+      )
+
       await agent.loadSession({ sessionId: 'sess-1', cwd: '/tmp/project', mcpServers: [], _meta: null } as any)
 
       // loadSession should have replayed messages as session/update notifications.
@@ -110,5 +117,7 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
   } finally {
     if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = oldEnv
+    if (oldAcpDir === undefined) delete process.env.PI_ACP_DIR
+    else process.env.PI_ACP_DIR = oldAcpDir
   }
 })

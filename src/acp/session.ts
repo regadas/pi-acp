@@ -1,5 +1,4 @@
 import type {
-  AgentSideConnection,
   ContentBlock,
   McpServer,
   PermissionOption,
@@ -9,6 +8,7 @@ import type {
   ToolKind
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
+import type { AcpClient } from './client.js'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
@@ -31,7 +31,7 @@ import { toolResultToText } from './translate/pi-tools.js'
 type SessionCreateParams = {
   cwd: string
   mcpServers: McpServer[]
-  conn: AgentSideConnection
+  conn: AcpClient
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
 }
@@ -51,7 +51,7 @@ type QueuedTurn = {
   reject: (err: unknown) => void
 }
 
-type PermissionResponse = Awaited<ReturnType<AgentSideConnection['requestPermission']>>
+type PermissionResponse = Awaited<ReturnType<AcpClient['requestPermission']>>
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
@@ -170,19 +170,11 @@ export class SessionManager {
     const s = this.sessions.get(sessionId)
     if (!s) return
     try {
-      s.proc.dispose?.()
+      s.dispose()
     } catch {
       // ignore
     }
     this.sessions.delete(sessionId)
-  }
-
-  /** Close all sessions except the one with `keepSessionId`. */
-  closeAllExcept(keepSessionId: string): void {
-    for (const [id] of this.sessions) {
-      if (id === keepSessionId) continue
-      this.close(id)
-    }
   }
 
   async create(params: SessionCreateParams): Promise<PiAcpSession> {
@@ -230,7 +222,7 @@ export class SessionManager {
 
   get(sessionId: string): PiAcpSession {
     const s = this.sessions.get(sessionId)
-    if (!s) throw RequestError.invalidParams(`Unknown sessionId: ${sessionId}`)
+    if (!s) throw RequestError.resourceNotFound(sessionId)
     return s
   }
 
@@ -265,7 +257,7 @@ export class PiAcpSession {
   private startupInfoSent = false
 
   readonly proc: PiRpcProcess
-  private readonly conn: AgentSideConnection
+  private readonly conn: AcpClient
   private readonly fileCommands: FileSlashCommand[]
 
   // Used to map abort semantics to ACP stopReason.
@@ -302,12 +294,20 @@ export class PiAcpSession {
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
 
+  // Settlement trackers for every turn-based `session/prompt` (in-flight and
+  // queued). Agent-level tracking also covers adapter-handled prompt paths.
+  private readonly outstandingTurns = new Set<Promise<void>>()
+  private closing = false
+  private shutdownPromise: Promise<void> | null = null
+  private readonly unsubscribe: () => void
+  private disposed = false
+
   constructor(opts: {
     sessionId: string
     cwd: string
     mcpServers: McpServer[]
     proc: PiRpcProcess
-    conn: AgentSideConnection
+    conn: AcpClient
     fileCommands?: FileSlashCommand[]
   }) {
     this.sessionId = opts.sessionId
@@ -317,7 +317,17 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
 
-    this.proc.onEvent(ev => this.handlePiEvent(ev))
+    this.unsubscribe = this.proc.onEvent(ev => this.handlePiEvent(ev))
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    try {
+      this.unsubscribe()
+    } finally {
+      this.proc.dispose()
+    }
   }
 
   setStartupInfo(text: string) {
@@ -342,6 +352,9 @@ export class PiAcpSession {
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+    // Once shutdown starts, no new work may be admitted to this subprocess.
+    if (this.isClosing()) return 'cancelled'
+
     // pi RPC mode disables slash command expansion, so we do it here.
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
@@ -376,6 +389,13 @@ export class PiAcpSession {
       this.startTurn(queued)
     })
 
+    const tracked = turnPromise.then(
+      () => undefined,
+      () => undefined
+    )
+    this.outstandingTurns.add(tracked)
+    void tracked.then(() => this.outstandingTurns.delete(tracked))
+
     return turnPromise
   }
 
@@ -383,10 +403,8 @@ export class PiAcpSession {
     // Cancel current and clear any queued prompts.
     this.cancelRequested = true
 
-    if (this.turnQueue.length) {
-      const queued = this.turnQueue.splice(0, this.turnQueue.length)
-      for (const t of queued) t.resolve('cancelled')
-
+    const queued = this.turnQueue.splice(0, this.turnQueue.length)
+    if (queued.length) {
       this.emit({
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Cleared queued prompts.' }
@@ -397,8 +415,57 @@ export class PiAcpSession {
       })
     }
 
-    // Abort the currently running turn (if any). If nothing is running, this is a no-op.
-    await this.proc.abort()
+    try {
+      // Abort the currently running turn (if any). If nothing is running, this is a no-op.
+      await this.proc.abort()
+    } finally {
+      // A queued prompt response must not overtake the updates that explain
+      // why the queue was cleared, even when abort itself fails.
+      if (queued.length) {
+        await this.flushEmits()
+        for (const turn of queued) turn.resolve('cancelled')
+      }
+    }
+  }
+
+  /**
+   * Cancel all in-flight and queued turn work and wait for it to settle with
+   * `cancelled` after final updates flush. Agent-level lifecycle tracking waits
+   * adapter-handled prompts after this turn shutdown and process disposal.
+   */
+  shutdown(): Promise<void> {
+    if (!this.shutdownPromise) {
+      // Close admission before runShutdown reaches its first async boundary.
+      this.closing = true
+      this.shutdownPromise = this.runShutdown()
+    }
+    return this.shutdownPromise
+  }
+
+  private async runShutdown(): Promise<void> {
+    this.cancelRequested = true
+
+    // Drain the queue synchronously so nothing already queued can start while
+    // abort is in flight, but settle those requests only after final updates.
+    const queued = this.turnQueue.splice(0, this.turnQueue.length)
+
+    try {
+      await this.proc.abort()
+    } catch {
+      // The subprocess may already be gone; shutdown must still settle turns.
+    }
+
+    const turn = this.pendingTurn
+    if (turn) this.completeTurn(turn)
+
+    // completeTurn resolves the active request only after this update chain.
+    // Resolve drained queue entries afterward, then it is safe to await the
+    // complete outstanding-turn set without deadlocking on those entries.
+    await this.flushEmits()
+    for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
+
+    await Promise.all([...this.outstandingTurns])
+    await this.flushEmits()
   }
 
   wasCancelRequested(): boolean {
@@ -606,7 +673,21 @@ export class PiAcpSession {
     })
   }
 
+  private isClosing(): boolean {
+    return this.closing || this.disposed
+  }
+
   private startNextQueuedTurn(): void {
+    if (this.isClosing()) {
+      const queued = this.turnQueue.splice(0, this.turnQueue.length)
+      if (queued.length) {
+        void this.flushEmits().finally(() => {
+          for (const turn of queued) turn.resolve('cancelled')
+        })
+      }
+      return
+    }
+
     const next = this.turnQueue.shift()
     if (next) {
       // The queued turn's own `session/prompt` request is still in flight, so

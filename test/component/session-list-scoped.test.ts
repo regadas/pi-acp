@@ -7,9 +7,7 @@ import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
-test('PiAcpAgent: listSessions defaults to lastSessionCwd when cwd param is omitted', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
-
+function seedSessions(root: string): void {
   const dirA = join(root, 'sessions', '--a--')
   const dirB = join(root, 'sessions', '--b--')
   mkdirSync(dirA, { recursive: true })
@@ -56,21 +54,65 @@ test('PiAcpAgent: listSessions defaults to lastSessionCwd when cwd param is omit
       '\n',
     { encoding: 'utf8' }
   )
+}
+
+async function withSeededAgent(fn: (agent: PiAcpAgent) => Promise<void>): Promise<void> {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
+  seedSessions(root)
 
   const oldEnv = process.env.PI_CODING_AGENT_DIR
   process.env.PI_CODING_AGENT_DIR = root
 
   try {
-    const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-
-    ;(agent as any).lastSessionCwd = '/cwd/a'
-
-    const listed = await agent.listSessions({} as any)
-    assert.equal(listed.sessions.length, 1)
-    assert.equal(listed.sessions[0]?.sessionId, 'sess-a')
+    await fn(new PiAcpAgent(asAgentConn(new FakeAgentSideConnection())))
   } finally {
     if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = oldEnv
   }
+}
+
+test('PiAcpAgent: listSessions returns all known sessions when cwd is omitted', async () => {
+  await withSeededAgent(async agent => {
+    const listed = await agent.listSessions({})
+    const ids = listed.sessions.map(s => s.sessionId).sort()
+    assert.deepEqual(ids, ['sess-a', 'sess-b'])
+    assert.equal(listed.nextCursor, null)
+  })
+})
+
+test('PiAcpAgent: listSessions filters by the supplied cwd', async () => {
+  await withSeededAgent(async agent => {
+    const listed = await agent.listSessions({ cwd: '/cwd/a' })
+    assert.equal(listed.sessions.length, 1)
+    assert.equal(listed.sessions[0]?.sessionId, 'sess-a')
+
+    const none = await agent.listSessions({ cwd: '/cwd/unknown' })
+    assert.deepEqual(none.sessions, [])
+
+    await assert.rejects(() => agent.listSessions({ cwd: 'relative/path' }), /absolute path/i)
+  })
+})
+
+test('PiAcpAgent: listSessions rejects malformed cursors instead of treating them as zero', async () => {
+  await withSeededAgent(async agent => {
+    await assert.rejects(() => agent.listSessions({ cursor: 'not-a-cursor' }), /invalid cursor/i)
+    await assert.rejects(() => agent.listSessions({ cursor: '-1' }), /invalid cursor/i)
+    await assert.rejects(() => agent.listSessions({ cursor: '' }), /invalid cursor/i)
+    await assert.rejects(() => agent.listSessions({ cursor: '9007199254740992' }), /invalid cursor/i)
+  })
+})
+
+test('PiAcpAgent: listSessions accepts cursors it issued', async () => {
+  await withSeededAgent(async agent => {
+    // Page size is larger than the fixture, so a "2" offset yields an empty page.
+    const first = await agent.listSessions({ cursor: '0' })
+    assert.deepEqual(
+      first.sessions.map(session => session.sessionId),
+      ['sess-a', 'sess-b']
+    )
+
+    const listed = await agent.listSessions({ cursor: '2' })
+    assert.deepEqual(listed.sessions, [])
+    assert.equal(listed.nextCursor, null)
+  })
 })

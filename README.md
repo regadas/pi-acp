@@ -6,9 +6,9 @@ ACP ([Agent Client Protocol](https://agentclientprotocol.com/overview/introducti
 
 ## Status
 
-This is an MVP-style adapter intended to be useful today and easy to iterate on. Some ACP features may be not implemented or are not supported (see [Limitations](#limitations)). Development is centered around [Zed](https://zed.dev) editor support, other clients may have varying levels of compatibility.
+`pi-acp` targets the stable ACP v1 core using the current `@agentclientprotocol/sdk` builder API. It implements the baseline prompt lifecycle plus stable session list, load, resume, close, and delete methods. It is not fully ACP v1 conformant because client-provided stdio MCP servers are not connected yet; see [Limitations](#limitations).
 
-Expect some minor breaking changes.
+Development is centered around [Zed](https://zed.dev) editor support, and other clients may have varying levels of compatibility. Expect some minor breaking changes.
 
 ## Features
 
@@ -18,9 +18,15 @@ Expect some minor breaking changes.
   - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed
   - For `edit`, `pi-acp` attempts to infer a 1-based line number from a unique `oldText` match in the pre-edit file snapshot and includes it in the emitted tool location when possible
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
+- Stable ACP v1 session lifecycle
+  - `session/list` discovers all known pi sessions or filters them by cwd
+  - `session/load` restores a session and replays its history before responding
+  - `session/resume` restores a session without replaying history
+  - `session/close` cancels live work and releases the session subprocess while preserving history
+  - `session/delete` idempotently closes and removes a persisted pi session
 - Session persistence
   - pi stores its own sessions in `~/.pi/agent/sessions/...`
-  - `pi-acp` stores a small mapping file at `~/.pi/pi-acp/session-map.json` so `session/load` can reattach to a previous pi session file
+  - `pi-acp` stores a small mapping file at `~/.pi/pi-acp/session-map.json` so session lifecycle methods can reattach to a previous pi session file
 - Slash commands
   - Loads file-based slash commands compatible with pi’s conventions
   - Adds a small set of built-in commands for headless/editor usage
@@ -112,7 +118,8 @@ Point your ACP client to the built `dist/index.js`:
 ### Environment variables
 
 - `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
-- Default: unset/any other value means `false`.
+- `PI_ACP_DIR=/path/to/state` overrides the adapter-owned state directory (default: `~/.pi/pi-acp`).
+- Default for `PI_ACP_ENABLE_EMBEDDED_CONTEXT`: unset/any other value means `false`.
 - When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
 
 You can add the environment variable in the Zed settings with:
@@ -183,6 +190,7 @@ Your ACP client can also invoke this automatically based on the agent's advertis
 npm install
 npm run dev        # run from src via tsx
 npm run build
+npm run typecheck
 npm run lint
 npm run test
 ```
@@ -195,7 +203,7 @@ Project layout:
 ## Limitations
 
 - No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally.
-- MCP servers are accepted in ACP params and stored in session state, but not wired through to pi in this adapter. If you use [pi MCP adapter](https://github.com/nicobailon/pi-mcp-adapter) it will be available in the ACP client.
+- ACP v1 requires agents to connect client-provided stdio MCP servers. `pi-acp` currently accepts and stores `mcpServers` in session state but does not connect them, so this remains an explicit protocol conformance gap. Installing the [pi MCP adapter](https://github.com/nicobailon/pi-mcp-adapter) makes separately configured MCP servers available to pi, but does not wire the ACP request's `mcpServers` automatically.
 - Assistant streaming is currently sent as `agent_message_chunk` (no separate thought stream).
 - Queue is implemented client-side and should work like pi's `one-at-a-time`
 - ~~ACP clients don't yet suport session history, but ACP sessions from `pi-acp` can be `/resume`d in pi directly~~

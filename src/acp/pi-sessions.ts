@@ -317,7 +317,7 @@ export function listPiSessions(): PiSessionListItem[] {
   items.sort((a, b) => {
     const aa = a.updatedAt ?? ''
     const bb = b.updatedAt ?? ''
-    return bb.localeCompare(aa)
+    return bb.localeCompare(aa) || a.sessionId.localeCompare(b.sessionId) || a.sessionFile.localeCompare(b.sessionFile)
   })
 
   return items
