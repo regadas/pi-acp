@@ -87,7 +87,15 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
         getMessages: async () => ({
           messages: [
             { role: 'user', content: 'Hello' },
-            { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] }
+            { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] },
+            {
+              role: 'custom',
+              display: true,
+              content: [{ type: 'text', text: 'Background task completed.' }]
+            },
+            { role: 'custom', display: false, content: 'Hidden custom message' },
+            { role: 'custom', content: 'Display flag absent' },
+            { role: 'custom', display: true, content: [] }
           ]
         }),
         getAvailableModels: async () => ({ models: [] }),
@@ -111,6 +119,12 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
 
       assert.ok(texts.some(t => t.kind === 'user_message_chunk' && t.text === 'Hello'))
       assert.ok(texts.some(t => t.kind === 'agent_message_chunk' && t.text === 'Hi there!'))
+      assert.equal(
+        texts.filter(t => t.kind === 'agent_message_chunk' && t.text === 'Background task completed.').length,
+        1
+      )
+      assert.ok(!texts.some(t => t.text === 'Hidden custom message'))
+      assert.ok(!texts.some(t => t.text === 'Display flag absent'))
     } finally {
       PiRpcProcess.spawn = originalSpawn
     }

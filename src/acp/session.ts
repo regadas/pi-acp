@@ -26,6 +26,7 @@ import {
   bashTerminalOutputMeta,
   isBashTool
 } from './translate/bash.js'
+import { normalizePiMessageText } from './translate/pi-messages.js'
 import { toolResultToText } from './translate/pi-tools.js'
 
 type SessionCreateParams = {
@@ -278,6 +279,7 @@ export class PiAcpSession {
 
   private startupInfo: string | null = null
   private startupInfoSent = false
+  private readonly pendingCustomMessageTexts: string[] = []
 
   readonly proc: PiRpcProcess
   private readonly conn: AcpClient
@@ -372,6 +374,16 @@ export class PiAcpSession {
       sessionUpdate: 'agent_message_chunk',
       content: { type: 'text', text: this.startupInfo }
     })
+  }
+
+  private sendPendingCustomMessages(): void {
+    const texts = this.pendingCustomMessageTexts.splice(0)
+    for (const text of texts) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text } satisfies ContentBlock
+      })
+    }
   }
 
   async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
@@ -580,6 +592,10 @@ export class PiAcpSession {
     // updates while a `session/prompt` is active, so the banner must not be
     // emitted right after session/new (https://github.com/svkozak/pi-acp/issues/59).
     this.sendStartupInfoIfPending()
+
+    // Custom messages can arrive while pi is idle. Defer them until a prompt
+    // is active so their agent_message_chunks remain inside an ACP turn.
+    this.sendPendingCustomMessages()
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -823,6 +839,24 @@ export class PiAcpSession {
         }
 
         // Ignore other delta/event types for now.
+        break
+      }
+
+      case 'message_end': {
+        const message = (ev as any).message
+        if (message?.role !== 'custom' || message.display !== true) break
+
+        const text = normalizePiMessageText(message.content)
+        if (!text) break
+
+        if (this.pendingTurn && !this.pendingTurn.completionStarted) {
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text } satisfies ContentBlock
+          })
+        } else {
+          this.pendingCustomMessageTexts.push(text)
+        }
         break
       }
 

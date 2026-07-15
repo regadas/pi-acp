@@ -34,6 +34,115 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   })
 })
 
+test('PiAcpSession: emits visible custom messages in-turn and omits hidden custom messages', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('test prompt')
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      display: true,
+      content: [
+        { type: 'text', text: 'Background task ' },
+        { type: 'image', data: 'ignored' },
+        { type: 'text', text: 'completed.' }
+      ]
+    }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', display: false, content: 'Hidden custom message' }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', content: 'Display flag absent' }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', display: true, content: [] }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Already streamed' }] }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await prompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+
+  const agentChunks = conn.updates
+    .map(update => update.update)
+    .filter(update => update.sessionUpdate === 'agent_message_chunk')
+  assert.equal(agentChunks.length, 1)
+  assert.deepEqual(agentChunks[0], {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: 'Background task completed.' }
+  })
+})
+
+test('PiAcpSession: buffers out-of-turn custom messages until the next prompt exactly once', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  const agentMessageTexts = () =>
+    conn.updates
+      .map(update => update.update)
+      .filter(update => update.sessionUpdate === 'agent_message_chunk')
+      .map(update => (update as any).content.text)
+
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', display: true, content: 'First idle message.' }
+  })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', display: true, content: 'Second idle message.' }
+  })
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(agentMessageTexts(), [])
+
+  const firstPrompt = session.prompt('first prompt')
+  proc.emit({ type: 'agent_settled' })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'custom', display: true, content: 'After completion started.' }
+  })
+  assert.equal(await firstPrompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(agentMessageTexts(), ['First idle message.', 'Second idle message.'])
+
+  const secondPrompt = session.prompt('second prompt')
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await secondPrompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(agentMessageTexts(), ['First idle message.', 'Second idle message.', 'After completion started.'])
+
+  const thirdPrompt = session.prompt('third prompt')
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await thirdPrompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(agentMessageTexts(), ['First idle message.', 'Second idle message.', 'After completion started.'])
+})
+
 test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()

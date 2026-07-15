@@ -1177,6 +1177,19 @@ export class PiAcpAgent implements ACPAgent {
           }
         }
 
+        if (role === 'custom' && m?.display === true) {
+          const text = normalizePiMessageText(m?.content)
+          if (text) {
+            await this.sendLoadUpdate(params.sessionId, generation, {
+              sessionId: session.sessionId,
+              update: {
+                sessionUpdate: 'agent_message_chunk',
+                content: { type: 'text', text }
+              }
+            })
+          }
+        }
+
         if (role === 'toolResult') {
           const toolName = String((m as any)?.toolName ?? 'tool')
           const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
