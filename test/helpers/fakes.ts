@@ -72,7 +72,8 @@ export class FakePiRpcProcess {
     return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
   }
 
-  async getMessages(): Promise<any> {
+  async getMessages(beforeResponseResolve?: () => void): Promise<any> {
+    beforeResponseResolve?.()
     return { messages: [] }
   }
 }

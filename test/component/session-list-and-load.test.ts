@@ -10,7 +10,7 @@ import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 // We mock PiRpcProcess.spawn so loadSession doesn't actually spawn `pi`.
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
-test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history', async () => {
+test('PiAcpAgent: loadSession replays visible custom history once across the response boundary', async () => {
   // Create a fake PI_CODING_AGENT_DIR with one session.
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
   const sessionsDir = join(root, 'sessions', '--tmp--project--')
@@ -74,6 +74,42 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
 
     // 2) load session: mock spawn to return fake proc with getMessages
     const originalSpawn = PiRpcProcess.spawn
+    let eventHandler: ((event: Record<string, unknown>) => void) | undefined
+    const preBoundarySnapshotMessage = {
+      role: 'custom',
+      customType: 'background-task',
+      display: true,
+      content: 'Pre-boundary snapshot message.',
+      timestamp: 1
+    }
+    const postBoundarySnapshotMessage = {
+      role: 'custom',
+      customType: 'background-task',
+      display: true,
+      content: 'Post-boundary snapshot message.',
+      timestamp: 2
+    }
+    const postBoundaryQueuedMessage = {
+      role: 'custom',
+      customType: 'background-task',
+      display: true,
+      content: 'Post-boundary queued message.',
+      timestamp: 3
+    }
+    const timestampLessSnapshotMessage = {
+      role: 'custom',
+      customType: 'timestamp-less',
+      display: true,
+      content: 'Timestamp-less message.',
+      details: { source: 'snapshot' }
+    }
+    const timestampLessQueuedMessage = {
+      role: 'custom',
+      customType: 'timestamp-less',
+      display: true,
+      content: 'Timestamp-less message.',
+      details: { source: 'queued' }
+    }
 
     ;(PiRpcProcess as any).spawn = async (params: any) => {
       // ensure loadSession resolves to some jsonl that ends with our expected filename
@@ -81,25 +117,38 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
       assert.ok(params.sessionPath.endsWith('/0000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jsonl'))
 
       return {
-        onEvent: () => () => {
-          // noop unsubscribe
+        onEvent: (handler: (event: Record<string, unknown>) => void) => {
+          eventHandler = handler
+          return () => {
+            if (eventHandler === handler) eventHandler = undefined
+          }
         },
-        getMessages: async () => ({
-          messages: [
-            { role: 'user', content: 'Hello' },
-            { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] },
-            {
-              role: 'custom',
-              display: true,
-              content: [{ type: 'text', text: 'Background task completed.' }]
-            },
-            { role: 'custom', display: false, content: 'Hidden custom message' },
-            { role: 'custom', content: 'Display flag absent' },
-            { role: 'custom', display: true, content: [] }
-          ]
-        }),
+        getMessages: async (beforeResponseResolve?: () => void) => {
+          eventHandler?.({ type: 'message_end', message: { ...preBoundarySnapshotMessage } })
+          beforeResponseResolve?.()
+          eventHandler?.({ type: 'message_end', message: { ...postBoundarySnapshotMessage } })
+          eventHandler?.({ type: 'message_end', message: { ...postBoundaryQueuedMessage } })
+          // Emit the unmatched timestamp-less event first. A fallback identity
+          // that ignores stable details would consume the wrong snapshot count.
+          eventHandler?.({ type: 'message_end', message: { ...timestampLessQueuedMessage } })
+          eventHandler?.({ type: 'message_end', message: { ...timestampLessSnapshotMessage } })
+
+          return {
+            messages: [
+              { role: 'user', content: 'Hello' },
+              { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] },
+              preBoundarySnapshotMessage,
+              postBoundarySnapshotMessage,
+              timestampLessSnapshotMessage,
+              { role: 'custom', display: false, content: 'Hidden custom message' },
+              { role: 'custom', content: 'Display flag absent' },
+              { role: 'custom', display: true, content: [] }
+            ]
+          }
+        },
         getAvailableModels: async () => ({ models: [] }),
-        getState: async () => ({ thinkingLevel: 'medium' })
+        getState: async () => ({ thinkingLevel: 'medium', isStreaming: true }),
+        prompt: async () => {}
       } as any
     }
 
@@ -119,12 +168,31 @@ test('PiAcpAgent: listSessions lists pi sessions and loadSession replays history
 
       assert.ok(texts.some(t => t.kind === 'user_message_chunk' && t.text === 'Hello'))
       assert.ok(texts.some(t => t.kind === 'agent_message_chunk' && t.text === 'Hi there!'))
-      assert.equal(
-        texts.filter(t => t.kind === 'agent_message_chunk' && t.text === 'Background task completed.').length,
-        1
-      )
+      assert.equal(texts.filter(t => t.text === 'Pre-boundary snapshot message.').length, 1)
+      assert.equal(texts.filter(t => t.text === 'Post-boundary snapshot message.').length, 1)
+      assert.equal(texts.filter(t => t.text === 'Timestamp-less message.').length, 1)
       assert.ok(!texts.some(t => t.text === 'Hidden custom message'))
       assert.ok(!texts.some(t => t.text === 'Display flag absent'))
+      assert.ok(!texts.some(t => t.text === 'Post-boundary queued message.'))
+
+      const nextPrompt = agent.prompt({
+        sessionId: 'sess-1',
+        prompt: [{ type: 'text', text: 'Continue' }]
+      } as any)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      eventHandler?.({ type: 'agent_start' })
+      eventHandler?.({ type: 'agent_settled' })
+      assert.equal((await nextPrompt).stopReason, 'end_turn')
+      await new Promise(resolve => setTimeout(resolve, 0))
+
+      const allAgentTexts = conn.updates
+        .map(u => (u as any).update)
+        .filter(u => u?.sessionUpdate === 'agent_message_chunk')
+        .map(u => u.content?.text)
+      assert.equal(allAgentTexts.filter(text => text === 'Pre-boundary snapshot message.').length, 1)
+      assert.equal(allAgentTexts.filter(text => text === 'Post-boundary snapshot message.').length, 1)
+      assert.equal(allAgentTexts.filter(text => text === 'Post-boundary queued message.').length, 1)
+      assert.equal(allAgentTexts.filter(text => text === 'Timestamp-less message.').length, 2)
     } finally {
       PiRpcProcess.spawn = originalSpawn
     }

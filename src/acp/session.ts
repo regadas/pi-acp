@@ -52,6 +52,12 @@ type QueuedTurn = {
   reject: (err: unknown) => void
 }
 
+type PendingCustomMessage = {
+  text: string
+  identity: string
+  sequence: number
+}
+
 type PermissionResponse = Awaited<ReturnType<AcpClient['requestPermission']>>
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
@@ -82,6 +88,30 @@ function getToolPath(args: unknown): string | undefined {
   if (typeof record?.path === 'string') return record.path
   if (typeof record?.file_path === 'string') return record.file_path
   return undefined
+}
+
+function customMessageIdentity(message: unknown, text: string): string {
+  const record = message as { timestamp?: unknown; customType?: unknown; details?: unknown } | null | undefined
+  const timestamp = record?.timestamp
+  const timestampIdentity =
+    (typeof timestamp === 'number' && Number.isFinite(timestamp)) ||
+    (typeof timestamp === 'string' && timestamp.length > 0)
+      ? timestamp
+      : null
+
+  let detailsIdentity: string
+  try {
+    detailsIdentity = JSON.stringify(record?.details ?? null)
+  } catch {
+    detailsIdentity = 'unserializable'
+  }
+
+  return JSON.stringify([
+    timestampIdentity,
+    typeof record?.customType === 'string' ? record.customType : null,
+    text,
+    detailsIdentity
+  ])
 }
 
 // Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
@@ -279,7 +309,9 @@ export class PiAcpSession {
 
   private startupInfo: string | null = null
   private startupInfoSent = false
-  private readonly pendingCustomMessageTexts: string[] = []
+  private activeAdapterPromptTurns = 0
+  private customMessageSequence = 0
+  private readonly pendingCustomMessages: PendingCustomMessage[] = []
 
   readonly proc: PiRpcProcess
   private readonly conn: AcpClient
@@ -376,12 +408,66 @@ export class PiAcpSession {
     })
   }
 
+  beginAdapterPromptTurn(): () => Promise<void> {
+    this.activeAdapterPromptTurns += 1
+    this.sendStartupInfoIfPending()
+    this.sendPendingCustomMessages()
+
+    let active = true
+    return async () => {
+      if (!active) return
+      active = false
+
+      // Close the scope synchronously before capturing the update chain so
+      // later custom messages are deferred instead of escaping after response.
+      this.activeAdapterPromptTurns -= 1
+      await this.flushEmits()
+    }
+  }
+
+  currentCustomMessageSequence(): number {
+    return this.customMessageSequence
+  }
+
+  reconcileLoadedCustomMessages(messages: unknown[], throughSequence: number): void {
+    const replayedByIdentity = new Map<string, number>()
+    for (const message of messages) {
+      const record = message as { role?: unknown; display?: unknown; content?: unknown } | null | undefined
+      if (record?.role !== 'custom' || record.display !== true) continue
+
+      const text = normalizePiMessageText(record.content)
+      if (!text) continue
+
+      const identity = customMessageIdentity(message, text)
+      replayedByIdentity.set(identity, (replayedByIdentity.get(identity) ?? 0) + 1)
+    }
+
+    const reconciledSequences = new Set<number>()
+    const reconcile = (pendingMessages: PendingCustomMessage[]) => {
+      for (const message of pendingMessages) {
+        const remaining = replayedByIdentity.get(message.identity) ?? 0
+        if (remaining === 0) continue
+
+        replayedByIdentity.set(message.identity, remaining - 1)
+        reconciledSequences.add(message.sequence)
+      }
+    }
+
+    // Prefer events observed before the response boundary, then reconcile
+    // later events only when their stable identity is actually in the snapshot.
+    reconcile(this.pendingCustomMessages.filter(message => message.sequence <= throughSequence))
+    reconcile(this.pendingCustomMessages.filter(message => message.sequence > throughSequence))
+
+    const retained = this.pendingCustomMessages.filter(message => !reconciledSequences.has(message.sequence))
+    this.pendingCustomMessages.splice(0, this.pendingCustomMessages.length, ...retained)
+  }
+
   private sendPendingCustomMessages(): void {
-    const texts = this.pendingCustomMessageTexts.splice(0)
-    for (const text of texts) {
+    const messages = this.pendingCustomMessages.splice(0)
+    for (const message of messages) {
       this.emit({
         sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text } satisfies ContentBlock
+        content: { type: 'text', text: message.text } satisfies ContentBlock
       })
     }
   }
@@ -507,19 +593,30 @@ export class PiAcpSession {
     return this.cancelRequested
   }
 
-  private emit(update: SessionUpdate): void {
-    // Serialize update delivery.
-    this.lastEmit = this.lastEmit
-      .then(() =>
-        this.conn.sessionUpdate({
-          sessionId: this.sessionId,
-          update
-        })
-      )
-      .catch(() => {
-        // Ignore notification errors (client may have gone away). We still want
-        // prompt completion.
+  private enqueueUpdate(update: SessionUpdate): Promise<void> {
+    const delivery = this.lastEmit.then(() =>
+      this.conn.sessionUpdate({
+        sessionId: this.sessionId,
+        update
       })
+    )
+
+    this.lastEmit = delivery.catch(() => {
+      // Ignore notification errors (client may have gone away). We still want
+      // prompt completion and later notifications to proceed.
+    })
+    return delivery
+  }
+
+  private emit(update: SessionUpdate): void {
+    void this.enqueueUpdate(update)
+  }
+
+  sendSessionUpdate(params: Parameters<AcpClient['sessionUpdate']>[0]): Promise<void> {
+    if (params.sessionId !== this.sessionId) {
+      return Promise.reject(new Error(`session update mismatch: ${params.sessionId}`))
+    }
+    return this.enqueueUpdate(params.update)
   }
 
   private async flushEmits(): Promise<void> {
@@ -849,13 +946,20 @@ export class PiAcpSession {
         const text = normalizePiMessageText(message.content)
         if (!text) break
 
-        if (this.pendingTurn && !this.pendingTurn.completionStarted) {
+        const pendingMessage: PendingCustomMessage = {
+          text,
+          identity: customMessageIdentity(message, text),
+          sequence: ++this.customMessageSequence
+        }
+        const forwardedTurnActive = Boolean(this.pendingTurn && !this.pendingTurn.completionStarted)
+
+        if (forwardedTurnActive || this.activeAdapterPromptTurns > 0) {
           this.emit({
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text } satisfies ContentBlock
           })
         } else {
-          this.pendingCustomMessageTexts.push(text)
+          this.pendingCustomMessages.push(pendingMessage)
         }
         break
       }

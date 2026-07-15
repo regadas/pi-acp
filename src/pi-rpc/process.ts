@@ -86,7 +86,14 @@ type SpawnParams = {
 
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
-  private readonly pending = new Map<string, { resolve: (v: PiRpcResponse) => void; reject: (e: unknown) => void }>()
+  private readonly pending = new Map<
+    string,
+    {
+      resolve: (v: PiRpcResponse) => void
+      reject: (e: unknown) => void
+      beforeResolve?: () => void
+    }
+  >()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private readonly preludeLines: string[] = []
 
@@ -113,7 +120,12 @@ export class PiRpcProcess {
           const pending = this.pending.get(id)
           if (pending) {
             this.pending.delete(id)
-            pending.resolve(msg as PiRpcResponse)
+            try {
+              pending.beforeResolve?.()
+              pending.resolve(msg as PiRpcResponse)
+            } catch (error) {
+              pending.reject(error)
+            }
             return
           }
         }
@@ -333,8 +345,12 @@ export class PiRpcProcess {
     if (!res.success) throw new Error(`pi switch_session failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
-  async getMessages(): Promise<unknown> {
-    const res = await this.request({ type: 'get_messages' })
+  /**
+   * The callback runs synchronously at the response line boundary, before
+   * later stdout events can be dispatched from the same input chunk.
+   */
+  async getMessages(beforeResponseResolve?: () => void): Promise<unknown> {
+    const res = await this.request({ type: 'get_messages' }, beforeResponseResolve)
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
@@ -349,14 +365,14 @@ export class PiRpcProcess {
     await this.writeLine(`${JSON.stringify({ type: 'extension_ui_response', ...response })}\n`)
   }
 
-  private request(cmd: PiRpcCommand): Promise<PiRpcResponse> {
+  private request(cmd: PiRpcCommand, beforeResolve?: () => void): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const withId = { ...cmd, id }
 
     const line = `${JSON.stringify(withId)}\n`
 
     return new Promise<PiRpcResponse>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      this.pending.set(id, { resolve, reject, beforeResolve })
 
       void this.writeLine(line).catch(error => {
         this.pending.delete(id)

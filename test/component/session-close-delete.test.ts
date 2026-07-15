@@ -202,6 +202,71 @@ test('PiAcpAgent: close waits for adapter commands, cancels them, and closes adm
   assert.equal(conn.updates.length, updatesAfterClose, 'cancelled adapter command emitted no update after close')
 })
 
+test('PiAcpAgent: visible custom messages during adapter commands stay in that prompt turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  const manager = (agent as any).sessions as SessionManager
+  manager.getOrCreate('s-compact-custom', {
+    cwd: process.cwd(),
+    mcpServers: [],
+    conn: asAgentConn(conn),
+    proc: proc as any,
+    fileCommands: []
+  })
+
+  const compactStarted = deferred<void>()
+  const compactResult = deferred<unknown>()
+  ;(proc as any).compact = async () => {
+    compactStarted.resolve()
+    return compactResult.promise
+  }
+
+  let commandSettled = false
+  const command = agent.prompt(promptParams('s-compact-custom', '/compact')).then(result => {
+    commandSettled = true
+    return result
+  })
+  await compactStarted.promise
+
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      customType: 'background-task',
+      display: true,
+      content: 'Background task completed during compact.',
+      timestamp: 1
+    }
+  })
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const customMessageCount = () =>
+    conn.updates.filter(
+      message =>
+        message.update.sessionUpdate === 'agent_message_chunk' &&
+        message.update.content.type === 'text' &&
+        message.update.content.text === 'Background task completed during compact.'
+    ).length
+
+  assert.equal(commandSettled, false)
+  assert.equal(customMessageCount(), 1, 'custom message was delivered while /compact was active')
+
+  compactResult.resolve({ tokensBefore: 42, summary: 'Compacted.' })
+  assert.equal((await command).stopReason, 'end_turn')
+
+  const nextPrompt = agent.prompt(promptParams('s-compact-custom', 'ordinary prompt'))
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(proc.prompts.length, 1)
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal((await nextPrompt).stopReason, 'end_turn')
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  assert.equal(customMessageCount(), 1, 'custom message did not leak into the next prompt')
+  agent.dispose()
+})
+
 test('PiAcpSession: cancel flushes queue-cleared updates before queued responses', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
