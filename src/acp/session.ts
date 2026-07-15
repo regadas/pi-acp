@@ -9,7 +9,7 @@ import type {
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
-import { readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, statSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
@@ -140,11 +140,34 @@ function getEditOldTexts(args: unknown): string[] {
   return oldTexts
 }
 
-function toToolCallLocations(args: unknown, cwd: string, line?: number): ToolCallLocation[] | undefined {
+function toToolCallLocations(
+  toolName: string,
+  args: unknown,
+  cwd: string,
+  line?: number
+): ToolCallLocation[] | undefined {
   const path = getToolPath(args)
   if (!path) return undefined
 
   const resolvedPath = isAbsolute(path) ? path : resolvePath(cwd, path)
+  let entry: ReturnType<typeof lstatSync>
+  try {
+    entry = lstatSync(resolvedPath)
+  } catch (error) {
+    const isMissing = (error as NodeJS.ErrnoException).code === 'ENOENT'
+    if (!isMissing || toolName.toLowerCase() !== 'write') return undefined
+    return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
+  }
+
+  if (entry.isSymbolicLink()) {
+    try {
+      entry = statSync(resolvedPath)
+    } catch {
+      return undefined
+    }
+  }
+
+  if (!entry.isFile()) return undefined
   return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
 }
 
@@ -755,7 +778,8 @@ export class PiAcpSession {
                     }
                   })()
 
-            const locations = toToolCallLocations(rawInput, this.cwd)
+            const locations =
+              ame.type === 'toolcall_delta' ? undefined : toToolCallLocations(toolName, rawInput, this.cwd)
             const existingStatus = this.currentToolCalls.get(toolCallId)
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
             const status = existingStatus ?? 'pending'
@@ -809,7 +833,7 @@ export class PiAcpSession {
         let line: number | undefined
 
         if (isBashTool(toolName)) {
-          const locations = toToolCallLocations(args, this.cwd)
+          const locations = toToolCallLocations(toolName, args, this.cwd)
           const existingStatus = this.currentToolCalls.get(toolCallId)
           this.currentToolCalls.set(toolCallId, 'in_progress')
           this.emitBashToolCall({
@@ -849,7 +873,7 @@ export class PiAcpSession {
           }
         }
 
-        const locations = toToolCallLocations(args, this.cwd, line)
+        const locations = toToolCallLocations(toolName, args, this.cwd, line)
 
         // If we already surfaced the tool call while the model streamed it, just transition.
         if (!this.currentToolCalls.has(toolCallId)) {

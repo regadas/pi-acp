@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpSession } from '../../src/acp/session.js'
@@ -124,9 +124,10 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
 })
 
-test('PiAcpSession: emits tool locations from pi path args', async () => {
+test('PiAcpSession: emits existing file locations for built-in and custom tools', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
+  const args = { path: 'src/acp/session.ts' }
 
   new PiAcpSession({
     sessionId: 's1',
@@ -137,14 +138,116 @@ test('PiAcpSession: emits tool locations from pi path args', async () => {
     fileCommands: []
   })
 
-  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'read', args: { path: 'src/acp/session.ts' } })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'read', toolName: 'read', args })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'custom', toolName: 'ctx_execute_file', args })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
+  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+  assert.deepEqual((conn.updates[1]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+})
+
+test('PiAcpSession: omits directory tool locations', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-directory-location-'))
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd,
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'ctx_index', args: { path: cwd } })
 
   await new Promise(r => setTimeout(r, 0))
 
   assert.equal(conn.updates.length, 1)
-  assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+  assert.equal((conn.updates[0]!.update as any).locations, undefined)
 })
+
+test('PiAcpSession: omits missing locations for non-write tools', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-missing-location-'))
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd,
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'tool_execution_start',
+    toolCallId: 't1',
+    toolName: 'read',
+    args: { path: 'missing.txt' }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 1)
+  assert.equal((conn.updates[0]!.update as any).locations, undefined)
+})
+
+test(
+  'PiAcpSession: follows symlinks only when they resolve to files',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-symlink-location-'))
+    const filePath = join(cwd, 'target.txt')
+    const directoryPath = join(cwd, 'directory')
+    const fileLink = join(cwd, 'file-link')
+    const directoryLink = join(cwd, 'directory-link')
+    const brokenLink = join(cwd, 'broken-link')
+
+    writeFileSync(filePath, 'content', 'utf8')
+    mkdirSync(directoryPath)
+    symlinkSync(filePath, fileLink)
+    symlinkSync(directoryPath, directoryLink)
+    symlinkSync(join(cwd, 'missing-target'), brokenLink)
+
+    new PiAcpSession({
+      sessionId: 's1',
+      cwd,
+      mcpServers: [],
+      proc: proc as any,
+      conn: asAgentConn(conn),
+      fileCommands: []
+    })
+
+    proc.emit({ type: 'tool_execution_start', toolCallId: 'file', toolName: 'read', args: { path: fileLink } })
+    proc.emit({
+      type: 'tool_execution_start',
+      toolCallId: 'directory',
+      toolName: 'read',
+      args: { path: directoryLink }
+    })
+    proc.emit({
+      type: 'tool_execution_start',
+      toolCallId: 'broken',
+      toolName: 'read',
+      args: { path: brokenLink }
+    })
+
+    await new Promise(r => setTimeout(r, 0))
+
+    assert.equal(conn.updates.length, 3)
+    assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: fileLink }])
+    assert.equal((conn.updates[1]!.update as any).locations, undefined)
+    assert.equal((conn.updates[2]!.update as any).locations, undefined)
+  }
+)
 
 test('PiAcpSession: handles extension select via ACP permission request', async () => {
   const conn = new FakeAgentSideConnection()
@@ -476,13 +579,20 @@ test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with
   )
 })
 
-test('PiAcpSession: emits streamed tool locations from pi path args', async () => {
+test('PiAcpSession: emits missing write locations at stream boundaries but not deltas', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-streamed-location-'))
+  const filePath = join(cwd, 'new.txt')
+  const toolCall = {
+    id: 't1',
+    name: 'write',
+    arguments: { path: filePath, content: 'hello' }
+  }
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -491,21 +601,27 @@ test('PiAcpSession: emits streamed tool locations from pi path args', async () =
 
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: {
-      type: 'toolcall_start',
-      toolCall: {
-        id: 't1',
-        name: 'write',
-        arguments: { path: '/tmp/test.txt', content: 'hello' }
-      }
-    }
+    assistantMessageEvent: { type: 'toolcall_start', toolCall }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_delta', toolCall }
+  })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'toolcall_end', toolCall }
   })
 
   await new Promise(r => setTimeout(r, 0))
 
-  assert.equal(conn.updates.length, 1)
+  assert.equal(conn.updates.length, 3)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: '/tmp/test.txt' }])
+  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: filePath }])
+  assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
+  assert.equal((conn.updates[1]!.update as any).locations, undefined)
+  assert.deepEqual((conn.updates[1]!.update as any).rawInput, toolCall.arguments)
+  assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
+  assert.deepEqual((conn.updates[2]!.update as any).locations, [{ path: filePath }])
 })
 
 test('PiAcpSession: emits edit tool line when oldText matches uniquely', async () => {
