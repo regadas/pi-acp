@@ -93,8 +93,12 @@ async function loadAndCountReplay(sessionId) {
       if (msg?.method === 'session/update') updates++
 
       if (msg?.id === 2) {
-        if (msg?.result !== null) {
-          reject(new Error('Expected session/load result to be null'))
+        if (!msg?.result || typeof msg.result !== 'object') {
+          reject(new Error('Expected session/load to return a LoadSessionResponse object'))
+          return
+        }
+        if ('models' in msg.result) {
+          reject(new Error('session/load must not return a custom root models field'))
           return
         }
         a.kill()

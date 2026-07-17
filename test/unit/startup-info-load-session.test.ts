@@ -14,27 +14,27 @@ class FakeStore {
 }
 
 test('PiAcpAgent: does not emit startup info on loadSession', async () => {
-  // spy on timers (commands update is scheduled)
-  const realSetTimeout = globalThis.setTimeout
-  const timeouts: Array<unknown> = []
-  ;(globalThis as any).setTimeout = (fn: unknown, _ms?: number) => {
-    timeouts.push(fn)
-    return 0 as any
-  }
-
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = async () => {
     return {
       onEvent: () => () => {},
-      getMessages: async () => ({ messages: [] }),
+      onTermination: () => () => {},
+      getTree: async () => ({ tree: [], leafId: null }),
       getAvailableModels: async () => ({ models: [] }),
-      getState: async () => ({ thinkingLevel: 'medium' })
+      // Restore validation requires pi to report the requested session.
+      getState: async () => ({ thinkingLevel: 'medium', sessionId: 's1', sessionFile: '/tmp/s.jsonl' })
     } as any
   }
 
   try {
     const conn = new FakeAgentSideConnection()
     const agent = new PiAcpAgent(asAgentConn(conn))
+
+    // Local seam: capture deferred notifications instead of patching timers.
+    const deferred: Array<() => void> = []
+    ;(agent as any).scheduleDeferred = (task: () => void) => {
+      deferred.push(task)
+    }
 
     // Inject store so loadSession resolves without depending on actual filesystem.
     ;(agent as any).store = new FakeStore()
@@ -44,9 +44,8 @@ test('PiAcpAgent: does not emit startup info on loadSession', async () => {
     assert.equal((res as any)?._meta?.piAcp?.startupInfo, null)
 
     // Only available_commands_update should be scheduled.
-    assert.equal(timeouts.length, 1)
+    assert.equal(deferred.length, 1)
   } finally {
-    ;(globalThis as any).setTimeout = realSetTimeout
     PiRpcProcess.spawn = originalSpawn
   }
 })

@@ -25,19 +25,35 @@ import {
   type SetSessionConfigOptionResponse,
   type SetSessionModeRequest,
   type SetSessionModeResponse,
-  type StopReason
+  type AuthMethod,
+  type StopReason,
+  type ToolCallContent
 } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
 import { getAuthMethods } from './auth.js'
 import { SessionManager, type PiAcpSession } from './session.js'
 import { SessionStore } from './session-store.js'
-import { PiRpcProcess } from '../pi-rpc/process.js'
+import { PiRpcProcess, PiRpcRequestTimeoutError } from '../pi-rpc/process.js'
+import { getPiCommand, shouldUseShellForPiCommand } from '../pi-rpc/command.js'
+import { comparePiVersions, parsePiVersion } from '../pi-rpc/version.js'
 import { listPiSessions, findPiSession } from './pi-sessions.js'
-import { normalizePiAssistantText, normalizePiMessageText } from './translate/pi-messages.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import {
+  translateAssistantContent,
+  translateCustomMessageContent,
+  translateUserContent
+} from './translate/pi-messages.js'
+import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
+import { PiSessionTreeError, walkActiveTreeBranch } from './translate/tree-walk.js'
+import {
+  FALLBACK_THINKING_LEVELS,
+  isThinkingLevel,
+  supportedThinkingLevels,
+  type ThinkingLevel
+} from './thinking-levels.js'
 import {
   bashCommand,
   bashExitCode,
+  bashOrderedContent,
   bashResultText,
   bashTerminalContent,
   bashTerminalExitMeta,
@@ -50,13 +66,12 @@ import { loadSlashCommands, parseCommandArgs, toAvailableCommands, type FileSlas
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
-import { isAbsolute } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
+import { homedir } from 'node:os'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
-import { join, dirname, basename } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 type AdvertisedModel = {
   modelId: string
   name: string
@@ -65,6 +80,37 @@ type AdvertisedModel = {
 
 const MODEL_CONFIG_ID = 'model'
 const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
+
+function historyToolKind(toolName: string): 'read' | 'edit' | 'other' {
+  if (toolName === 'read') return 'read'
+  if (toolName === 'write' || toolName === 'edit') return 'edit'
+  return 'other'
+}
+
+/**
+ * pi has no MCP support (an extension would be required to bridge MCP
+ * servers), so silently accepting `mcpServers` would hand the client a
+ * session that is missing its requested tools. Reject explicitly before any
+ * session side effects instead of degrading silently.
+ */
+function assertNoMcpServers(mcpServers: readonly unknown[] | undefined): void {
+  if (!mcpServers?.length) return
+  throw RequestError.invalidParams(
+    { reason: 'MCP_SERVERS_UNSUPPORTED' },
+    `pi does not support MCP servers, so pi-acp cannot connect the ${mcpServers.length} requested MCP server(s). ` +
+      'Remove mcpServers from the session request. To use MCP tools with pi, configure them through a pi extension ' +
+      '(e.g. https://github.com/nicobailon/pi-mcp-adapter) instead.'
+  )
+}
+
+function sessionPathsEquivalent(left: string, right: string): boolean {
+  if (resolve(left) === resolve(right)) return true
+  try {
+    return realpathSync(left) === realpathSync(right)
+  } catch {
+    return false
+  }
+}
 
 function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -123,22 +169,45 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
 
   return out
 }
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AcpClient
-  private readonly sessions = new SessionManager()
+  // Declared before `sessions` so the shared store exists when the manager
+  // field initializer runs (class fields initialize in declaration order).
   private readonly store = new SessionStore()
+  private readonly sessions = new SessionManager(this.store)
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
   private readonly cancellationEpochs = new Map<string, number>()
   private readonly loadGenerations = new Map<string, number>()
   private readonly activePrompts = new Map<string, Set<Promise<void>>>()
   private readonly activeLoads = new Map<string, Set<Promise<void>>>()
   private readonly closingSessions = new Map<string, Promise<void>>()
+  // Serializes model/thinking-level mutations per session so a concurrent
+  // write cannot slip between another write's support check and its
+  // post-write verification.
+  private readonly configMutationQueues = new Map<string, Promise<void>>()
+  private disposed = false
+
+  // Negotiated at initialize: the auth methods this connection advertised.
+  // `authenticate` accepts only these IDs, and auth-required errors raised
+  // anywhere in this agent's sessions advertise exactly this set.
+  private authMethods: AuthMethod[] = []
+  private advertisedAuthMethodIds = new Set<string>()
+
+  // Negotiated at initialize. Zed advertises `_meta.terminal_output` for its
+  // display-only terminal rendering convention; other clients get standard
+  // text/image tool content instead. Defaults are strict (off) so nothing
+  // non-standard leaks before initialization.
+  private supportsTerminalOutputMeta = false
 
   dispose(): void {
+    // Marking disposed first lets every in-flight create/restore that crosses
+    // its next await boundary dispose its fresh process instead of
+    // registering it; disposeAll then closes everything already registered.
+    this.disposed = true
     this.sessions.disposeAll()
   }
 
@@ -195,6 +264,7 @@ export class PiAcpAgent implements ACPAgent {
   private isPromptCancelled(sessionId: string, cancellationEpoch: number, signal?: AbortSignal): boolean {
     return (
       signal?.aborted === true ||
+      this.disposed ||
       this.closingSessions.has(sessionId) ||
       this.activeLoads.has(sessionId) ||
       (this.cancellationEpochs.get(sessionId) ?? 0) !== cancellationEpoch
@@ -358,13 +428,58 @@ export class PiAcpAgent implements ACPAgent {
         throw e
       }
 
+      // The connection may have been torn down while the spawn was in flight;
+      // a disposed agent must never register (and thereby leak) this process.
+      if (this.disposed) {
+        proc.dispose()
+        throw RequestError.internalError({}, 'pi-acp agent is disposed')
+      }
+
+      // Authoritative identity check before installation: the child must
+      // actually be running the requested session. A pi that silently started
+      // a different or fresh session (e.g. the stored file vanished) would
+      // otherwise be installed under the wrong ACP sessionId.
+      let state: any = null
+      try {
+        state = (await proc.getState()) as any
+      } catch (e) {
+        proc.dispose()
+        throw (
+          maybeAuthRequiredError(e, this.authMethods) ??
+          RequestError.internalError({}, `pi did not report its session state: ${String((e as Error)?.message ?? e)}`)
+        )
+      }
+      if (this.disposed) {
+        proc.dispose()
+        throw RequestError.internalError({}, 'pi-acp agent is disposed')
+      }
+
+      const reportedId = typeof state?.sessionId === 'string' ? state.sessionId.trim() : ''
+      const reportedFile = typeof state?.sessionFile === 'string' ? state.sessionFile.trim() : ''
+      if (
+        reportedId !== sessionId ||
+        !reportedFile ||
+        (stored.sessionFile && !sessionPathsEquivalent(reportedFile, stored.sessionFile))
+      ) {
+        proc.dispose()
+        throw RequestError.internalError(
+          {},
+          `pi did not restore the requested session (requested ${sessionId} at ${stored.sessionFile}, ` +
+            `got ${reportedId || 'unknown'} at ${reportedFile || 'unknown'})`
+        )
+      }
+
       const fileCommands = loadSlashCommands(cwd)
+      // getOrCreate refuses registration after teardown and disposes `proc`
+      // itself when a concurrently registered session wins the race.
       const session = this.sessions.getOrCreate(sessionId, {
         cwd,
         mcpServers: opts?.mcpServers ?? [],
         conn: this.conn,
         proc,
-        fileCommands
+        fileCommands,
+        supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
+        authMethods: this.authMethods
       })
 
       try {
@@ -390,10 +505,53 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
+  /**
+   * Restore for non-load consumers (resume, config mutations). While a
+   * session/load is replaying this session, its freshly restored process is
+   * provisional — a failing load evicts and disposes it — so other consumers
+   * must not share it mid-flight. They wait for every active load to settle
+   * and then use (or restore) the surviving state. The load itself calls
+   * restoreSession directly and therefore never waits on itself.
+   */
+  private async restoreSessionAwaitingLoads(
+    sessionId: string,
+    opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers'] }
+  ): Promise<PiAcpSession> {
+    while (true) {
+      await this.waitForActiveLoads(sessionId)
+      const observedGeneration = this.loadGenerations.get(sessionId) ?? 0
+      const session = await this.restoreSession(sessionId, opts)
+
+      // A load can begin after the wait resolves but while restoration is in
+      // flight. Never hand its provisional process to resume/config callers.
+      if (!this.activeLoads.has(sessionId) && (this.loadGenerations.get(sessionId) ?? 0) === observedGeneration) {
+        return session
+      }
+      await this.waitForActiveLoads(sessionId)
+    }
+  }
+
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     // We currently only support stable ACP protocol version 1.
     const supportedVersion = PROTOCOL_VERSION
     const requested = params.protocolVersion
+
+    const clientCapabilities = params.clientCapabilities as
+      | {
+          auth?: { terminal?: unknown } | null
+          _meta?: Record<string, unknown> | null
+        }
+      | null
+      | undefined
+    this.supportsTerminalOutputMeta = clientCapabilities?._meta?.['terminal_output'] === true
+    // Terminal auth methods are advertised only against the standard
+    // (unstable-SDK) `auth.terminal` capability; the Zed `_meta["terminal-auth"]`
+    // launch spec is added only when the client also declared its meta flag.
+    this.authMethods = getAuthMethods({
+      supportsTerminalAuth: clientCapabilities?.auth?.terminal === true,
+      supportsTerminalAuthMeta: clientCapabilities?._meta?.['terminal-auth'] === true
+    })
+    this.advertisedAuthMethodIds = new Set(this.authMethods.map(method => method.id))
 
     return {
       protocolVersion: requested === supportedVersion ? requested : supportedVersion,
@@ -402,17 +560,14 @@ export class PiAcpAgent implements ACPAgent {
         title: 'pi ACP adapter',
         version: pkg.version ?? '0.0.0'
       },
-      // Zed currently uses ClientCapabilities._meta["terminal-auth"] to decide whether to show
-      // the "Authenticate" banner/button. If not supported, we still return the method for the registry.
-      authMethods: getAuthMethods({
-        supportsTerminalAuthMeta: (params as any)?.clientCapabilities?._meta?.['terminal-auth'] === true
-      }),
+      authMethods: this.authMethods,
       // Keep this snapshot exactly in sync with the handlers registered in
       // `createPiAcpAgentApp` (src/acp/app.ts): omitted capability = unsupported.
       agentCapabilities: {
         loadSession: true,
-        // MCP servers are accepted and stored but not connected to pi yet, so
-        // no MCP transport capability is advertised (see README limitations).
+        // pi has no MCP support; non-empty mcpServers are rejected explicitly
+        // in session/new, session/load, and session/resume (see README
+        // limitations), and no MCP transport capability is advertised.
         mcpCapabilities: { http: false, sse: false },
         promptCapabilities: {
           image: true,
@@ -433,17 +588,19 @@ export class PiAcpAgent implements ACPAgent {
     if (!isAbsolute(params.cwd)) {
       throw RequestError.invalidParams({}, `cwd must be an absolute path: ${params.cwd}`)
     }
+    assertNoMcpServers(params.mcpServers)
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
 
-    // Pi doesn't support mcpServers, but we accept and store.
     const session = await this.sessions.create({
       cwd: params.cwd,
       mcpServers: params.mcpServers,
       conn: this.conn,
       fileCommands,
-      piCommand: process.env.PI_ACP_PI_COMMAND
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
+      authMethods: this.authMethods
     })
 
     // Fetch state + models once (parallel) to reduce startup latency.
@@ -473,7 +630,7 @@ export class PiAcpAgent implements ACPAgent {
         })
     ])
 
-    const availableModelsAuthErr = maybeAuthRequiredError(availableModelsErr)
+    const availableModelsAuthErr = maybeAuthRequiredError(availableModelsErr, this.authMethods)
 
     if (availableModelsAuthErr) {
       this.cleanupFailedNewSession(session.sessionId, state)
@@ -491,20 +648,19 @@ export class PiAcpAgent implements ACPAgent {
     if (rawModelsCount === 0) {
       this.cleanupFailedNewSession(session.sessionId, state)
       throw RequestError.authRequired(
-        { authMethods: getAuthMethods() },
+        { authMethods: this.authMethods },
         'Configure an API key or log in with an OAuth provider.'
       )
     }
 
-    if (stateErr && maybeAuthRequiredError(stateErr)) {
+    if (stateErr) {
+      const authError = maybeAuthRequiredError(stateErr, this.authMethods)
       this.cleanupFailedNewSession(session.sessionId, state)
-      throw RequestError.authRequired(
-        { authMethods: getAuthMethods() },
-        'Configure an API key or log in with an OAuth provider.'
-      )
+      if (authError) throw authError
+      throw RequestError.internalError({}, String((stateErr as Error)?.message ?? stateErr))
     }
 
-    const { configOptions, models, modes } = await getSessionConfiguration(session.proc, {
+    const { configOptions, modes } = await getSessionConfiguration(session.proc, {
       state,
       availableModels
     })
@@ -529,7 +685,6 @@ export class PiAcpAgent implements ACPAgent {
     const response = {
       sessionId: session.sessionId,
       configOptions,
-      models,
       modes,
       _meta: {
         piAcp: {
@@ -553,9 +708,19 @@ export class PiAcpAgent implements ACPAgent {
     return response
   }
 
-  async authenticate(_params: AuthenticateRequest) {
+  async authenticate(params: AuthenticateRequest) {
+    // ACP defines methodId as one of the methods this agent advertised at
+    // initialize; unknown or unadvertised IDs must not succeed silently.
+    const methodId = typeof params?.methodId === 'string' ? params.methodId : ''
+    if (!this.advertisedAuthMethodIds.has(methodId)) {
+      throw RequestError.invalidParams(
+        { methodId },
+        `Unknown auth method: ${methodId || '(missing)'}. It was not advertised by this agent at initialize.`
+      )
+    }
+
     // Terminal Auth is handled out-of-band by re-launching the binary with `--terminal-login`.
-    // If the client calls `authenticate` anyway, we can no-op successfully.
+    // If the client calls `authenticate` for the advertised method anyway, acknowledge it.
     return
   }
 
@@ -584,6 +749,17 @@ export class PiAcpAgent implements ACPAgent {
       } catch (error) {
         if (this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)) {
           return { stopReason: 'cancelled' }
+        }
+        if (error instanceof PiRpcRequestTimeoutError) {
+          // An adapter-handled command (compact, stats, export, ...) timed
+          // out; the RPC layer already quarantined the channel. Evict this
+          // session so the next request restores a fresh subprocess instead
+          // of reusing the dead one.
+          const session = this.sessions.maybeGet(params.sessionId)
+          if (session) {
+            session.dispose({ expected: false })
+            this.sessions.evictIfCurrent(params.sessionId, session)
+          }
         }
         throw error
       } finally {
@@ -990,7 +1166,7 @@ export class PiAcpAgent implements ACPAgent {
           return { stopReason: 'end_turn' }
         }
 
-        const uri = `file://${resultPath}`
+        const uri = pathToFileURL(resultPath).href
 
         // Emit a short prefix + a resource link. Many clients concatenate chunks into a single
         // assistant message, so this avoids the "link + duplicate plain text" look.
@@ -1052,13 +1228,9 @@ export class PiAcpAgent implements ACPAgent {
       }
     }
 
-    const result = await session.prompt(message, images)
-
-    // ACP StopReason does not include "error"; if pi fails we map to end_turn for now,
-    // unless we know this was a cancellation.
-    const stopReason: StopReason =
-      result === 'error' ? (session.wasCancelRequested() ? 'cancelled' : 'end_turn') : result
-
+    // Failures reject with an ACP error (session.PiAcpSession.failTurn);
+    // successful turns resolve with a stable ACP stop reason.
+    const stopReason: StopReason = await session.prompt(message, images)
     return { stopReason }
   }
 
@@ -1071,6 +1243,7 @@ export class PiAcpAgent implements ACPAgent {
     const session = this.sessions.maybeGet(params.sessionId)
     if (!session) return
     await session.cancel()
+    if (session.isUnavailable()) this.sessions.evictIfCurrent(params.sessionId, session)
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -1122,6 +1295,7 @@ export class PiAcpAgent implements ACPAgent {
     if (!isAbsolute(params.cwd)) {
       throw RequestError.invalidParams({}, `cwd must be an absolute path: ${params.cwd}`)
     }
+    assertNoMcpServers(params.mcpServers)
 
     const stored = this.findStoredSession(params.sessionId)
     if (!stored) {
@@ -1154,81 +1328,269 @@ export class PiAcpAgent implements ACPAgent {
         cwd: params.cwd,
         mcpServers: params.mcpServers
       })
-      this.assertLoadActive(params.sessionId, generation)
-      const proc = session.proc
-      const fileCommands = loadSlashCommands(params.cwd)
+      try {
+        this.assertLoadActive(params.sessionId, generation)
+        const proc = session.proc
+        const fileCommands = loadSlashCommands(params.cwd)
 
-      // Replay full conversation history. Capture the session's custom-message
-      // sequence at the exact get_messages response boundary so events written
-      // after that response cannot be mistaken for entries in its snapshot.
-      let customMessageBoundary = session.currentCustomMessageSequence()
-      const data = (await proc.getMessages(() => {
-        customMessageBoundary = session.currentCustomMessageSequence()
-      })) as any
-      this.assertLoadActive(params.sessionId, generation)
-      const messages = Array.isArray(data?.messages) ? data.messages : []
-      session.reconcileLoadedCustomMessages(messages, customMessageBoundary)
+        // Replay the complete raw active-branch history via pi's get_tree
+        // (available on every supported pi version): unlike get_messages it
+        // retains pre-compaction conversation. Capture the session's
+        // custom-message sequence at the exact get_tree response boundary so
+        // events written after that response cannot be mistaken for entries in
+        // its snapshot.
+        let customMessageBoundary = session.currentCustomMessageSequence()
+        const treeData = await proc.getTree(() => {
+          customMessageBoundary = session.currentCustomMessageSequence()
+        })
+        this.assertLoadActive(params.sessionId, generation)
 
-      for (const m of messages) {
-        const role = String(m?.role ?? '')
+        let entries: ReturnType<typeof walkActiveTreeBranch>
+        try {
+          entries = walkActiveTreeBranch(treeData)
+        } catch (error) {
+          if (error instanceof PiSessionTreeError) {
+            throw RequestError.internalError({}, `Cannot replay session history: ${error.message}`)
+          }
+          throw error
+        }
 
-        if (role === 'user') {
-          const text = normalizePiMessageText(m?.content)
-          if (text) {
-            await this.sendLoadUpdate(params.sessionId, generation, {
-              sessionId: session.sessionId,
-              update: {
-                sessionUpdate: 'user_message_chunk',
-                content: { type: 'text', text }
+        // Conversation records on the active branch, in order. `message` entries
+        // carry pi AgentMessages directly; `custom_message` entries are
+        // normalized to the CustomMessage shape live `message_end` events use so
+        // custom-identity reconciliation sees one consistent format. Internal
+        // entries (compaction, branch_summary, thinking/model changes, labels,
+        // session_info, extension custom state) are not conversation: the
+        // original pre-compaction messages remain on the path, so replaying
+        // compaction summaries as well would duplicate history.
+        const records: Array<{ entryId: string; message: Record<string, unknown> }> = []
+        for (const entry of entries) {
+          if (entry.type === 'message' && entry.message && typeof entry.message === 'object') {
+            records.push({ entryId: entry.id, message: entry.message as Record<string, unknown> })
+          } else if (entry.type === 'custom_message') {
+            records.push({
+              entryId: entry.id,
+              message: {
+                role: 'custom',
+                customType: entry.customType,
+                content: entry.content,
+                display: entry.display,
+                details: entry.details,
+                timestamp: entry.timestamp
               }
             })
           }
         }
 
-        if (role === 'assistant') {
-          const text = normalizePiAssistantText(m?.content)
-          if (text) {
+        session.reconcileLoadedCustomMessages(
+          records.map(record => record.message),
+          customMessageBoundary
+        )
+
+        const replayedToolCallIds = new Set<string>()
+        // Assistant tool calls that never see a durable toolResult on the
+        // branch; closed as failed after the walk (see below).
+        const openToolCalls = new Map<string, { isBash: boolean }>()
+
+        for (const { entryId, message: m } of records) {
+          const role = String(m?.role ?? '')
+
+          if (role === 'user') {
+            for (const block of translateUserContent(m?.content)) {
+              await this.sendLoadUpdate(params.sessionId, generation, {
+                sessionId: session.sessionId,
+                update: {
+                  sessionUpdate: 'user_message_chunk',
+                  content:
+                    block.kind === 'text'
+                      ? { type: 'text', text: block.text }
+                      : { type: 'image', data: block.data, mimeType: block.mimeType }
+                }
+              })
+            }
+            continue
+          }
+
+          if (role === 'assistant') {
+            for (const block of translateAssistantContent(m?.content)) {
+              if (block.kind === 'text') {
+                await this.sendLoadUpdate(params.sessionId, generation, {
+                  sessionId: session.sessionId,
+                  update: {
+                    sessionUpdate: 'agent_message_chunk',
+                    content: { type: 'text', text: block.text }
+                  }
+                })
+                continue
+              }
+
+              if (block.kind === 'thinking') {
+                await this.sendLoadUpdate(params.sessionId, generation, {
+                  sessionId: session.sessionId,
+                  update: {
+                    sessionUpdate: 'agent_thought_chunk',
+                    content: { type: 'text', text: block.text }
+                  }
+                })
+                continue
+              }
+
+              // Reconstruct the tool call from the assistant block; the matching
+              // toolResult later upgrades it to its terminal status.
+              replayedToolCallIds.add(block.toolCallId)
+              const isBash = isBashTool(block.toolName)
+              openToolCalls.set(block.toolCallId, { isBash })
+              await this.sendLoadUpdate(params.sessionId, generation, {
+                sessionId: session.sessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId: block.toolCallId,
+                  title: isBash ? (bashCommand(block.rawInput) ?? block.toolName) : block.toolName,
+                  kind: isBash ? 'execute' : historyToolKind(block.toolName),
+                  status: 'pending',
+                  rawInput: block.rawInput,
+                  ...(isBash && this.supportsTerminalOutputMeta
+                    ? {
+                        content: bashTerminalContent(block.toolCallId),
+                        _meta: bashTerminalInfoMeta(block.toolCallId, params.cwd)
+                      }
+                    : {})
+                }
+              })
+            }
+            continue
+          }
+
+          if (role === 'custom') {
+            if (m?.display !== true) continue
+            for (const block of translateCustomMessageContent(m?.content)) {
+              await this.sendLoadUpdate(params.sessionId, generation, {
+                sessionId: session.sessionId,
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content:
+                    block.kind === 'text'
+                      ? { type: 'text', text: block.text }
+                      : { type: 'image', data: block.data, mimeType: block.mimeType }
+                }
+              })
+            }
+            continue
+          }
+
+          if (role === 'toolResult') {
+            const toolName = String(m?.toolName ?? 'tool')
+            const toolCallId = typeof m?.toolCallId === 'string' && m.toolCallId ? m.toolCallId : `pi-load-${entryId}`
+            const isError = Boolean(m?.isError)
+            const alreadyReplayed = replayedToolCallIds.has(toolCallId)
+            replayedToolCallIds.add(toolCallId)
+            openToolCalls.delete(toolCallId)
+
+            if (isBashTool(toolName)) {
+              if (!alreadyReplayed) {
+                await this.sendLoadUpdate(params.sessionId, generation, {
+                  sessionId: session.sessionId,
+                  update: {
+                    sessionUpdate: 'tool_call',
+                    toolCallId,
+                    title: bashCommand(m) ?? toolName,
+                    kind: 'execute',
+                    status: 'in_progress',
+                    ...(this.supportsTerminalOutputMeta
+                      ? {
+                          content: bashTerminalContent(toolCallId),
+                          _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+                        }
+                      : {})
+                  }
+                })
+              }
+
+              const text = bashResultText(m)
+              // Binary image blocks cannot travel through terminal output text;
+              // preserve them as standard image content on both bash paths.
+              // The generic path keeps text and images in source order.
+              const bashImages: ToolCallContent[] = toolResultImageBlocks(m).map(image => ({
+                type: 'content',
+                content: { type: 'image', data: image.data, mimeType: image.mimeType }
+              }))
+              const genericContent = bashOrderedContent(m)
+              await this.sendLoadUpdate(params.sessionId, generation, {
+                sessionId: session.sessionId,
+                update: {
+                  sessionUpdate: 'tool_call_update',
+                  toolCallId,
+                  status: isError ? 'failed' : 'completed',
+                  ...(this.supportsTerminalOutputMeta
+                    ? {
+                        ...(bashImages.length ? { content: [...bashTerminalContent(toolCallId), ...bashImages] } : {}),
+                        _meta: {
+                          ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
+                          ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
+                        }
+                      }
+                    : genericContent.length
+                      ? { content: genericContent }
+                      : {})
+                }
+              })
+              continue
+            }
+
+            if (!alreadyReplayed) {
+              // No assistant toolCall block preceded this result (e.g. older
+              // session data). Synthesize the initial call so the terminal
+              // status transition stays monotonic.
+              await this.sendLoadUpdate(params.sessionId, generation, {
+                sessionId: session.sessionId,
+                update: {
+                  sessionUpdate: 'tool_call',
+                  toolCallId,
+                  title: toolName,
+                  kind: historyToolKind(toolName),
+                  status: 'in_progress',
+                  rawInput: null
+                }
+              })
+            }
+
+            const content: ToolCallContent[] = toolResultToolCallContent(m)
             await this.sendLoadUpdate(params.sessionId, generation, {
               sessionId: session.sessionId,
               update: {
-                sessionUpdate: 'agent_message_chunk',
-                content: { type: 'text', text }
+                sessionUpdate: 'tool_call_update',
+                toolCallId,
+                status: isError ? 'failed' : 'completed',
+                content: content.length ? content : null,
+                rawOutput: m
               }
             })
+            continue
           }
-        }
 
-        if (role === 'custom' && m?.display === true) {
-          const text = normalizePiMessageText(m?.content)
-          if (text) {
-            await this.sendLoadUpdate(params.sessionId, generation, {
-              sessionId: session.sessionId,
-              update: {
-                sessionUpdate: 'agent_message_chunk',
-                content: { type: 'text', text }
-              }
-            })
-          }
-        }
+          if (role === 'bashExecution') {
+            // pi `!command` shell executions: replay as a synthetic execute tool
+            // call keyed from the durable entry id.
+            const toolCallId = `pi-bash-${entryId}`
+            const cancelled = m?.cancelled === true
+            const output = bashResultText(m)
+            const exitCode = bashExitCode(m, cancelled)
+            const failed = cancelled || exitCode !== 0
 
-        if (role === 'toolResult') {
-          const toolName = String((m as any)?.toolName ?? 'tool')
-          const toolCallId = String((m as any)?.toolCallId ?? crypto.randomUUID())
-          const isError = Boolean((m as any)?.isError)
-          const isBash = isBashTool(toolName)
-
-          if (isBash) {
-            const text = bashResultText(m)
             await this.sendLoadUpdate(params.sessionId, generation, {
               sessionId: session.sessionId,
               update: {
                 sessionUpdate: 'tool_call',
                 toolCallId,
-                title: bashCommand(m) ?? toolName,
+                title: bashCommand(m) ?? 'bash',
                 kind: 'execute',
-                status: 'completed',
-                content: bashTerminalContent(toolCallId),
-                _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+                status: 'in_progress',
+                ...(this.supportsTerminalOutputMeta
+                  ? {
+                      content: bashTerminalContent(toolCallId),
+                      _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+                    }
+                  : {})
               }
             })
 
@@ -1237,62 +1599,79 @@ export class PiAcpAgent implements ACPAgent {
               update: {
                 sessionUpdate: 'tool_call_update',
                 toolCallId,
-                status: isError ? 'failed' : 'completed',
-                _meta: {
-                  ...(text ? bashTerminalOutputMeta(toolCallId, text) : {}),
-                  ...bashTerminalExitMeta(toolCallId, bashExitCode(m, isError))
-                }
+                status: failed ? 'failed' : 'completed',
+                ...(this.supportsTerminalOutputMeta
+                  ? {
+                      _meta: {
+                        ...(output ? bashTerminalOutputMeta(toolCallId, output) : {}),
+                        ...bashTerminalExitMeta(toolCallId, exitCode)
+                      }
+                    }
+                  : (() => {
+                      const content = bashOrderedContent(m)
+                      return content.length ? { content } : {}
+                    })())
               }
             })
             continue
           }
+        }
 
-          // Create a synthetic ACP tool call to render historic tool usage.
-          await this.sendLoadUpdate(params.sessionId, generation, {
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'tool_call',
-              toolCallId,
-              title: toolName,
-              kind: toolName === 'read' ? 'read' : toolName === 'write' || toolName === 'edit' ? 'edit' : 'other',
-              status: 'completed',
-              rawInput: null,
-              rawOutput: m
+        // Latest Zed renders a replayed tool call with no terminal status as a
+        // spinner forever. A durable history that ends mid-call has no result to
+        // replay, so close such calls as failed with a standard explanation.
+        // Live sessions are unaffected: this runs only on load replay.
+        for (const [toolCallId, metadata] of openToolCalls) {
+          const explanation: ToolCallContent = {
+            type: 'content',
+            content: {
+              type: 'text',
+              text: 'No result was recorded for this tool call; the session ended before it completed.'
             }
-          })
-
-          const text = toolResultToText(m)
+          }
+          const terminalSettlement = metadata.isBash && this.supportsTerminalOutputMeta
           await this.sendLoadUpdate(params.sessionId, generation, {
             sessionId: session.sessionId,
             update: {
               sessionUpdate: 'tool_call_update',
               toolCallId,
-              status: isError ? 'failed' : 'completed',
-              content: text ? [{ type: 'content', content: { type: 'text', text } }] : null,
-              rawOutput: m
+              status: 'failed',
+              content: terminalSettlement ? [...bashTerminalContent(toolCallId), explanation] : [explanation],
+              ...(terminalSettlement ? { _meta: bashTerminalExitMeta(toolCallId, 1) } : {})
             }
           })
         }
-      }
 
-      const { configOptions, models, modes } = await getSessionConfiguration(proc)
-      this.assertLoadActive(params.sessionId, generation)
+        const { configOptions, modes } = await getSessionConfiguration(proc)
+        this.assertLoadActive(params.sessionId, generation)
 
-      const response = {
-        configOptions,
-        models,
-        modes,
-        _meta: {
-          piAcp: {
-            startupInfo: null
+        const response = {
+          configOptions,
+          modes,
+          _meta: {
+            piAcp: {
+              startupInfo: null
+            }
           }
         }
+
+        // Advertise slash commands after the response so the client knows the session exists.
+        this.advertiseCommandsSoon(session, { fileCommands, enableSkillCommands })
+
+        return response
+      } catch (error) {
+        // Any post-restore load failure (get_tree, malformed tree, replay
+        // delivery, configuration, or generation cancellation) must not leave
+        // this load's freshly restored session and pi subprocess installed.
+        // Only the exact instance this load produced is evicted/disposed — a
+        // replacement registered by a newer load is never touched — and the
+        // durable session file/store entry is retained so the session remains
+        // loadable.
+        if (!this.sessions.evictIfCurrent(params.sessionId, session)) {
+          session.dispose()
+        }
+        throw error
       }
-
-      // Advertise slash commands after the response so the client knows the session exists.
-      this.advertiseCommandsSoon(session, { fileCommands, enableSkillCommands })
-
-      return response
     })
   }
 
@@ -1300,6 +1679,7 @@ export class PiAcpAgent implements ACPAgent {
     if (!isAbsolute(params.cwd)) {
       throw RequestError.invalidParams({}, `cwd must be an absolute path: ${params.cwd}`)
     }
+    assertNoMcpServers(params.mcpServers)
 
     const stored = this.findStoredSession(params.sessionId)
     if (!stored) {
@@ -1315,13 +1695,13 @@ export class PiAcpAgent implements ACPAgent {
       )
     }
 
-    const session = await this.restoreSession(params.sessionId, {
+    const session = await this.restoreSessionAwaitingLoads(params.sessionId, {
       cwd: params.cwd,
       mcpServers: params.mcpServers
     })
 
     // Unlike session/load, resume MUST NOT replay conversation history.
-    const { configOptions, models, modes } = await getSessionConfiguration(session.proc)
+    const { configOptions, modes } = await getSessionConfiguration(session.proc)
 
     this.advertiseCommandsSoon(session, {
       fileCommands: loadSlashCommands(params.cwd),
@@ -1330,7 +1710,6 @@ export class PiAcpAgent implements ACPAgent {
 
     const response = {
       configOptions,
-      models,
       modes,
       _meta: {
         piAcp: {
@@ -1383,13 +1762,19 @@ export class PiAcpAgent implements ACPAgent {
    * been delivered. Some clients (e.g. Zed) ignore notifications for a
    * sessionId they have not yet confirmed.
    */
+  // Test seam: deferred scheduling for post-response notifications. Tests
+  // replace this locally instead of monkey-patching the global setTimeout.
+  private scheduleDeferred: (task: () => void) => void = task => {
+    setTimeout(task, 0)
+  }
+
   private advertiseCommandsSoon(
     session: PiAcpSession,
     opts: { fileCommands: FileSlashCommand[]; enableSkillCommands: boolean }
   ): void {
-    setTimeout(() => {
+    this.scheduleDeferred(() => {
       void this.advertiseCommands(session, opts)
-    }, 0)
+    })
   }
 
   private async advertiseCommands(
@@ -1432,65 +1817,87 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
-  async unstable_setSessionModel(params: { sessionId: string; modelId: string }): Promise<void> {
-    const session = await this.restoreSession(params.sessionId)
-    await setSessionModel(session.proc, params.modelId)
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+  /**
+   * Serialize model/thinking-level writes per session: a concurrent mutation
+   * must not slip between another write's support check, set command, and
+   * post-write verification.
+   */
+  private runExclusiveConfigMutation<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.configMutationQueues.get(sessionId) ?? Promise.resolve()
+    const result = previous.then(operation)
+    const tail = result.then(
+      () => undefined,
+      () => undefined
+    )
+    this.configMutationQueues.set(sessionId, tail)
+    void tail.then(() => {
+      if (this.configMutationQueues.get(sessionId) === tail) this.configMutationQueues.delete(sessionId)
+    })
+    return result
   }
 
   async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const session = await this.restoreSession(params.sessionId)
-
     const mode = String(params.modeId)
-    if (!isThinkingLevel(mode)) {
-      throw RequestError.invalidParams({}, `Unknown modeId: ${mode}`)
-    }
 
-    await session.proc.setThinkingLevel(mode)
-
-    // Let the client know the current mode changed (keeps the dropdown in sync).
-    void this.conn.sessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'current_mode_update',
-        currentModeId: mode
+    // Restoration, validation, verification, write, and publication share one
+    // queue. Restoring first also preserves resource-not-found precedence for
+    // unknown sessions.
+    await this.runExclusiveConfigMutation(params.sessionId, async () => {
+      const session = await this.restoreSessionAwaitingLoads(params.sessionId)
+      if (!isThinkingLevel(mode)) {
+        throw RequestError.invalidParams({}, `Unknown modeId: ${mode}`)
       }
-    })
+      const state = await applyThinkingLevel(session.proc, mode)
 
-    await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+      await this.conn.sessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'current_mode_update',
+          currentModeId: mode
+        }
+      })
+
+      await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, { state })
+    })
 
     return {}
   }
 
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
-    const session = await this.restoreSession(params.sessionId)
     const configId = String(params.configId)
 
     if (typeof params.value !== 'string') {
       throw RequestError.invalidParams({}, `Expected string value for config option: ${configId}`)
     }
 
-    if (configId === MODEL_CONFIG_ID) {
-      await setSessionModel(session.proc, params.value)
-    } else if (configId === THOUGHT_LEVEL_CONFIG_ID) {
-      if (!isThinkingLevel(params.value)) {
-        throw RequestError.invalidParams({}, `Unknown thinking level: ${params.value}`)
+    const value = params.value
+    if (configId !== MODEL_CONFIG_ID && configId !== THOUGHT_LEVEL_CONFIG_ID) {
+      throw RequestError.invalidParams({}, `Unknown config option: ${configId}`)
+    }
+    if (configId === THOUGHT_LEVEL_CONFIG_ID && !isThinkingLevel(value)) {
+      throw RequestError.invalidParams({}, `Unknown thinking level: ${value}`)
+    }
+
+    // Check + write + verify + publish run as one exclusive mutation so a
+    // concurrent mutation can neither interleave with the write nor apply
+    // before this one's updates are delivered.
+    const configOptions = await this.runExclusiveConfigMutation(params.sessionId, async () => {
+      const session = await this.restoreSessionAwaitingLoads(params.sessionId)
+      if (configId === MODEL_CONFIG_ID) {
+        const state = await applySessionModel(session.proc, value)
+        return emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, { state })
       }
 
-      await session.proc.setThinkingLevel(params.value)
-
-      void this.conn.sessionUpdate({
+      const state = await applyThinkingLevel(session.proc, value as ThinkingLevel)
+      await this.conn.sessionUpdate({
         sessionId: session.sessionId,
         update: {
           sessionUpdate: 'current_mode_update',
-          currentModeId: params.value
+          currentModeId: value
         }
       })
-    } else {
-      throw RequestError.invalidParams({}, `Unknown config option: ${configId}`)
-    }
-
-    const configOptions = await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc)
+      return emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, { state })
+    })
     return { configOptions }
   }
 }
@@ -1541,8 +1948,70 @@ export async function runPromptWithCancellation(
   }
 }
 
-function isThinkingLevel(x: string): x is ThinkingLevel {
-  return x === 'off' || x === 'minimal' || x === 'low' || x === 'medium' || x === 'high' || x === 'xhigh'
+/**
+ * Thinking levels the current pi model actually supports (mirrors pi's
+ * getSupportedThinkingLevels; see thinking-levels.ts). When the model is
+ * unknown (state probe failed or pi reports no model) only the conservative
+ * `off` level is offered: no level is ever advertised blind.
+ */
+function thinkingLevelsFromState(state: unknown): readonly ThinkingLevel[] {
+  const model = (state as { model?: unknown } | null | undefined)?.model
+  if (!model || typeof model !== 'object') return FALLBACK_THINKING_LEVELS
+  const supported = supportedThinkingLevels(model)
+  return supported.length ? supported : FALLBACK_THINKING_LEVELS
+}
+
+async function assertThinkingLevelSupported(proc: PiRpcProcess, level: ThinkingLevel): Promise<void> {
+  let state: unknown
+  try {
+    state = await proc.getState()
+  } catch (e) {
+    // Fail closed: without state, support cannot be established, and pi would
+    // silently clamp an unsupported level while we report success.
+    throw RequestError.internalError(
+      {},
+      `Cannot verify thinking level support (get_state failed): ${String((e as Error)?.message ?? e)}`
+    )
+  }
+
+  const supported = thinkingLevelsFromState(state)
+  if (!supported.includes(level)) {
+    throw RequestError.invalidParams(
+      {},
+      `Thinking level not supported by the current model: ${level} (supported: ${supported.join(', ')})`
+    )
+  }
+}
+
+/**
+ * Apply a thinking level and verify it against pi's authoritative post-write
+ * state. pi clamps unsupported levels silently (e.g. after a concurrent model
+ * change), so success is only reported when the level actually stuck.
+ * Returns the verified state for config-option publication.
+ */
+async function applyThinkingLevel(proc: PiRpcProcess, level: ThinkingLevel): Promise<unknown> {
+  await assertThinkingLevelSupported(proc, level)
+  await proc.setThinkingLevel(level)
+
+  let state: unknown
+  try {
+    state = await proc.getState()
+  } catch (e) {
+    throw RequestError.internalError(
+      {},
+      `Could not verify the thinking level after set_thinking_level: ${String((e as Error)?.message ?? e)}`
+    )
+  }
+
+  const applied = (state as { thinkingLevel?: unknown } | null | undefined)?.thinkingLevel
+  if (applied !== level) {
+    throw RequestError.internalError(
+      {},
+      `pi did not apply thinking level ${level} (current: ${typeof applied === 'string' ? applied : 'unknown'})`
+    )
+  }
+
+  return state
 }
 
 async function getThinkingState(
@@ -1556,23 +2025,18 @@ async function getThinkingState(
   }>
   currentModeId: string
 }> {
-  // Ask pi for current thinking level.
-  let current: ThinkingLevel = 'medium'
+  const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
 
-  const state =
-    pre?.state ??
-    (await (async () => {
-      try {
-        return (await proc.getState()) as any
-      } catch {
-        return null
-      }
-    })())
+  const available = thinkingLevelsFromState(state)
 
   const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-  if (tl && isThinkingLevel(tl)) current = tl
-
-  const available: ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh']
+  let current: ThinkingLevel = tl && isThinkingLevel(tl) ? tl : 'off'
+  // The advertised current value must be one of the advertised options: when
+  // support is unknown or the reported level is outside the model's set,
+  // report the conservative effective level instead of an unselectable one.
+  if (!available.includes(current)) {
+    current = available.includes('off') ? 'off' : (available[0] ?? 'off')
+  }
 
   return {
     currentModeId: current,
@@ -1589,10 +2053,6 @@ async function getSessionConfiguration(
   pre?: { state?: any | null; availableModels?: any | null }
 ): Promise<{
   configOptions: SessionConfigOption[]
-  models: {
-    availableModels: AdvertisedModel[]
-    currentModelId: string
-  } | null
   modes: {
     availableModes: Array<{
       id: string
@@ -1602,11 +2062,23 @@ async function getSessionConfiguration(
     currentModeId: string
   }
 }> {
-  const [models, modes] = await Promise.all([getModelState(proc, pre), getThinkingState(proc, { state: pre?.state })])
+  // Resolve each health probe once. Missing prefetches are real RPC calls and
+  // failures propagate; only a successful response with absent/unknown data
+  // may produce conservative configuration.
+  const hasState = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state')
+  const hasAvailableModels = Object.prototype.hasOwnProperty.call(pre ?? {}, 'availableModels')
+  const [state, availableModels] = await Promise.all([
+    hasState ? Promise.resolve(pre?.state) : proc.getState(),
+    hasAvailableModels ? Promise.resolve(pre?.availableModels) : proc.getAvailableModels()
+  ])
+  const prefetched = { state, availableModels }
+  const [models, modes] = await Promise.all([
+    getModelState(proc, prefetched),
+    getThinkingState(proc, { state: prefetched.state })
+  ])
 
   return {
     configOptions: buildConfigOptions({ models, modes }),
-    models,
     modes
   }
 }
@@ -1670,15 +2142,9 @@ async function getModelState(
   // Ask pi for available models.
   let availableModels: AdvertisedModel[] = []
 
-  const data =
-    pre?.availableModels ??
-    (await (async () => {
-      try {
-        return (await proc.getAvailableModels()) as any
-      } catch {
-        return null
-      }
-    })())
+  const data = Object.prototype.hasOwnProperty.call(pre ?? {}, 'availableModels')
+    ? pre?.availableModels
+    : ((await proc.getAvailableModels()) as any)
 
   const models: any[] = Array.isArray(data?.models) ? data.models : []
   availableModels = models
@@ -1699,15 +2165,7 @@ async function getModelState(
   // Ask pi what model is currently active.
   let currentModelId: string | null = null
 
-  const state =
-    pre?.state ??
-    (await (async () => {
-      try {
-        return (await proc.getState()) as any
-      } catch {
-        return null
-      }
-    })())
+  const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
 
   const model = state?.model
   if (model && typeof model === 'object') {
@@ -1730,9 +2188,10 @@ async function getModelState(
 async function emitConfigOptionsUpdate(
   conn: AcpClient,
   sessionId: string,
-  proc: PiRpcProcess
+  proc: PiRpcProcess,
+  pre?: { state?: any | null }
 ): Promise<SessionConfigOption[]> {
-  const { configOptions } = await getSessionConfiguration(proc)
+  const { configOptions } = await getSessionConfiguration(proc, pre)
 
   await conn.sessionUpdate({
     sessionId,
@@ -1745,7 +2204,12 @@ async function emitConfigOptionsUpdate(
   return configOptions
 }
 
-async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<void> {
+/**
+ * Apply a model change and verify it against pi's authoritative post-write
+ * state before success is reported. Returns the verified state for
+ * config-option publication.
+ */
+async function applySessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<unknown> {
   // Accept either:
   //  - "provider/model" (preferred, matches how we advertise)
   //  - "model" (fallback, resolve via available models)
@@ -1775,53 +2239,72 @@ async function setSessionModel(proc: PiRpcProcess, requestedModelId: string): Pr
   }
 
   await proc.setModel(provider, modelId)
-}
 
-function isSemver(v: string): boolean {
-  return /^\d+\.\d+\.\d+(?:[-+].+)?$/.test(v)
-}
-
-function compareSemver(a: string, b: string): number {
-  // Very small comparator for x.y.z (ignores pre-release/build beyond making them "not greater" unless base differs)
-  const pa = a
-    .split(/[.-]/)
-    .slice(0, 3)
-    .map(n => Number(n))
-  const pb = b
-    .split(/[.-]/)
-    .slice(0, 3)
-    .map(n => Number(n))
-  for (let i = 0; i < 3; i++) {
-    const da = pa[i] ?? 0
-    const db = pb[i] ?? 0
-    if (da > db) return 1
-    if (da < db) return -1
+  let state: unknown
+  try {
+    state = await proc.getState()
+  } catch (e) {
+    throw RequestError.internalError(
+      {},
+      `Could not verify the model after set_model: ${String((e as Error)?.message ?? e)}`
+    )
   }
-  return 0
+
+  const model = (state as { model?: unknown } | null | undefined)?.model
+  const appliedProvider =
+    model && typeof model === 'object' ? String((model as { provider?: unknown }).provider ?? '').trim() : ''
+  const appliedId = model && typeof model === 'object' ? String((model as { id?: unknown }).id ?? '').trim() : ''
+  if (appliedProvider !== provider || appliedId !== modelId) {
+    const current = appliedProvider && appliedId ? `${appliedProvider}/${appliedId}` : 'unknown'
+    throw RequestError.internalError({}, `pi did not apply model ${provider}/${modelId} (current: ${current})`)
+  }
+
+  return state
 }
 
-function buildUpdateNotice(): string | null {
+let updateNoticeCache: { value: string | null } | null = null
+
+/** Test seam: clear the per-process update-notice cache. */
+export function resetUpdateNoticeCacheForTests(): void {
+  updateNoticeCache = null
+}
+
+function buildUpdateNotice(compute: () => string | null = computeUpdateNotice): string | null {
+  // Cached for the process lifetime: the installed pi version cannot change
+  // under a running adapter, and the synchronous npm lookup must not tax
+  // every session/new. The object sentinel also caches a null result.
+  if (updateNoticeCache) return updateNoticeCache.value
+  const value = compute()
+  updateNoticeCache = { value }
+  return value
+}
+
+/** Deterministic local seam for cache behavior; does not replace child_process globals. */
+export function getCachedUpdateNoticeForTests(compute: () => string | null): string | null {
+  return buildUpdateNotice(compute)
+}
+
+function computeUpdateNotice(): string | null {
   // Best-effort update check against npm registry.
   // Important: keep it fast to not slow down session/new.
   try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
-    const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
-      /^v/i,
-      ''
-    )
-
-    if (!installed || !isSemver(installed)) return null
+    const piCommand = getPiCommand(process.env.PI_ACP_PI_COMMAND)
+    const piVersion = spawnSync(piCommand, ['--version'], {
+      encoding: 'utf-8',
+      timeout: 2_000,
+      shell: shouldUseShellForPiCommand(piCommand)
+    })
+    const installed = parsePiVersion(String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim())
+    if (!installed) return null
 
     const latestRes = spawnSync('npm', ['view', '@earendil-works/pi-coding-agent', 'version'], {
       encoding: 'utf-8',
       timeout: 800
     })
-    const latest = String(latestRes.stdout ?? '')
-      .trim()
-      .replace(/^v/i, '')
+    const latest = parsePiVersion(String(latestRes.stdout ?? '').trim())
 
-    if (!latest || !isSemver(latest)) return null
-    if (compareSemver(latest, installed) <= 0) return null
+    if (!latest) return null
+    if (comparePiVersions(latest, installed) <= 0) return null
 
     return `New version available: v${latest} (installed v${installed}). Run: \`npm i -g @earendil-works/pi-coding-agent\``
   } catch {
@@ -1840,7 +2323,12 @@ function buildStartupInfo(opts: {
 
   // pi version header
   try {
-    const piVersion = spawnSync('pi', ['--version'], { encoding: 'utf-8' })
+    const piCommand = getPiCommand(process.env.PI_ACP_PI_COMMAND)
+    const piVersion = spawnSync(piCommand, ['--version'], {
+      encoding: 'utf-8',
+      timeout: 2_000,
+      shell: shouldUseShellForPiCommand(piCommand)
+    })
     const installed = (String(piVersion.stdout ?? '').trim() || String(piVersion.stderr ?? '').trim()).replace(
       /^v/i,
       ''
@@ -1920,13 +2408,13 @@ function buildStartupInfo(opts: {
     }
   }
 
-  // Global skills
-  // Use getAgentDir() so this respects PI_CODING_AGENT_DIR overrides.
-  const globalSkillsDir = join(getAgentDir(), 'skills')
+  // All pi-owned global resources share the same override-aware root.
+  const agentDir = getAgentDir()
+  const globalSkillsDir = join(agentDir, 'skills')
   pushSkillFromRoot(globalSkillsDir)
 
   // Also support ~/.agents/skills (pi skill discovery)
-  const legacyAgentsSkillsDir = join(process.env.HOME ?? '', '.agents', 'skills')
+  const legacyAgentsSkillsDir = join(homedir(), '.agents', 'skills')
   pushSkillFromRoot(legacyAgentsSkillsDir)
 
   // Project skills (.pi/skills)
@@ -1937,7 +2425,7 @@ function buildStartupInfo(opts: {
 
   // Prompts
   const promptsItems: string[] = []
-  const promptsDir = join(process.env.HOME ?? '', '.pi', 'agent', 'prompts')
+  const promptsDir = join(agentDir, 'prompts')
   try {
     const prompts = readdirSync(promptsDir).filter(f => f.endsWith('.md'))
     for (const f of prompts) promptsItems.push(`/${basename(f, '.md')}`)
@@ -1948,7 +2436,7 @@ function buildStartupInfo(opts: {
 
   // Extensions
   const extItems: string[] = []
-  const extDir = join(process.env.HOME ?? '', '.pi', 'agent', 'extensions')
+  const extDir = join(agentDir, 'extensions')
   try {
     const exts = readdirSync(extDir).filter(f => f.endsWith('.ts') || f.endsWith('.js'))
     for (const f of exts) extItems.push(join(extDir, f))
@@ -1958,7 +2446,7 @@ function buildStartupInfo(opts: {
 
   // Also show npm packages from pi settings (best-effort)
   try {
-    const settingsPath = join(process.env.HOME ?? '', '.pi', 'agent', 'settings.json')
+    const settingsPath = join(agentDir, 'settings.json')
     const settings = JSON.parse(readFileSync(settingsPath, 'utf-8')) as any
     const pkgs: string[] = Array.isArray(settings?.packages) ? settings.packages : []
     for (const pkg of pkgs) {

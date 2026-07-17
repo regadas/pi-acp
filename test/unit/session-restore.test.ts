@@ -48,7 +48,15 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
   ;(PiRpcProcess as any).spawn = async (params: any) => {
     spawnCalls.push(params)
     return {
-      onEvent: () => () => {}
+      onEvent: () => () => {},
+      onTermination: () => () => {},
+      dispose: () => {},
+      // Restore validation requires pi to report the requested session.
+      getState: async () => ({
+        isStreaming: false,
+        sessionId: 'stored-session',
+        sessionFile: '/tmp/store-project/session.jsonl'
+      })
     } as any
   }
 
@@ -123,7 +131,10 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
   const spawnCalls: any[] = []
   const state = {
     thinkingLevel: 'medium',
-    model: { provider: 'test', id: 'alpha' }
+    model: { provider: 'test', id: 'alpha' },
+    // Restore validation requires pi to report the requested session.
+    sessionId: 'fallback-session',
+    sessionFile
   }
 
   const sessions = new FakeSessions((sessionId, params) => ({
@@ -137,6 +148,8 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
     spawnCalls.push(params)
     return {
       onEvent: () => () => {},
+      onTermination: () => () => {},
+      dispose: () => {},
       getAvailableModels: async () => ({
         models: [
           { provider: 'test', id: 'alpha', name: 'Alpha' },

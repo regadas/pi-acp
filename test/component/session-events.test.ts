@@ -181,7 +181,9 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    // This test locks in the negotiated Zed terminal_output convention.
+    supportsTerminalOutputMeta: true
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bash', args: { command: 'ls' } })
@@ -231,6 +233,307 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
     terminal_exit: { terminal_id: 't1', exit_code: 0, signal: null }
   })
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
+})
+
+test('PiAcpSession: bash output falls back to standard content without terminal_output negotiation', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bash', args: { command: 'ls' } })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 't1',
+    partialResult: { content: [{ type: 'text', text: 'running' }] }
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'running\ndone' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 3)
+
+  const start = conn.updates[0]!.update as any
+  assert.equal(start.sessionUpdate, 'tool_call')
+  assert.equal(start.kind, 'execute')
+  assert.equal(start.content, undefined, 'no fabricated terminal reference for generic clients')
+  assert.equal(start._meta, undefined)
+
+  const progress = conn.updates[1]!.update as any
+  assert.equal(progress.sessionUpdate, 'tool_call_update')
+  assert.equal(progress.status, 'in_progress')
+  assert.equal(progress._meta, undefined)
+  assert.deepEqual(progress.content, [{ type: 'content', content: { type: 'text', text: '```console\nrunning\n```' } }])
+
+  const end = conn.updates[2]!.update as any
+  assert.equal(end.sessionUpdate, 'tool_call_update')
+  assert.equal(end.status, 'completed')
+  assert.equal(end._meta, undefined)
+  assert.deepEqual(end.content, [
+    { type: 'content', content: { type: 'text', text: '```console\nrunning\ndone\n```' } }
+  ])
+})
+
+test('PiAcpSession: preserves tool-result image content in live tool_call_update', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'screenshot', args: {} })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't1',
+    isError: false,
+    result: {
+      content: [
+        { type: 'text', text: 'captured' },
+        { type: 'image', data: 'aWFtYXBuZw==', mimeType: 'image/png' }
+      ]
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const end = conn.updates.at(-1)!.update as any
+  assert.equal(end.sessionUpdate, 'tool_call_update')
+  assert.equal(end.status, 'completed')
+  assert.deepEqual(end.content, [
+    { type: 'content', content: { type: 'text', text: 'captured' } },
+    { type: 'content', content: { type: 'image', data: 'aWFtYXBuZw==', mimeType: 'image/png' } }
+  ])
+})
+
+test('PiAcpSession: preserves interleaved and image-only tool-result order in live updates', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't-mixed', toolName: 'screenshot', args: {} })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't-mixed',
+    isError: false,
+    result: {
+      content: [
+        { type: 'image', data: 'aW1nMQ==', mimeType: 'image/png' },
+        { type: 'text', text: 'between' },
+        { type: 'image', data: 'aW1nMg==', mimeType: 'image/jpeg' }
+      ]
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId: 't-img-only', toolName: 'screenshot', args: {} })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 't-img-only',
+    isError: false,
+    result: { content: [{ type: 'image', data: 'b25seQ==', mimeType: 'image/png' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const updates = conn.updates.map(u => u.update as any)
+  const mixed = updates.find(u => u.sessionUpdate === 'tool_call_update' && u.toolCallId === 't-mixed')
+  assert.deepEqual(mixed.content, [
+    { type: 'content', content: { type: 'image', data: 'aW1nMQ==', mimeType: 'image/png' } },
+    { type: 'content', content: { type: 'text', text: 'between' } },
+    { type: 'content', content: { type: 'image', data: 'aW1nMg==', mimeType: 'image/jpeg' } }
+  ])
+
+  const imageOnly = updates.find(u => u.sessionUpdate === 'tool_call_update' && u.toolCallId === 't-img-only')
+  assert.deepEqual(
+    imageOnly.content,
+    [{ type: 'content', content: { type: 'image', data: 'b25seQ==', mimeType: 'image/png' } }],
+    'an image-only result must not grow a JSON/base64 text block'
+  )
+})
+
+test('PiAcpSession: emits custom-message image blocks in order during an active turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('test prompt')
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      display: true,
+      content: [
+        { type: 'image', data: 'aW1nQQ==', mimeType: 'image/png' },
+        { type: 'text', text: 'annotated' }
+      ]
+    }
+  })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+
+  const chunks = conn.updates
+    .map(u => u.update as any)
+    .filter(u => u.sessionUpdate === 'agent_message_chunk')
+    .map(u => u.content)
+  assert.deepEqual(chunks, [
+    { type: 'image', data: 'aW1nQQ==', mimeType: 'image/png' },
+    { type: 'text', text: 'annotated' }
+  ])
+})
+
+test('PiAcpSession: flushes idle custom-message image blocks in order on the next prompt', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'custom',
+      display: true,
+      content: [
+        { type: 'text', text: 'result: ' },
+        { type: 'image', data: 'aW1nQg==', mimeType: 'image/jpeg' }
+      ]
+    }
+  })
+  await new Promise(r => setTimeout(r, 0))
+  assert.deepEqual(
+    conn.updates.map(u => (u.update as any).sessionUpdate).filter(kind => kind === 'agent_message_chunk'),
+    [],
+    'idle custom messages stay pending until a prompt turn'
+  )
+
+  const prompt = session.prompt('next prompt')
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+
+  const chunks = conn.updates
+    .map(u => u.update as any)
+    .filter(u => u.sessionUpdate === 'agent_message_chunk')
+    .map(u => u.content)
+  assert.deepEqual(chunks, [
+    { type: 'text', text: 'result: ' },
+    { type: 'image', data: 'aW1nQg==', mimeType: 'image/jpeg' }
+  ])
+})
+
+test('PiAcpSession: retains bash tool-result image blocks for generic clients', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'b1', toolName: 'bash', args: { command: 'render' } })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'b1',
+    isError: false,
+    result: {
+      content: [{ type: 'image', data: 'YmFzaA==', mimeType: 'image/png' }],
+      details: { stdout: 'rendered chart\n', exitCode: 0 }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const end = conn.updates.at(-1)!.update as any
+  assert.equal(end.sessionUpdate, 'tool_call_update')
+  assert.equal(end.status, 'completed')
+  assert.equal(end._meta, undefined)
+  assert.deepEqual(end.content, [
+    { type: 'content', content: { type: 'text', text: '```console\nrendered chart\n```' } },
+    { type: 'content', content: { type: 'image', data: 'YmFzaA==', mimeType: 'image/png' } }
+  ])
+})
+
+test('PiAcpSession: retains bash tool-result image blocks alongside negotiated terminal metadata', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    supportsTerminalOutputMeta: true
+  })
+
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'b2', toolName: 'bash', args: { command: 'render' } })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'b2',
+    isError: false,
+    result: {
+      content: [{ type: 'image', data: 'YmFzaA==', mimeType: 'image/png' }],
+      details: { stdout: 'rendered chart\n', exitCode: 0 }
+    }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  const end = conn.updates.at(-1)!.update as any
+  assert.equal(end.sessionUpdate, 'tool_call_update')
+  assert.equal(end.status, 'completed')
+  assert.deepEqual(end._meta, {
+    terminal_output: { terminal_id: 'b2', data: 'rendered chart\n' },
+    terminal_exit: { terminal_id: 'b2', exit_code: 0, signal: null }
+  })
+  assert.deepEqual(end.content, [
+    { type: 'terminal', terminalId: 'b2' },
+    { type: 'content', content: { type: 'image', data: 'YmFzaA==', mimeType: 'image/png' } }
+  ])
 })
 
 test('PiAcpSession: emits existing file locations for built-in and custom tools', async () => {

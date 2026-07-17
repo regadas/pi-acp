@@ -113,8 +113,93 @@ test('app wiring: connection abort disposes every live session exactly once', as
   assert.equal(procB.disposeCount, 1)
 })
 
+test('app wiring: requests before initialize and duplicate initialize are invalid', async () => {
+  const conn = connect()
+
+  // ACP wire state: every non-initialize request is invalid before a
+  // successful initialize on this connection.
+  await assert.rejects(
+    () => conn.agent.request(methods.agent.session.list, {}),
+    (err: unknown) => (err as RequestError).code === -32600
+  )
+  await assert.rejects(
+    () => conn.agent.request(methods.agent.authenticate, { methodId: 'pi_terminal_login' }),
+    (err: unknown) => (err as RequestError).code === -32600
+  )
+
+  const res = await conn.agent.request(methods.agent.initialize, { protocolVersion: 1 })
+  assert.equal(res.protocolVersion, 1)
+
+  // Initialization is a one-time state transition per connection.
+  await assert.rejects(
+    () => conn.agent.request(methods.agent.initialize, { protocolVersion: 1 }),
+    (err: unknown) => (err as RequestError).code === -32600
+  )
+
+  // After initialize, normal methods route.
+  assert.deepEqual((await conn.agent.request(methods.agent.session.list, {})).sessions, [])
+})
+
+test('app wiring: concurrent initialize requests admit exactly one transition', async () => {
+  let activeAgent: PiAcpAgent | null = null
+  const conn = connect(agent => {
+    if (agent) activeAgent = agent
+  })
+  assert.ok(activeAgent)
+  const agent = activeAgent as PiAcpAgent
+
+  let release!: () => void
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  let calls = 0
+  const originalInitialize = agent.initialize.bind(agent)
+  ;(agent as any).initialize = async (params: any) => {
+    calls += 1
+    await gate
+    return originalInitialize(params)
+  }
+
+  const first = conn.agent.request(methods.agent.initialize, { protocolVersion: 1 })
+  await new Promise(resolve => setTimeout(resolve, 0))
+  const second = conn.agent.request(methods.agent.initialize, { protocolVersion: 1 })
+  release()
+
+  const results = await Promise.allSettled([first, second])
+  assert.equal(calls, 1)
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1)
+  const rejected = results.find(result => result.status === 'rejected') as PromiseRejectedResult
+  assert.equal((rejected.reason as RequestError).code, -32600)
+})
+
+test('app wiring: failed initialize resets the connection to uninitialized', async () => {
+  let activeAgent: PiAcpAgent | null = null
+  const conn = connect(agent => {
+    if (agent) activeAgent = agent
+  })
+  assert.ok(activeAgent)
+  const agent = activeAgent as PiAcpAgent
+  const originalInitialize = agent.initialize.bind(agent)
+  let fail = true
+  ;(agent as any).initialize = async (params: any) => {
+    if (fail) {
+      fail = false
+      throw new Error('initialize failed once')
+    }
+    return originalInitialize(params)
+  }
+
+  await assert.rejects(
+    () => conn.agent.request(methods.agent.initialize, { protocolVersion: 1 }),
+    (error: unknown) => (error as RequestError).code === -32603
+  )
+  const response = await conn.agent.request(methods.agent.initialize, { protocolVersion: 1 })
+  assert.equal(response.protocolVersion, 1)
+})
+
 test('app wiring: advertised session lifecycle methods are registered and routed', async () => {
   const conn = connect()
+  await conn.agent.request(methods.agent.initialize, { protocolVersion: 1 })
 
   // list works against the isolated (empty) session dir.
   const listed = await conn.agent.request(methods.agent.session.list, {})
@@ -130,10 +215,11 @@ test('app wiring: advertised session lifecycle methods are registered and routed
     (err: unknown) => (err as RequestError).code === -32002
   )
 
-  // The legacy Zed model selector method stays routed as a custom method.
+  // The legacy Zed model selector method is gone; model selection goes
+  // through the standard session/set_config_option path.
   await assert.rejects(
     () => conn.agent.request('session/set_model', { sessionId: 'unknown', modelId: 'test/alpha' }),
-    (err: unknown) => (err as RequestError).code === -32002
+    (err: unknown) => (err as RequestError).code === -32601
   )
 
   // cancel for an unknown session is a safe no-op notification.

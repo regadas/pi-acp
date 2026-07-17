@@ -1,17 +1,6 @@
 import { agent as acpAgent, methods, RequestError, type AgentApp } from '@agentclientprotocol/sdk'
-import { z } from 'zod'
 import { PiAcpAgent, runPromptWithCancellation } from './agent.js'
 import { ClientConnection } from './client.js'
-
-// Legacy Zed model selector method that predates stable session config
-// options. Registered as a custom method for older clients; new clients use
-// `session/set_config_option`.
-const LEGACY_SET_SESSION_MODEL_METHOD = 'session/set_model'
-
-const setSessionModelParams = z.object({
-  sessionId: z.string(),
-  modelId: z.string()
-})
 
 /**
  * Builds the ACP agent app with exactly the methods this adapter implements
@@ -21,16 +10,28 @@ const setSessionModelParams = z.object({
  */
 export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null) => void }): AgentApp {
   let active: PiAcpAgent | null = null
+  // ACP wire state is connection-scoped. `initializing` closes the race where
+  // two concurrent initialize requests both observed a false boolean.
+  let initializeState: 'uninitialized' | 'initializing' | 'initialized' = 'uninitialized'
 
   const getAgent = (): PiAcpAgent => {
     if (!active) throw RequestError.internalError({}, 'pi-acp agent is not connected')
     return active
   }
 
+  const getInitializedAgent = (): PiAcpAgent => {
+    const agent = getAgent()
+    if (initializeState !== 'initialized') {
+      throw RequestError.invalidRequest({}, 'Agent is not initialized: call initialize first')
+    }
+    return agent
+  }
+
   return acpAgent({ name: 'pi-acp' })
     .onConnect(connection => {
       const agent = new PiAcpAgent(new ClientConnection(connection.client))
       active = agent
+      initializeState = 'uninitialized'
       opts?.onAgent?.(agent)
 
       connection.signal.addEventListener(
@@ -38,6 +39,7 @@ export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null
         () => {
           if (active === agent) {
             active = null
+            initializeState = 'uninitialized'
             opts?.onAgent?.(null)
           }
           agent.dispose()
@@ -45,20 +47,37 @@ export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null
         { once: true }
       )
     })
-    .onRequest(methods.agent.initialize, ctx => getAgent().initialize(ctx.params))
-    .onRequest(methods.agent.authenticate, ctx => getAgent().authenticate(ctx.params))
-    .onRequest(methods.agent.session.new, ctx => getAgent().newSession(ctx.params))
-    .onRequest(methods.agent.session.load, ctx => getAgent().loadSession(ctx.params))
-    .onRequest(methods.agent.session.list, ctx => getAgent().listSessions(ctx.params))
-    .onRequest(methods.agent.session.resume, ctx => getAgent().resumeSession(ctx.params))
-    .onRequest(methods.agent.session.close, ctx => getAgent().closeSession(ctx.params))
-    .onRequest(methods.agent.session.delete, ctx => getAgent().deleteSession(ctx.params))
-    .onRequest(methods.agent.session.setMode, ctx => getAgent().setSessionMode(ctx.params))
-    .onRequest(methods.agent.session.setConfigOption, ctx => getAgent().setSessionConfigOption(ctx.params))
-    .onRequest(methods.agent.session.prompt, ctx => runPromptWithCancellation(getAgent(), ctx.params, ctx.signal))
-    .onNotification(methods.agent.session.cancel, ctx => getAgent().cancel(ctx.params))
-    .onRequest(LEGACY_SET_SESSION_MODEL_METHOD, setSessionModelParams, async ctx => {
-      await getAgent().unstable_setSessionModel(ctx.params)
-      return {}
+    .onRequest(methods.agent.initialize, async ctx => {
+      if (initializeState !== 'uninitialized') {
+        throw RequestError.invalidRequest({}, 'Agent is already initializing or initialized')
+      }
+
+      const agent = getAgent()
+      initializeState = 'initializing'
+      try {
+        const response = await agent.initialize(ctx.params)
+        if (active !== agent) {
+          throw RequestError.requestCancelled({}, 'ACP connection closed during initialize')
+        }
+        initializeState = 'initialized'
+        return response
+      } catch (error) {
+        // Do not reset state belonging to a newer connection.
+        if (active === agent) initializeState = 'uninitialized'
+        throw error
+      }
     })
+    .onRequest(methods.agent.authenticate, ctx => getInitializedAgent().authenticate(ctx.params))
+    .onRequest(methods.agent.session.new, ctx => getInitializedAgent().newSession(ctx.params))
+    .onRequest(methods.agent.session.load, ctx => getInitializedAgent().loadSession(ctx.params))
+    .onRequest(methods.agent.session.list, ctx => getInitializedAgent().listSessions(ctx.params))
+    .onRequest(methods.agent.session.resume, ctx => getInitializedAgent().resumeSession(ctx.params))
+    .onRequest(methods.agent.session.close, ctx => getInitializedAgent().closeSession(ctx.params))
+    .onRequest(methods.agent.session.delete, ctx => getInitializedAgent().deleteSession(ctx.params))
+    .onRequest(methods.agent.session.setMode, ctx => getInitializedAgent().setSessionMode(ctx.params))
+    .onRequest(methods.agent.session.setConfigOption, ctx => getInitializedAgent().setSessionConfigOption(ctx.params))
+    .onRequest(methods.agent.session.prompt, ctx =>
+      runPromptWithCancellation(getInitializedAgent(), ctx.params, ctx.signal)
+    )
+    .onNotification(methods.agent.session.cancel, ctx => getInitializedAgent().cancel(ctx.params))
 }

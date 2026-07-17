@@ -190,10 +190,10 @@ test(
     const third = session.prompt('third')
     let settled = false
     let turnBoundAtSettle = -1
-    const all = Promise.all([first, second, third]).then(reasons => {
+    const all = Promise.allSettled([first, second, third]).then(results => {
       settled = true
       turnBoundAtSettle = conn.updates.filter(update => TURN_BOUND_UPDATES.has(update.update.sessionUpdate)).length
-      return reasons
+      return results
     })
 
     await tick()
@@ -204,7 +204,12 @@ test(
     )
 
     releaseFirstUpdate()
-    assert.deepEqual(await all, ['error', 'error', 'error'])
+    const results = await all
+    for (const result of results) {
+      assert.equal(result.status, 'rejected', 'non-auth prompt failures must reject, not resolve end_turn')
+      assert.equal((result as PromiseRejectedResult).reason?.code, -32603)
+      assert.match(String((result as PromiseRejectedResult).reason?.message), /pi prompt failed/)
+    }
     assert.deepEqual(
       proc.prompts.map(prompt => prompt.message),
       ['first'],

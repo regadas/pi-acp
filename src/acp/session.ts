@@ -1,4 +1,5 @@
 import type {
+  AuthMethod,
   ContentBlock,
   McpServer,
   PermissionOption,
@@ -9,15 +10,22 @@ import type {
 } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
-import { lstatSync, readFileSync, statSync } from 'node:fs'
-import { isAbsolute, resolve as resolvePath } from 'node:path'
-import { PiRpcProcess, PiRpcSpawnError, type PiRpcEvent } from '../pi-rpc/process.js'
+import { lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs'
+import { dirname, isAbsolute, resolve as resolvePath } from 'node:path'
+import {
+  PiRpcProcess,
+  PiRpcRequestTimeoutError,
+  PiRpcSpawnError,
+  type PiRpcEvent,
+  type PiRpcTermination
+} from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
   bashExitCode,
+  bashOrderedContent,
   bashOutputDelta,
   bashResultText,
   bashTerminalContent,
@@ -26,8 +34,8 @@ import {
   bashTerminalOutputMeta,
   isBashTool
 } from './translate/bash.js'
-import { normalizePiMessageText } from './translate/pi-messages.js'
-import { toolResultToText } from './translate/pi-tools.js'
+import { translateCustomMessageContent, type TranslatedUserBlock } from './translate/pi-messages.js'
+import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
 
 type SessionCreateParams = {
   cwd: string
@@ -35,9 +43,13 @@ type SessionCreateParams = {
   conn: AcpClient
   fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
+  /** Client negotiated Zed's `_meta.terminal_output` tool rendering convention. */
+  supportsTerminalOutputMeta?: boolean
+  /** Auth methods the owning agent advertised at initialize (for auth-required errors). */
+  authMethods?: AuthMethod[]
 }
 
-export type StopReason = 'end_turn' | 'cancelled' | 'error'
+export type StopReason = 'end_turn' | 'cancelled' | 'max_tokens'
 
 type PendingTurn = {
   resolve: (reason: StopReason) => void
@@ -53,7 +65,7 @@ type QueuedTurn = {
 }
 
 type PendingCustomMessage = {
-  text: string
+  blocks: TranslatedUserBlock[]
   identity: string
   sequence: number
 }
@@ -90,14 +102,15 @@ function getToolPath(args: unknown): string | undefined {
   return undefined
 }
 
-function customMessageIdentity(message: unknown, text: string): string {
-  const record = message as { timestamp?: unknown; customType?: unknown; details?: unknown } | null | undefined
-  const timestamp = record?.timestamp
-  const timestampIdentity =
-    (typeof timestamp === 'number' && Number.isFinite(timestamp)) ||
-    (typeof timestamp === 'string' && timestamp.length > 0)
-      ? timestamp
-      : null
+/**
+ * Stable counted identity for a custom message across live events and
+ * persisted `custom_message` tree entries. Timestamps are deliberately
+ * excluded: pi stamps live `CustomMessage`s with a numeric epoch but persists
+ * an ISO string, so any timestamp-based identity would never reconcile.
+ * Repeated identical messages stay distinguishable by count, not identity.
+ */
+function customMessageIdentity(message: unknown, blocks: TranslatedUserBlock[]): string {
+  const record = message as { customType?: unknown; details?: unknown } | null | undefined
 
   let detailsIdentity: string
   try {
@@ -107,9 +120,8 @@ function customMessageIdentity(message: unknown, text: string): string {
   }
 
   return JSON.stringify([
-    timestampIdentity,
     typeof record?.customType === 'string' ? record.customType : null,
-    text,
+    blocks.map(block => (block.kind === 'text' ? ['text', block.text] : ['image', block.mimeType, block.data])),
     detailsIdentity
   ])
 }
@@ -204,16 +216,49 @@ function toToolCallLocations(
 
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
-  private readonly store = new SessionStore()
+  private readonly store: SessionStore
+  private disposed = false
 
-  /** Dispose all sessions and their underlying pi subprocesses. */
+  /** The owning agent shares its store so both sides see one mapping. */
+  constructor(store: SessionStore = new SessionStore()) {
+    this.store = store
+  }
+
+  /**
+   * Dispose all sessions and their underlying pi subprocesses and refuse any
+   * later registration: an in-flight create/restore that finishes spawning
+   * after teardown must dispose its fresh process instead of installing it.
+   */
   disposeAll(): void {
+    this.disposed = true
     for (const [id] of this.sessions) this.close(id)
   }
 
-  /** Get a registered session if it exists (no throw). */
+  isDisposed(): boolean {
+    return this.disposed
+  }
+
+  private assertNotDisposed(proc?: PiRpcProcess): void {
+    if (!this.disposed) return
+    proc?.dispose()
+    throw RequestError.internalError({}, 'pi-acp session manager is disposed')
+  }
+
+  /** Get a registered, usable session if it exists (no throw). */
   maybeGet(sessionId: string): PiAcpSession | undefined {
-    return this.sessions.get(sessionId)
+    const session = this.sessions.get(sessionId)
+    if (!session?.isUnavailable()) return session
+
+    session.dispose()
+    this.sessions.delete(sessionId)
+    return undefined
+  }
+
+  /** Remove a session only if it is still the instance the caller observed. */
+  evictIfCurrent(sessionId: string, expectedSession: PiAcpSession): boolean {
+    if (this.sessions.get(sessionId) !== expectedSession) return false
+    this.close(sessionId)
+    return true
   }
 
   /**
@@ -232,6 +277,8 @@ export class SessionManager {
   }
 
   async create(params: SessionCreateParams): Promise<PiAcpSession> {
+    this.assertNotDisposed()
+
     // Let pi manage session persistence in its default location (~/.pi/agent/sessions/...)
     // so sessions are visible to the regular `pi` CLI.
     let proc: PiRpcProcess
@@ -246,56 +293,105 @@ export class SessionManager {
       }
       throw e
     }
+    this.assertNotDisposed(proc)
 
+    // The ACP sessionId must be pi's authoritative persisted session identity;
+    // fabricating one would return an ID that can never be found, listed, or
+    // loaded again. Any failure past this point owns the spawned process.
     let state: any = null
     try {
       state = (await proc.getState()) as any
+    } catch (e) {
+      proc.dispose()
+      throw maybeAuthRequiredError(e, params.authMethods) ?? toRequestError(e)
+    }
+    this.assertNotDisposed(proc)
+
+    const sessionId = typeof state?.sessionId === 'string' && state.sessionId.trim() ? state.sessionId : null
+    const sessionFile = typeof state?.sessionFile === 'string' && state.sessionFile.trim() ? state.sessionFile : null
+    if (!sessionId || !sessionFile) {
+      proc.dispose()
+      throw RequestError.internalError(
+        {},
+        'pi did not report an authoritative sessionId/sessionFile for the new session'
+      )
+    }
+
+    // pi creates its session directory lazily; ensure it exists up-front so
+    // commands that read the session file (e.g. export_html) cannot fail on a
+    // missing parent directory. Best-effort: pi itself creates it on write.
+    try {
+      mkdirSync(dirname(sessionFile), { recursive: true })
     } catch {
-      state = null
+      // ignore
     }
 
-    const sessionId = typeof state?.sessionId === 'string' ? state.sessionId : crypto.randomUUID()
-    const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-
-    if (sessionFile) {
+    try {
       this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
+    } catch (e) {
+      proc.dispose()
+      throw toRequestError(e)
     }
 
-    const session = new PiAcpSession({
-      sessionId,
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      proc,
-      conn: params.conn,
-      fileCommands: params.fileCommands ?? []
-    })
+    let session: PiAcpSession
+    try {
+      session = new PiAcpSession({
+        sessionId,
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+        proc,
+        conn: params.conn,
+        fileCommands: params.fileCommands ?? [],
+        supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
+        authMethods: params.authMethods
+      })
+    } catch (error) {
+      proc.dispose()
+      throw error
+    }
 
     this.sessions.set(sessionId, session)
     return session
   }
 
   get(sessionId: string): PiAcpSession {
-    const s = this.sessions.get(sessionId)
-    if (!s) throw RequestError.resourceNotFound(sessionId)
-    return s
+    const session = this.maybeGet(sessionId)
+    if (!session) throw RequestError.resourceNotFound(sessionId)
+    return session
   }
 
   /**
    * Used by session/load: create a session object bound to an existing sessionId/proc
-   * if it isn't already registered.
+   * if it isn't already registered. When a registered session wins the race,
+   * the caller's freshly spawned losing process is disposed here so it can
+   * never leak; after disposeAll the fresh process is disposed and the call
+   * fails instead of registering.
    */
   getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiRpcProcess }): PiAcpSession {
-    const existing = this.sessions.get(sessionId)
-    if (existing) return existing
+    this.assertNotDisposed(params.proc)
 
-    const session = new PiAcpSession({
-      sessionId,
-      cwd: params.cwd,
-      mcpServers: params.mcpServers,
-      proc: params.proc,
-      conn: params.conn,
-      fileCommands: params.fileCommands ?? []
-    })
+    const existing = this.maybeGet(sessionId)
+    if (existing) {
+      if (existing.proc !== params.proc) params.proc.dispose()
+      return existing
+    }
+
+    let session: PiAcpSession
+    try {
+      session = new PiAcpSession({
+        sessionId,
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+        proc: params.proc,
+        conn: params.conn,
+        fileCommands: params.fileCommands ?? [],
+        supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
+        authMethods: params.authMethods
+      })
+    } catch (error) {
+      params.proc.dispose()
+      throw error
+    }
 
     this.sessions.set(sessionId, session)
     return session
@@ -316,6 +412,12 @@ export class PiAcpSession {
   readonly proc: PiRpcProcess
   private readonly conn: AcpClient
   private readonly fileCommands: FileSlashCommand[]
+  // Fabricated terminal references and terminal_* metadata are a negotiated
+  // Zed convention; never expose them to a client that did not opt in.
+  private readonly supportsTerminalOutputMeta: boolean
+  // Auth methods the owning agent advertised at initialize; auth-required
+  // errors raised from this session must advertise exactly these.
+  private readonly authMethods: AuthMethod[]
 
   // Used to map abort semantics to ACP stopReason.
   // Applies to the currently running turn.
@@ -339,6 +441,17 @@ export class PiAcpSession {
   // commands or input hooks) can complete without hanging.
   private agentRunObserved = false
 
+  // Stop-reason tracking for the current turn. `lastDoneReason` records the
+  // most recent assistantMessageEvent `done` reason ('length' maps to ACP
+  // max_tokens); `turnFailure` records a run failure that must fail the ACP
+  // turn once pi settles (agent_settled stays the sole settlement boundary).
+  private lastDoneReason: string | null = null
+  private turnFailure: Error | null = null
+
+  // Set once when the pi child terminates; used to fail (or cancel) any
+  // accepted turn deterministically instead of waiting for agent_settled.
+  private procTermination: PiRpcTermination | null = null
+
   // For ACP diff support: capture file contents before edit/write mutations,
   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
   // events may need to be implemented in pi in the future.
@@ -358,6 +471,7 @@ export class PiAcpSession {
   private shutdownPromise: Promise<void> | null = null
   private readonly unsubscribe: () => void
   private disposed = false
+  private disposalExpected = false
 
   constructor(opts: {
     sessionId: string
@@ -366,6 +480,8 @@ export class PiAcpSession {
     proc: PiRpcProcess
     conn: AcpClient
     fileCommands?: FileSlashCommand[]
+    supportsTerminalOutputMeta?: boolean
+    authMethods?: AuthMethod[]
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -373,17 +489,36 @@ export class PiAcpSession {
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
+    this.supportsTerminalOutputMeta = opts.supportsTerminalOutputMeta ?? false
+    this.authMethods = opts.authMethods ?? []
 
     this.unsubscribe = this.proc.onEvent(ev => this.handlePiEvent(ev))
+    // Intentionally never unsubscribed: onTermination fires at most once and
+    // is the only path that settles an accepted turn when the child dies
+    // mid-run (including a teardown that races an in-flight prompt).
+    this.proc.onTermination(termination => this.handleProcessTermination(termination))
   }
 
-  dispose(): void {
+  private handleProcessTermination(termination: PiRpcTermination): void {
+    this.procTermination = termination
+    const turn = this.pendingTurn
+    if (!turn || turn.completionStarted) return
+
+    // Adapter-driven teardown (dispose/close) settles as a cancellation, not
+    // as an internal error surfaced to the client. Fault quarantine explicitly
+    // opts out so disposal cannot reclassify the fault as cancellation.
+    if (termination.expected || this.closing || this.disposalExpected) this.cancelRequested = true
+    this.failTurn(turn, terminationError(termination))
+  }
+
+  dispose(options?: { expected?: boolean }): void {
     if (this.disposed) return
     this.disposed = true
+    this.disposalExpected = options?.expected ?? true
     try {
       this.unsubscribe()
     } finally {
-      this.proc.dispose()
+      this.proc.dispose({ expected: this.disposalExpected })
     }
   }
 
@@ -435,10 +570,10 @@ export class PiAcpSession {
       const record = message as { role?: unknown; display?: unknown; content?: unknown } | null | undefined
       if (record?.role !== 'custom' || record.display !== true) continue
 
-      const text = normalizePiMessageText(record.content)
-      if (!text) continue
+      const blocks = translateCustomMessageContent(record.content)
+      if (!blocks.length) continue
 
-      const identity = customMessageIdentity(message, text)
+      const identity = customMessageIdentity(message, blocks)
       replayedByIdentity.set(identity, (replayedByIdentity.get(identity) ?? 0) + 1)
     }
 
@@ -453,10 +588,14 @@ export class PiAcpSession {
       }
     }
 
-    // Prefer events observed before the response boundary, then reconcile
-    // later events only when their stable identity is actually in the snapshot.
+    // Only events observed up to the get_tree response boundary may be
+    // reconciled. An identical event arriving after the boundary is a
+    // genuinely new message (the snapshot cannot contain it), and counted
+    // identity cannot tell it apart from an older snapshot occurrence, so it
+    // must stay queued. Tradeoff: an event pi persisted just before the
+    // boundary but delivered just after it is replayed once and shown once
+    // more on the next prompt (rare duplicate) instead of ever being dropped.
     reconcile(this.pendingCustomMessages.filter(message => message.sequence <= throughSequence))
-    reconcile(this.pendingCustomMessages.filter(message => message.sequence > throughSequence))
 
     const retained = this.pendingCustomMessages.filter(message => !reconciledSequences.has(message.sequence))
     this.pendingCustomMessages.splice(0, this.pendingCustomMessages.length, ...retained)
@@ -465,9 +604,17 @@ export class PiAcpSession {
   private sendPendingCustomMessages(): void {
     const messages = this.pendingCustomMessages.splice(0)
     for (const message of messages) {
+      this.emitCustomMessageBlocks(message.blocks)
+    }
+  }
+
+  private emitCustomMessageBlocks(blocks: TranslatedUserBlock[]): void {
+    for (const block of blocks) {
       this.emit({
         sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: message.text } satisfies ContentBlock
+        content: (block.kind === 'text'
+          ? { type: 'text', text: block.text }
+          : { type: 'image', data: block.data, mimeType: block.mimeType }) satisfies ContentBlock
       })
     }
   }
@@ -539,6 +686,13 @@ export class PiAcpSession {
     try {
       // Abort the currently running turn (if any). If nothing is running, this is a no-op.
       await this.proc.abort()
+    } catch {
+      // If abort cannot be acknowledged, pi may still be generating output.
+      // Quarantine and terminate the channel, then settle locally rather than
+      // leaving session/prompt pending indefinitely.
+      this.dispose()
+      const turn = this.pendingTurn
+      if (turn) this.completeTurn(turn)
     } finally {
       // A queued prompt response must not overtake the updates that explain
       // why the queue was cleared, even when abort itself fails.
@@ -589,10 +743,6 @@ export class PiAcpSession {
     await this.flushEmits()
   }
 
-  wasCancelRequested(): boolean {
-    return this.cancelRequested
-  }
-
   private enqueueUpdate(update: SessionUpdate): Promise<void> {
     const delivery = this.lastEmit.then(() =>
       this.conn.sessionUpdate({
@@ -633,6 +783,7 @@ export class PiAcpSession {
     includeTerminal: boolean
   }): void {
     this.bashToolCallIds.add(params.toolCallId)
+    const includeTerminal = params.includeTerminal && this.supportsTerminalOutputMeta
     this.emit({
       sessionUpdate: params.sessionUpdate,
       toolCallId: params.toolCallId,
@@ -640,8 +791,8 @@ export class PiAcpSession {
       kind: 'execute',
       status: params.status,
       locations: params.locations,
-      ...(params.includeTerminal ? { content: bashTerminalContent(params.toolCallId) } : {}),
-      ...(params.includeTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {})
+      ...(includeTerminal ? { content: bashTerminalContent(params.toolCallId) } : {}),
+      ...(includeTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {})
     })
   }
 
@@ -651,7 +802,29 @@ export class PiAcpSession {
     result: unknown
     isError?: boolean
   }): void {
+    if (!this.supportsTerminalOutputMeta) {
+      // Generic clients get the full accumulated output as ordered standard
+      // content — text fenced in place, images kept in source order — and
+      // tool_call_update content replaces earlier content, so the snapshot
+      // stays consistent while streaming.
+      const content = bashOrderedContent(params.result)
+      this.emit({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: params.toolCallId,
+        status: params.status,
+        ...(content.length ? { content } : {})
+      })
+      return
+    }
+
     const text = bashResultText(params.result)
+    // Binary image blocks cannot travel through text-only terminal output;
+    // they are preserved as standard image content beside the terminal ref.
+    const imageContent: ToolCallContent[] = toolResultImageBlocks(params.result).map(image => ({
+      type: 'content',
+      content: { type: 'image', data: image.data, mimeType: image.mimeType }
+    }))
+
     const previous = this.bashOutputSnapshots.get(params.toolCallId) ?? ''
     const delta = bashOutputDelta(previous, text)
     this.bashOutputSnapshots.set(params.toolCallId, text)
@@ -660,6 +833,7 @@ export class PiAcpSession {
       sessionUpdate: 'tool_call_update',
       toolCallId: params.toolCallId,
       status: params.status,
+      ...(imageContent.length ? { content: [...bashTerminalContent(params.toolCallId), ...imageContent] } : {}),
       _meta: {
         ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
         ...(params.status === 'completed' || params.status === 'failed'
@@ -680,6 +854,8 @@ export class PiAcpSession {
   private startTurn(t: QueuedTurn): void {
     this.cancelRequested = false
     this.agentRunObserved = false
+    this.lastDoneReason = null
+    this.turnFailure = null
 
     const turn: PendingTurn = { resolve: t.resolve, reject: t.reject, completionStarted: false }
     this.pendingTurn = turn
@@ -713,7 +889,15 @@ export class PiAcpSession {
     this.proc
       .prompt(t.message, t.images)
       .then(() => this.handlePromptAccepted(turn))
-      .catch(err => this.failTurn(turn, err))
+      .catch(err => {
+        if (err instanceof PiRpcRequestTimeoutError && err.command === 'prompt') {
+          // PiRpcProcess already quarantined the channel. Unsubscribe session
+          // event handling immediately and mark this session unavailable so a
+          // later request restores a fresh subprocess instead of reusing it.
+          this.dispose({ expected: false })
+        }
+        this.failTurn(turn, err)
+      })
   }
 
   /**
@@ -738,11 +922,14 @@ export class PiAcpSession {
         // prompt was handled without an agent run.
         if (!isStreaming) this.completeTurn(turn)
       },
-      () => {
-        // State probe failed (pi exited or the RPC channel broke). Complete
-        // rather than hang; a dead subprocess cannot emit agent_settled.
+      err => {
+        // Without a successful idle-state probe, pi may still start the accepted
+        // prompt later. Quarantine it before settlement so no late output can
+        // escape into a closed or replacement ACP turn.
         if (this.pendingTurn !== turn || turn.completionStarted || this.agentRunObserved) return
-        this.completeTurn(turn)
+        const failure = this.procTermination ? terminationError(this.procTermination) : err
+        this.dispose({ expected: false })
+        this.failTurn(turn, failure)
       }
     )
   }
@@ -757,7 +944,11 @@ export class PiAcpSession {
   private completeTurn(turn: PendingTurn): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
-    const reason: StopReason = this.cancelRequested ? 'cancelled' : 'end_turn'
+    const reason: StopReason = this.cancelRequested
+      ? 'cancelled'
+      : this.lastDoneReason === 'length'
+        ? 'max_tokens'
+        : 'end_turn'
 
     void this.flushEmits().finally(() => {
       // Keep the completing turn installed until its updates have flushed. New
@@ -773,14 +964,12 @@ export class PiAcpSession {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
 
-    const authErr = maybeAuthRequiredError(err)
-
     // Keep the failed turn installed while its existing updates flush so any
     // concurrent prompts queue rather than leapfrog it. Once that first flush
     // completes, JS run-to-completion makes the queue drain + pendingTurn clear
     // atomic with respect to new prompt requests.
     void this.flushEmits().finally(() => {
-      const reason: StopReason = this.cancelRequested ? 'cancelled' : 'error'
+      const cancelled = this.cancelRequested
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
       this.pendingTurn = null
 
@@ -788,12 +977,23 @@ export class PiAcpSession {
       // blocked. Capture and flush them after closing the queue, before settling
       // either the failed request or any drained queued requests.
       void this.flushEmits().finally(() => {
-        if (authErr) {
-          turn.reject(authErr)
-          for (const queuedTurn of queued) queuedTurn.reject(authErr)
+        if (cancelled) {
+          // ACP cancellation semantics dominate all underlying failures,
+          // including auth-looking stderr from a process being torn down.
+          turn.resolve('cancelled')
+          for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
         } else {
-          turn.resolve(reason)
-          for (const queuedTurn of queued) queuedTurn.resolve(reason)
+          const authErr = maybeAuthRequiredError(err, this.authMethods)
+          if (authErr) {
+            turn.reject(authErr)
+            for (const queuedTurn of queued) queuedTurn.reject(authErr)
+          } else {
+            // Non-auth, non-cancel failures must reject the ACP request rather
+            // than masquerade as a successful end_turn.
+            const rpcError = toRequestError(err)
+            turn.reject(rpcError)
+            for (const queuedTurn of queued) queuedTurn.reject(rpcError)
+          }
         }
 
         // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
@@ -807,6 +1007,10 @@ export class PiAcpSession {
         }
       })
     })
+  }
+
+  isUnavailable(): boolean {
+    return this.disposed || this.procTermination !== null
   }
 
   private isClosing(): boolean {
@@ -935,6 +1139,36 @@ export class PiAcpSession {
           break
         }
 
+        if (ame?.type === 'done') {
+          const reason = typeof ame.reason === 'string' ? ame.reason : null
+          // A known successful completion supersedes a provisional error from
+          // an attempt that pi recovered via retry or compaction. Unknown future
+          // reasons must not accidentally erase a real failure.
+          if (reason === 'stop' || reason === 'length' || reason === 'toolUse') {
+            this.turnFailure = null
+          }
+          // Only the latest message boundary counts: a mid-turn 'length' stop
+          // followed by a continued run that ends with 'stop' is not truncation.
+          this.lastDoneReason = reason
+          break
+        }
+
+        if (ame?.type === 'error') {
+          const reason = typeof ame.reason === 'string' ? ame.reason : 'error'
+          const errorMessage = (ame as { error?: { errorMessage?: unknown } })?.error?.errorMessage
+          const detail = typeof errorMessage === 'string' && errorMessage ? `: ${errorMessage}` : ''
+          if (reason === 'aborted') {
+            // Only a client-driven cancellation may map an abort to the ACP
+            // `cancelled` stop reason; anything else is a failed turn.
+            if (!this.cancelRequested) {
+              this.turnFailure ??= new Error(`pi aborted the run unexpectedly${detail}`)
+            }
+          } else {
+            this.turnFailure ??= new Error(`pi run failed${detail}`)
+          }
+          break
+        }
+
         // Ignore other delta/event types for now.
         break
       }
@@ -943,21 +1177,18 @@ export class PiAcpSession {
         const message = (ev as any).message
         if (message?.role !== 'custom' || message.display !== true) break
 
-        const text = normalizePiMessageText(message.content)
-        if (!text) break
+        const blocks = translateCustomMessageContent(message.content)
+        if (!blocks.length) break
 
         const pendingMessage: PendingCustomMessage = {
-          text,
-          identity: customMessageIdentity(message, text),
+          blocks,
+          identity: customMessageIdentity(message, blocks),
           sequence: ++this.customMessageSequence
         }
         const forwardedTurnActive = Boolean(this.pendingTurn && !this.pendingTurn.completionStarted)
 
         if (forwardedTurnActive || this.activeAdapterPromptTurns > 0) {
-          this.emit({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text } satisfies ContentBlock
-          })
+          this.emitCustomMessageBlocks(blocks)
         } else {
           this.pendingCustomMessages.push(pendingMessage)
         }
@@ -1049,15 +1280,13 @@ export class PiAcpSession {
           break
         }
 
-        const text = this.fileMutationToolCallIds.has(toolCallId) ? '' : toolResultToText(partial)
+        const content = this.fileMutationToolCallIds.has(toolCallId) ? [] : toolResultToolCallContent(partial)
 
         this.emit({
           sessionUpdate: 'tool_call_update',
           toolCallId,
           status: 'in_progress',
-          content: text
-            ? ([{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[])
-            : undefined,
+          content: content.length ? content : undefined,
           ...(this.fileMutationToolCallIds.has(toolCallId) ? {} : { rawOutput: partial })
         })
         break
@@ -1080,7 +1309,7 @@ export class PiAcpSession {
           break
         }
 
-        const text = toolResultToText(result)
+        const orderedContent = toolResultToolCallContent(result)
 
         const snapshot = this.fileSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
@@ -1094,8 +1323,10 @@ export class PiAcpSession {
               hasStructuredDiff = true
               content = [
                 {
+                  // ACP Diff requires an absolute path; pi may report a
+                  // cwd-relative one.
                   type: 'diff',
-                  path: snapshot.path,
+                  path: abs,
                   oldText: snapshot.oldText,
                   newText
                 }
@@ -1106,8 +1337,13 @@ export class PiAcpSession {
           }
         }
 
-        if (!content && !hasStructuredDiff && text) {
-          content = [{ type: 'content', content: { type: 'text', text } }] satisfies ToolCallContent[]
+        if (content) {
+          // The structured diff replaces the tool's text summary; binary image
+          // blocks are still preserved after it.
+          const images = orderedContent.filter(item => item.type === 'content' && item.content.type === 'image')
+          if (images.length) content = [...content, ...images]
+        } else if (orderedContent.length) {
+          content = orderedContent
         }
 
         this.emit({
@@ -1143,6 +1379,18 @@ export class PiAcpSession {
       }
 
       case 'auto_retry_end': {
+        if ((ev as { success?: unknown }).success === false) {
+          const finalError = stringProp(ev, 'finalError')
+          const text = finalError ? `Automatic retry failed: ${finalError}` : 'Automatic retry failed.'
+          this.turnFailure = new Error(text)
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text } satisfies ContentBlock
+          })
+          break
+        }
+
+        this.turnFailure = null
         this.emit({
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'Retry finished, resuming.' } satisfies ContentBlock
@@ -1196,9 +1444,14 @@ export class PiAcpSession {
       case 'agent_settled': {
         // pi has fully settled this prompt: no automatic retry, compaction
         // retry, or queued continuation remains. This is the safe boundary to
-        // resolve the ACP `session/prompt`.
+        // resolve (or fail) the ACP `session/prompt`.
         const turn = this.pendingTurn
-        if (turn) this.completeTurn(turn)
+        if (!turn) break
+        if (this.turnFailure && !this.cancelRequested) {
+          this.failTurn(turn, this.turnFailure)
+        } else {
+          this.completeTurn(turn)
+        }
         break
       }
 
@@ -1356,6 +1609,21 @@ function extensionUiToolCall(id: string, ev: PiRpcEvent) {
 function stringProp(source: Record<string, unknown>, key: string): string | null {
   const value = source[key]
   return typeof value === 'string' ? value : null
+}
+
+function toRequestError(err: unknown): RequestError {
+  if (err instanceof RequestError) return err
+  const message = err instanceof Error ? err.message : String(err)
+  return RequestError.internalError({}, message)
+}
+
+function terminationError(termination: PiRpcTermination): Error {
+  const base =
+    termination.reason === 'error'
+      ? `pi process failed: ${termination.error instanceof Error ? termination.error.message : String(termination.error)}`
+      : `pi process exited unexpectedly (code=${termination.code}, signal=${termination.signal})`
+  const tail = termination.stderrTail.trim()
+  return new Error(tail ? `${base}. Last stderr output: ${tail.slice(-400)}` : base)
 }
 
 function optionIndex(optionId: string): number | null {

@@ -44,19 +44,30 @@ test('PiAcpAgent: resumeSession restores a session without replaying history', a
   process.env.PI_CODING_AGENT_DIR = root
   process.env.PI_ACP_DIR = acpDir
 
-  let getMessagesCalls = 0
+  let historyReplayCalls = 0
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = async (params: any) => {
     assert.equal(params.cwd, '/tmp/project')
     assert.ok(String(params.sessionPath).endsWith('0000_resume.jsonl'))
     return {
       onEvent: () => () => {},
+      onTermination: () => () => {},
       getMessages: async () => {
-        getMessagesCalls += 1
+        historyReplayCalls += 1
         return { messages: [] }
       },
+      getTree: async () => {
+        historyReplayCalls += 1
+        return { tree: [], leafId: null }
+      },
       getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }),
-      getState: async () => ({ thinkingLevel: 'medium', model: { provider: 'test', id: 'alpha' } })
+      getState: async () => ({
+        thinkingLevel: 'medium',
+        model: { provider: 'test', id: 'alpha', reasoning: true },
+        // Restore validation requires pi to report the requested session.
+        sessionId: 'sess-resume',
+        sessionFile: String(params.sessionPath)
+      })
     } as any
   }
 
@@ -69,9 +80,11 @@ test('PiAcpAgent: resumeSession restores a session without replaying history', a
     // Resume returns current session configuration...
     assert.ok(Array.isArray(res.configOptions) && res.configOptions.length > 0)
     assert.equal(res.modes?.currentModeId, 'medium')
+    // ...through standard fields only (no custom root models)...
+    assert.equal('models' in (res as any), false)
 
-    // ...but MUST NOT replay conversation history before responding.
-    assert.equal(getMessagesCalls, 0)
+    // ...and MUST NOT replay conversation history before responding.
+    assert.equal(historyReplayCalls, 0)
     assert.equal(conn.updates.length, 0)
 
     // Commands are advertised after the response has been delivered.
@@ -111,6 +124,12 @@ test('PiAcpAgent: closeSession waits for an in-progress resume and releases its 
 
   const originalSpawn = PiRpcProcess.spawn
   const proc = new FakePiRpcProcess()
+  // Restore validation requires pi to report the requested session.
+  proc.state = {
+    isStreaming: false,
+    sessionId: 'sess-resume',
+    sessionFile: join(sessionsDir, '0000_resume.jsonl')
+  }
   let releaseSpawn!: () => void
   const spawnGate = new Promise<void>(resolve => {
     releaseSpawn = resolve

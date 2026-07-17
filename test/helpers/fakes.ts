@@ -1,6 +1,6 @@
 import type { SessionNotification } from '@agentclientprotocol/sdk'
 import type { AcpClient } from '../../src/acp/client.js'
-import type { PiRpcEvent } from '../../src/pi-rpc/process.js'
+import type { PiRpcEvent, PiRpcTermination } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = SessionNotification
 
@@ -25,12 +25,14 @@ export class FakeAgentSideConnection {
 
 export class FakePiRpcProcess {
   private handlers: Array<(ev: PiRpcEvent) => void> = []
+  private terminationHandlers: Array<(t: PiRpcTermination) => void> = []
 
   // spies
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
   disposeCount = 0
+  readonly disposeOptions: Array<{ expected?: boolean } | undefined> = []
 
   // Mutable fake pi state returned by getState(). Defaults to an active agent
   // run so lifecycle tests behave like a real running pi; tests exercising
@@ -48,6 +50,27 @@ export class FakePiRpcProcess {
     for (const h of this.handlers) h(ev)
   }
 
+  onTermination(handler: (t: PiRpcTermination) => void): () => void {
+    this.terminationHandlers.push(handler)
+    return () => {
+      this.terminationHandlers = this.terminationHandlers.filter(h => h !== handler)
+    }
+  }
+
+  // Unlike the real PiRpcProcess (which notifies at most once), this does not
+  // dedupe deliveries so tests can assert session-side idempotency.
+  emitTermination(info: Partial<PiRpcTermination> = {}) {
+    const termination: PiRpcTermination = {
+      reason: 'exit',
+      code: 1,
+      signal: null,
+      expected: false,
+      stderrTail: '',
+      ...info
+    }
+    for (const h of this.terminationHandlers) h(termination)
+  }
+
   async prompt(message: string, attachments: unknown[] = []): Promise<void> {
     this.prompts.push({ message, attachments })
   }
@@ -56,8 +79,11 @@ export class FakePiRpcProcess {
     this.abortCount += 1
   }
 
-  dispose(): void {
+  // Mirrors PiRpcProcess.dispose(options?) so sessions exercising the
+  // expected/unexpected disposal distinction compile against the fake.
+  dispose(options?: { expected?: boolean }): void {
     this.disposeCount += 1
+    this.disposeOptions.push(options)
   }
 
   async sendExtensionUiResponse(response: unknown): Promise<void> {
@@ -75,6 +101,14 @@ export class FakePiRpcProcess {
   async getMessages(beforeResponseResolve?: () => void): Promise<any> {
     beforeResponseResolve?.()
     return { messages: [] }
+  }
+
+  // Mutable fake get_tree payload; tests set `tree` to replay history.
+  tree: { tree: unknown[]; leafId: string | null } = { tree: [], leafId: null }
+
+  async getTree(beforeResponseResolve?: () => void): Promise<any> {
+    beforeResponseResolve?.()
+    return this.tree
   }
 }
 

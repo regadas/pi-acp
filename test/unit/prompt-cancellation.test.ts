@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { PromptRequest } from '@agentclientprotocol/sdk'
 import { PiAcpAgent, runPromptWithCancellation } from '../../src/acp/agent.js'
-import { PiAcpSession } from '../../src/acp/session.js'
+import { PiAcpSession, SessionManager } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 const promptParams = (sessionId: string): PromptRequest => ({
@@ -123,6 +123,86 @@ test('runPromptWithCancellation: abort after settlement does not cancel later tu
   controller.abort()
   await new Promise(resolve => setTimeout(resolve, 0))
   assert.equal(cancelCount, 0)
+})
+
+test('PiAcpAgent: abort failure evicts the unavailable session after cancelling its prompt', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.abort = async () => {
+    proc.abortCount += 1
+    throw new Error('abort timed out')
+  }
+  const session = new PiAcpSession({
+    sessionId: 's-unhealthy',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  const evicted: Array<{ id: string; session: PiAcpSession }> = []
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = {
+    maybeGet: (id: string) => (id === session.sessionId ? session : undefined),
+    evictIfCurrent: (id: string, expected: PiAcpSession) => {
+      evicted.push({ id, session: expected })
+      return true
+    }
+  }
+
+  const pending = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  await agent.cancel({ sessionId: session.sessionId })
+
+  assert.equal(await pending, 'cancelled')
+  assert.deepEqual(evicted, [{ id: session.sessionId, session }])
+  assert.equal(proc.disposeCount, 1)
+})
+
+test('PiAcpAgent: stale cancel completion does not evict a replacement session', async () => {
+  const conn = new FakeAgentSideConnection()
+  const firstProc = new FakePiRpcProcess()
+  const secondProc = new FakePiRpcProcess()
+  const abortStarted = deferred<void>()
+  const releaseAbort = deferred<void>()
+  firstProc.abort = async () => {
+    firstProc.abortCount += 1
+    abortStarted.resolve()
+    await releaseAbort.promise
+    throw new Error('abort timed out')
+  }
+
+  const first = new PiAcpSession({
+    sessionId: 's-race',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: firstProc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  const replacement = new PiAcpSession({
+    sessionId: first.sessionId,
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: secondProc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+  const manager = new SessionManager()
+  ;(manager as any).sessions.set(first.sessionId, first)
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = manager
+
+  const cancellation = agent.cancel({ sessionId: first.sessionId })
+  await abortStarted.promise
+  ;(manager as any).sessions.set(first.sessionId, replacement)
+  releaseAbort.resolve()
+  await cancellation
+
+  assert.equal(manager.maybeGet(first.sessionId), replacement)
+  assert.equal(secondProc.disposeCount, 0)
+  assert.equal(firstProc.disposeCount, 1)
+  manager.close(first.sessionId)
 })
 
 test('runPromptWithCancellation: generic cancellation settles the session prompt as cancelled after final updates', async () => {

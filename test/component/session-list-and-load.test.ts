@@ -110,6 +110,66 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
       content: 'Timestamp-less message.',
       details: { source: 'queued' }
     }
+    const repeatedMessage = {
+      role: 'custom',
+      customType: 'repeated',
+      display: true,
+      content: 'Repeated identical message.',
+      timestamp: 4
+    }
+    const imageFirstMessage = {
+      role: 'custom',
+      customType: 'vision',
+      display: true,
+      content: [
+        { type: 'image', data: 'aW1nQQ==', mimeType: 'image/png' },
+        { type: 'text', text: 'Image note.' }
+      ],
+      timestamp: 5
+    }
+
+    // The persisted snapshot equivalents of the live custom messages:
+    // pi persists extension messages as `custom_message` entries.
+    const toCustomMessageEntry = (message: Record<string, unknown>) => ({
+      type: 'custom_message',
+      customType: message.customType,
+      content: message.content,
+      display: message.display,
+      ...(message.details !== undefined ? { details: message.details } : {}),
+      // pi persists SessionEntryBase.timestamp as an ISO string even though
+      // live CustomMessage events carry a numeric epoch timestamp; the
+      // reconciliation identity must bridge both representations.
+      timestamp: typeof message.timestamp === 'number' ? new Date(message.timestamp).toISOString() : message.timestamp
+    })
+
+    const chainEntries = [
+      { type: 'message', message: { role: 'user', content: 'Hello' } },
+      { type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] } },
+      toCustomMessageEntry(preBoundarySnapshotMessage),
+      toCustomMessageEntry(postBoundarySnapshotMessage),
+      toCustomMessageEntry(timestampLessSnapshotMessage),
+      toCustomMessageEntry(repeatedMessage),
+      toCustomMessageEntry(repeatedMessage),
+      toCustomMessageEntry(imageFirstMessage),
+      toCustomMessageEntry({ customType: 'background-task', display: false, content: 'Hidden custom message' }),
+      // Display flag absent: a raw custom message persisted as a message entry.
+      { type: 'message', message: { role: 'custom', content: 'Display flag absent' } },
+      toCustomMessageEntry({ customType: 'background-task', display: true, content: [] })
+    ]
+
+    // Nest the chain into get_tree's node shape (one active branch, no forks).
+    let treeRoot: any = null
+    let cursor: any = null
+    chainEntries.forEach((entry, index) => {
+      const node = {
+        entry: { id: `e${index + 1}`, parentId: index === 0 ? null : `e${index}`, timestamp: '', ...entry },
+        children: [] as any[]
+      }
+      if (!treeRoot) treeRoot = node
+      else cursor.children.push(node)
+      cursor = node
+    })
+    const treeData = { tree: [treeRoot], leafId: `e${chainEntries.length}` }
 
     ;(PiRpcProcess as any).spawn = async (params: any) => {
       // ensure loadSession resolves to some jsonl that ends with our expected filename
@@ -123,8 +183,12 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
             if (eventHandler === handler) eventHandler = undefined
           }
         },
-        getMessages: async (beforeResponseResolve?: () => void) => {
+        onTermination: () => () => {},
+        getTree: async (beforeResponseResolve?: () => void) => {
           eventHandler?.({ type: 'message_end', message: { ...preBoundarySnapshotMessage } })
+          eventHandler?.({ type: 'message_end', message: { ...repeatedMessage } })
+          eventHandler?.({ type: 'message_end', message: { ...repeatedMessage } })
+          eventHandler?.({ type: 'message_end', message: { ...imageFirstMessage } })
           beforeResponseResolve?.()
           eventHandler?.({ type: 'message_end', message: { ...postBoundarySnapshotMessage } })
           eventHandler?.({ type: 'message_end', message: { ...postBoundaryQueuedMessage } })
@@ -133,21 +197,19 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
           eventHandler?.({ type: 'message_end', message: { ...timestampLessQueuedMessage } })
           eventHandler?.({ type: 'message_end', message: { ...timestampLessSnapshotMessage } })
 
-          return {
-            messages: [
-              { role: 'user', content: 'Hello' },
-              { role: 'assistant', content: [{ type: 'text', text: 'Hi there!' }] },
-              preBoundarySnapshotMessage,
-              postBoundarySnapshotMessage,
-              timestampLessSnapshotMessage,
-              { role: 'custom', display: false, content: 'Hidden custom message' },
-              { role: 'custom', content: 'Display flag absent' },
-              { role: 'custom', display: true, content: [] }
-            ]
-          }
+          return treeData
+        },
+        getMessages: async () => {
+          throw new Error('get_messages must not be used for session/load replay')
         },
         getAvailableModels: async () => ({ models: [] }),
-        getState: async () => ({ thinkingLevel: 'medium', isStreaming: true }),
+        getState: async () => ({
+          thinkingLevel: 'medium',
+          isStreaming: true,
+          // Restore validation requires pi to report the requested session.
+          sessionId: 'sess-1',
+          sessionFile: String(params.sessionPath)
+        }),
         prompt: async () => {}
       } as any
     }
@@ -171,6 +233,21 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
       assert.equal(texts.filter(t => t.text === 'Pre-boundary snapshot message.').length, 1)
       assert.equal(texts.filter(t => t.text === 'Post-boundary snapshot message.').length, 1)
       assert.equal(texts.filter(t => t.text === 'Timestamp-less message.').length, 1)
+      assert.equal(texts.filter(t => t.text === 'Repeated identical message.').length, 2)
+      assert.equal(texts.filter(t => t.text === 'Image note.').length, 1)
+
+      const replayChunks = conn.updates
+        .map(u => (u as any).update)
+        .filter(u => u?.sessionUpdate === 'agent_message_chunk')
+        .map(u => u.content)
+      const imageIndex = replayChunks.findIndex(c => c?.type === 'image' && c?.data === 'aW1nQQ==')
+      assert.ok(imageIndex >= 0, 'custom-message image content is replayed')
+      assert.deepEqual(replayChunks[imageIndex], { type: 'image', data: 'aW1nQQ==', mimeType: 'image/png' })
+      assert.deepEqual(
+        replayChunks[imageIndex + 1],
+        { type: 'text', text: 'Image note.' },
+        'image-first ordering is preserved'
+      )
       assert.ok(!texts.some(t => t.text === 'Hidden custom message'))
       assert.ok(!texts.some(t => t.text === 'Display flag absent'))
       assert.ok(!texts.some(t => t.text === 'Post-boundary queued message.'))
@@ -190,9 +267,21 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
         .filter(u => u?.sessionUpdate === 'agent_message_chunk')
         .map(u => u.content?.text)
       assert.equal(allAgentTexts.filter(text => text === 'Pre-boundary snapshot message.').length, 1)
-      assert.equal(allAgentTexts.filter(text => text === 'Post-boundary snapshot message.').length, 1)
+      // A post-boundary event never reconciles against the snapshot — counted
+      // identity cannot tell a genuinely new identical message apart from an
+      // older snapshot occurrence — so it stays queued and is emitted on the
+      // next prompt. The rare delayed persisted event is therefore shown
+      // twice (documented tradeoff) instead of a new one ever being dropped.
+      assert.equal(allAgentTexts.filter(text => text === 'Post-boundary snapshot message.').length, 2)
       assert.equal(allAgentTexts.filter(text => text === 'Post-boundary queued message.').length, 1)
-      assert.equal(allAgentTexts.filter(text => text === 'Timestamp-less message.').length, 2)
+      assert.equal(allAgentTexts.filter(text => text === 'Timestamp-less message.').length, 3)
+      assert.equal(allAgentTexts.filter(text => text === 'Repeated identical message.').length, 2)
+      assert.equal(allAgentTexts.filter(text => text === 'Image note.').length, 1)
+
+      const allImageChunks = conn.updates
+        .map(u => (u as any).update)
+        .filter(u => u?.sessionUpdate === 'agent_message_chunk' && u.content?.type === 'image')
+      assert.equal(allImageChunks.length, 1, 'the custom-message image is not re-emitted on the next prompt')
     } finally {
       PiRpcProcess.spawn = originalSpawn
     }

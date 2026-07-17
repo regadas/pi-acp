@@ -7,6 +7,7 @@ import type { PromptRequest } from '@agentclientprotocol/sdk'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession, SessionManager } from '../../src/acp/session.js'
+import { SessionStore } from '../../src/acp/session-store.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -378,6 +379,8 @@ test('PiAcpAgent: public close invalidates a load during its private replacement
   const manager = (agent as any).sessions as SessionManager
   const sessionId = 's-load-close-teardown'
   const cwd = process.cwd()
+  // Restore validation requires pi to report the requested session.
+  replacementProc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
 
   manager.getOrCreate(sessionId, {
     cwd,
@@ -438,14 +441,28 @@ test('PiAcpAgent: close waits for deferred load updates and leaves no restored p
   const manager = (agent as any).sessions as SessionManager
   const sessionId = 's-load-close-replay'
   const cwd = process.cwd()
+  // Restore validation requires pi to report the requested session.
+  proc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
   ;(agent as any).store = {
     get: () => ({ sessionId, cwd, sessionFile: '/tmp/session.jsonl' }),
     upsert: () => {},
     delete: () => {}
   }
-  proc.getMessages = async () => ({
-    messages: [{ role: 'assistant', content: [{ type: 'text', text: 'restored history' }] }]
-  })
+  proc.tree = {
+    tree: [
+      {
+        entry: {
+          type: 'message',
+          id: 'e1',
+          parentId: null,
+          timestamp: '',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'restored history' }] }
+        },
+        children: []
+      }
+    ],
+    leafId: 'e1'
+  }
 
   const updateStarted = deferred<void>()
   const releaseUpdate = deferred<void>()
@@ -497,6 +514,8 @@ test('PiAcpAgent: restore persistence failure cannot leak its registered process
   const manager = (agent as any).sessions as SessionManager
   const sessionId = 's-restore-store-failure'
   const cwd = process.cwd()
+  // Restore validation requires pi to report the requested session.
+  proc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
   let close: Promise<unknown> | undefined
   ;(agent as any).store = {
     get: () => ({ sessionId, cwd, sessionFile: '/tmp/session.jsonl' }),
@@ -608,9 +627,9 @@ test('PiAcpAgent: deleteSession is idempotent and never unlinks tampered map pat
     assert.ok(existsSync(decoy), 'tampered map path was not unlinked')
     assert.equal(readFileSync(decoy, 'utf-8'), 'must never be deleted')
 
-    // The adapter mapping was removed and the session no longer lists.
-    const map = JSON.parse(readFileSync(join(acpDir, 'session-map.json'), 'utf-8'))
-    assert.equal(map.sessions['sess-del'], undefined)
+    // The adapter mapping was removed (tombstoned over the tampered legacy
+    // entry) and the session no longer lists.
+    assert.equal(new SessionStore(join(acpDir, 'session-map.json')).get('sess-del'), null)
     assert.deepEqual((await agent.listSessions({})).sessions, [])
 
     // Deleting again (or deleting unknown ids) stays a silent success.

@@ -3,22 +3,32 @@ import type { AuthMethod } from '@agentclientprotocol/sdk'
 export const PI_SETUP_METHOD_ID = 'pi_terminal_login'
 
 /**
- * Zed (and some other clients) currently support "Terminal Auth" via an extension field
- * in AuthMethod._meta, rather than the RFD "type/args/env" shape.
- *
- * We include BOTH for maximum compatibility:
- *  - `_meta["terminal-auth"]`: used by Zed to render the "Authenticate" banner + button.
- *  - `type/args/env`: registry-required shape.
+ * Terminal login methods for the negotiating client:
+ *  - The SDK's unstable terminal AuthMethod (`type`/`args`/`env`) is advertised
+ *    only when the client declared `clientCapabilities.auth.terminal`.
+ *  - Zed additionally reads `_meta["terminal-auth"]` (launch spec) to render
+ *    its "Authenticate" banner; included only when the client also declared
+ *    the matching `clientCapabilities._meta["terminal-auth"]` flag.
+ * A client that does not declare the standard terminal auth capability gets
+ * no auth methods: pi-acp has no agent-managed auth flow, so advertising one
+ * would dead-end the user. There is no module-level negotiation state: each
+ * `PiAcpAgent` computes its advertised methods at `initialize` and threads
+ * them through auth-required error mapping.
  */
-export function getAuthMethods(opts?: { supportsTerminalAuthMeta?: boolean }): AuthMethod[] {
-  const supportsTerminalAuthMeta = opts?.supportsTerminalAuthMeta ?? true
+export function getAuthMethods(opts?: {
+  supportsTerminalAuth?: boolean
+  supportsTerminalAuthMeta?: boolean
+}): AuthMethod[] {
+  const supportsTerminalAuth = opts?.supportsTerminalAuth ?? false
+  const supportsTerminalAuthMeta = opts?.supportsTerminalAuthMeta ?? false
+
+  if (!supportsTerminalAuth) return []
 
   const method: any = {
     id: PI_SETUP_METHOD_ID,
     name: 'Launch pi in the terminal',
     description: 'Start pi in an interactive terminal to configure API keys or login',
 
-    // Registry-required fields
     type: 'terminal',
     args: ['--terminal-login'],
     env: {}

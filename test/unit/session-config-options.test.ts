@@ -24,9 +24,6 @@ class FakeSessions {
 }
 
 test('PiAcpAgent: newSession returns configOptions for model and thinking selectors', async () => {
-  const realSetTimeout = globalThis.setTimeout
-  ;(globalThis as any).setTimeout = () => 0 as any
-
   try {
     const conn = new FakeAgentSideConnection()
     const session = {
@@ -44,7 +41,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
         async getState() {
           return {
             thinkingLevel: 'high',
-            model: { provider: 'test', id: 'beta' }
+            model: { provider: 'test', id: 'beta', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } }
           }
         }
       },
@@ -54,10 +51,14 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
 
     const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
     ;(agent as any).sessions = new FakeSessions(session) as any
+    // Local seam: swallow deferred notifications instead of patching timers.
+    ;(agent as any).scheduleDeferred = () => {}
 
     const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
 
-    assert.equal(result.models?.currentModelId, 'test/beta')
+    // Model state is exposed only through standard configOptions; the legacy
+    // custom root `models` field is gone.
+    assert.equal('models' in (result as any), false)
     assert.equal(result.modes?.currentModeId, 'high')
     assert.deepEqual(result.configOptions, [
       {
@@ -90,7 +91,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
       }
     ])
   } finally {
-    ;(globalThis as any).setTimeout = realSetTimeout
+    // no global state to restore
   }
 })
 
@@ -98,7 +99,7 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
   const conn = new FakeAgentSideConnection()
   const state = {
     thinkingLevel: 'medium',
-    model: { provider: 'test', id: 'alpha' }
+    model: { provider: 'test', id: 'alpha', reasoning: true }
   }
   const setModelCalls: Array<{ provider: string; modelId: string }> = []
 
@@ -119,7 +120,7 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
       },
       async setModel(provider: string, modelId: string) {
         setModelCalls.push({ provider, modelId })
-        state.model = { provider, id: modelId }
+        state.model = { provider, id: modelId, reasoning: true }
       }
     }
   }
@@ -150,7 +151,7 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
   const conn = new FakeAgentSideConnection()
   const state = {
     thinkingLevel: 'medium',
-    model: { provider: 'test', id: 'alpha' }
+    model: { provider: 'test', id: 'alpha', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } }
   }
   const thinkingLevels: string[] = []
 
@@ -200,4 +201,131 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
       }
     }
   ])
+})
+
+test('PiAcpAgent: setSessionConfigOption rejects thinking levels the current model does not support', async () => {
+  const conn = new FakeAgentSideConnection()
+  const thinkingLevels: string[] = []
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
+      },
+      async getState() {
+        return {
+          thinkingLevel: 'medium',
+          model: { provider: 'test', id: 'alpha', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } }
+        }
+      },
+      async setThinkingLevel(level: string) {
+        thinkingLevels.push(level)
+      }
+    }
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  await assert.rejects(
+    () => agent.setSessionConfigOption({ sessionId: 's1', configId: 'thought_level', value: 'max' } as any),
+    (e: any) => {
+      assert.equal(e?.code, -32602)
+      assert.match(String(e?.message), /not supported by the current model/)
+      return true
+    }
+  )
+  await assert.rejects(
+    () => agent.setSessionMode({ sessionId: 's1', modeId: 'max' } as any),
+    (e: any) => e?.code === -32602
+  )
+  assert.deepEqual(thinkingLevels, [], 'unsupported levels must be rejected before reaching pi')
+})
+
+test('PiAcpAgent: setSessionConfigOption accepts max on a Kimi-like max-only model', async () => {
+  const conn = new FakeAgentSideConnection()
+  const thinkingLevels: string[] = []
+  const state = {
+    thinkingLevel: 'max',
+    model: {
+      provider: 'kimi',
+      id: 'k3',
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: 'max' }
+    }
+  }
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [{ provider: 'kimi', id: 'k3', name: 'K3' }] }
+      },
+      async getState() {
+        return state
+      },
+      async setThinkingLevel(level: string) {
+        thinkingLevels.push(level)
+      }
+    }
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  const result = await agent.setSessionConfigOption({ sessionId: 's1', configId: 'thought_level', value: 'max' } as any)
+
+  assert.deepEqual(thinkingLevels, ['max'])
+  const thought = result.configOptions.find(option => option.id === 'thought_level')
+  assert.equal(thought?.currentValue, 'max')
+  assert.deepEqual(
+    (thought as any)?.options.map((o: any) => o.value),
+    ['max'],
+    'only the model-supported levels are advertised'
+  )
+})
+
+test('PiAcpAgent: model switch refreshes advertised thinking levels for the new model', async () => {
+  const conn = new FakeAgentSideConnection()
+  const state: any = {
+    thinkingLevel: 'high',
+    model: { provider: 'test', id: 'plain', reasoning: true }
+  }
+  const session = {
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return {
+          models: [
+            { provider: 'test', id: 'plain', name: 'Plain' },
+            { provider: 'test', id: 'deep', name: 'Deep' }
+          ]
+        }
+      },
+      async getState() {
+        return state
+      },
+      async setModel(provider: string, modelId: string) {
+        state.model = {
+          provider,
+          id: modelId,
+          reasoning: true,
+          thinkingLevelMap: { xhigh: 'xhigh', max: 'max' }
+        }
+      }
+    }
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  ;(agent as any).sessions = new FakeSessions(session) as any
+
+  const result = await agent.setSessionConfigOption({ sessionId: 's1', configId: 'model', value: 'test/deep' } as any)
+  const thought = result.configOptions.find(option => option.id === 'thought_level')
+  assert.deepEqual(
+    (thought as any)?.options.map((o: any) => o.value),
+    ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    'config refresh after a model change includes the new model levels (incl. max)'
+  )
 })
