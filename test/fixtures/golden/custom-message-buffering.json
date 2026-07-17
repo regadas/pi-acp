@@ -1,0 +1,109 @@
+{
+  "formatVersion": 1,
+  "name": "custom-message-buffering",
+  "description": "Visible custom messages arriving while pi is idle are buffered and flushed exactly once at the start of the next turn (before its queue-status update); in-turn custom messages emit immediately; hidden custom and assistant message_end events emit nothing.",
+  "session": {
+    "sessionId": "s1",
+    "cwd": "/fixture/cwd",
+    "supportsTerminalOutputMeta": false
+  },
+  "steps": [
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "message_end",
+        "message": { "role": "custom", "display": true, "content": "First idle message." }
+      }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "message_end",
+        "message": { "role": "custom", "display": true, "content": "Second idle message." }
+      }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "message_end",
+        "message": { "role": "custom", "display": false, "content": "Hidden message." }
+      }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "message_end",
+        "message": { "role": "assistant", "content": [{ "type": "text", "text": "Already streamed." }] }
+      }
+    },
+    { "op": "prompt", "promptId": "p1", "text": "first prompt" },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "message_end",
+        "message": { "role": "custom", "display": true, "content": "Mid-turn message." }
+      }
+    },
+    { "op": "pi_event", "event": { "type": "agent_settled" } },
+    { "op": "prompt", "promptId": "p2", "text": "second prompt" },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    { "op": "pi_event", "event": { "type": "agent_settled" } }
+  ],
+  "expected": {
+    "pi": [
+      { "kind": "prompt", "message": "first prompt" },
+      { "kind": "prompt", "message": "second prompt" }
+    ],
+    "acp": [
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "First idle message." }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "Second idle message." }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Mid-turn message." } }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": false } }
+        }
+      },
+      { "kind": "stop", "promptId": "p1", "stopReason": "end_turn" },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": false } }
+        }
+      },
+      { "kind": "stop", "promptId": "p2", "stopReason": "end_turn" }
+    ]
+  }
+}

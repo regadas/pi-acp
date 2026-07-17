@@ -1,0 +1,89 @@
+{
+  "formatVersion": 1,
+  "name": "bash-terminal-meta",
+  "description": "With negotiated terminal_output metadata, bash execution carries a terminal content reference, terminal_info includes the session cwd verbatim, terminal_output streams deltas of the accumulated text, and completion adds terminal_exit.",
+  "session": {
+    "sessionId": "s1",
+    "cwd": "/fixture/cwd",
+    "supportsTerminalOutputMeta": true
+  },
+  "steps": [
+    { "op": "prompt", "promptId": "p1", "text": "run ls" },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    {
+      "op": "pi_event",
+      "event": { "type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash", "args": { "command": "ls" } }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "tool_execution_update",
+        "toolCallId": "t1",
+        "partialResult": { "content": [{ "type": "text", "text": "running" }] }
+      }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "tool_execution_end",
+        "toolCallId": "t1",
+        "isError": false,
+        "result": { "content": [{ "type": "text", "text": "running\ndone" }] }
+      }
+    },
+    { "op": "pi_event", "event": { "type": "agent_settled" } }
+  ],
+  "expected": {
+    "pi": [{ "kind": "prompt", "message": "run ls" }],
+    "acp": [
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "t1",
+          "title": "ls",
+          "kind": "execute",
+          "status": "in_progress",
+          "content": [{ "type": "terminal", "terminalId": "t1" }],
+          "_meta": { "terminal_info": { "terminal_id": "t1", "cwd": "/fixture/cwd" } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "t1",
+          "status": "in_progress",
+          "_meta": { "terminal_output": { "terminal_id": "t1", "data": "running" } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "t1",
+          "status": "completed",
+          "_meta": {
+            "terminal_output": { "terminal_id": "t1", "data": "\ndone" },
+            "terminal_exit": { "terminal_id": "t1", "exit_code": 0, "signal": null }
+          }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": false } }
+        }
+      },
+      { "kind": "stop", "promptId": "p1", "stopReason": "end_turn" }
+    ]
+  }
+}

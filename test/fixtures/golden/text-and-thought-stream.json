@@ -1,0 +1,67 @@
+{
+  "formatVersion": 1,
+  "name": "text-and-thought-stream",
+  "description": "Assistant text_delta maps to agent_message_chunk and thinking_delta to agent_thought_chunk in source order; turn_end and agent_end do not settle; agent_settled resolves end_turn after all updates.",
+  "session": {
+    "sessionId": "s1",
+    "cwd": "/fixture/cwd",
+    "supportsTerminalOutputMeta": false
+  },
+  "steps": [
+    { "op": "prompt", "promptId": "p1", "text": "hello" },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    {
+      "op": "pi_event",
+      "event": { "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "delta": "Hello, " } }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "message_update",
+        "assistantMessageEvent": { "type": "thinking_delta", "delta": "considering the question" }
+      }
+    },
+    {
+      "op": "pi_event",
+      "event": { "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "delta": "world." } }
+    },
+    { "op": "pi_event", "event": { "type": "turn_end" } },
+    { "op": "pi_event", "event": { "type": "agent_end" } },
+    { "op": "pi_event", "event": { "type": "agent_settled" } }
+  ],
+  "expected": {
+    "pi": [{ "kind": "prompt", "message": "hello" }],
+    "acp": [
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "Hello, " } }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "agent_thought_chunk",
+          "content": { "type": "text", "text": "considering the question" }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "world." } }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": false } }
+        }
+      },
+      { "kind": "stop", "promptId": "p1", "stopReason": "end_turn" }
+    ]
+  }
+}

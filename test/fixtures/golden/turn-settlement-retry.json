@@ -1,0 +1,101 @@
+{
+  "formatVersion": 1,
+  "name": "turn-settlement-retry",
+  "description": "agent_end does not settle the prompt: an automatic retry continuation (thought and tool work) stays inside the same ACP turn, the retry notice text is locked, and the stop trails every update.",
+  "session": {
+    "sessionId": "s1",
+    "cwd": "/fixture/cwd",
+    "supportsTerminalOutputMeta": false
+  },
+  "steps": [
+    { "op": "prompt", "promptId": "p1", "text": "hello" },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    {
+      "op": "pi_event",
+      "event": { "type": "message_update", "assistantMessageEvent": { "type": "text_delta", "delta": "partial " } }
+    },
+    { "op": "pi_event", "event": { "type": "turn_end" } },
+    { "op": "pi_event", "event": { "type": "agent_end" } },
+    { "op": "pi_event", "event": { "type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 2000 } },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "message_update",
+        "assistantMessageEvent": { "type": "thinking_delta", "delta": "still thinking" }
+      }
+    },
+    {
+      "op": "pi_event",
+      "event": { "type": "tool_execution_start", "toolCallId": "t1", "toolName": "search", "args": { "query": "docs" } }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "tool_execution_end",
+        "toolCallId": "t1",
+        "isError": false,
+        "result": { "content": [{ "type": "text", "text": "done" }] }
+      }
+    },
+    { "op": "pi_event", "event": { "type": "turn_end" } },
+    { "op": "pi_event", "event": { "type": "agent_end" } },
+    { "op": "pi_event", "event": { "type": "agent_settled" } }
+  ],
+  "expected": {
+    "pi": [{ "kind": "prompt", "message": "hello" }],
+    "acp": [
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "partial " } }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "Retrying (attempt 1/3, waiting 2s)..." }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": { "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "still thinking" } }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "t1",
+          "title": "search",
+          "kind": "other",
+          "status": "in_progress",
+          "rawInput": { "query": "docs" }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "t1",
+          "status": "completed",
+          "content": [{ "type": "content", "content": { "type": "text", "text": "done" } }],
+          "rawOutput": { "content": [{ "type": "text", "text": "done" }] }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": false } }
+        }
+      },
+      { "kind": "stop", "promptId": "p1", "stopReason": "end_turn" }
+    ]
+  }
+}

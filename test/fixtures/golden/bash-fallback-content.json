@@ -1,0 +1,84 @@
+{
+  "formatVersion": 1,
+  "name": "bash-fallback-content",
+  "description": "Without negotiated terminal_output metadata, bash execution renders as a plain tool_call (no fabricated terminal reference) and each update carries the full accumulated output fenced as a console block.",
+  "session": {
+    "sessionId": "s1",
+    "cwd": "/fixture/cwd",
+    "supportsTerminalOutputMeta": false
+  },
+  "steps": [
+    { "op": "prompt", "promptId": "p1", "text": "run ls" },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    {
+      "op": "pi_event",
+      "event": { "type": "tool_execution_start", "toolCallId": "t1", "toolName": "bash", "args": { "command": "ls" } }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "tool_execution_update",
+        "toolCallId": "t1",
+        "partialResult": { "content": [{ "type": "text", "text": "running" }] }
+      }
+    },
+    {
+      "op": "pi_event",
+      "event": {
+        "type": "tool_execution_end",
+        "toolCallId": "t1",
+        "isError": false,
+        "result": { "content": [{ "type": "text", "text": "running\ndone" }] }
+      }
+    },
+    { "op": "pi_event", "event": { "type": "agent_settled" } }
+  ],
+  "expected": {
+    "pi": [{ "kind": "prompt", "message": "run ls" }],
+    "acp": [
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call",
+          "toolCallId": "t1",
+          "title": "ls",
+          "kind": "execute",
+          "status": "in_progress"
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "t1",
+          "status": "in_progress",
+          "content": [{ "type": "content", "content": { "type": "text", "text": "```console\nrunning\n```" } }]
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "tool_call_update",
+          "toolCallId": "t1",
+          "status": "completed",
+          "content": [{ "type": "content", "content": { "type": "text", "text": "```console\nrunning\ndone\n```" } }]
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": false } }
+        }
+      },
+      { "kind": "stop", "promptId": "p1", "stopReason": "end_turn" }
+    ]
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "formatVersion": 1,
+  "name": "queue-cancel",
+  "description": "A second prompt queues behind the running turn with visible queue-status updates and is never forwarded to pi; cancel clears the queue, aborts pi, settles the queued prompt as cancelled after the explanatory updates, and the running turn settles cancelled at agent_settled.",
+  "session": {
+    "sessionId": "s1",
+    "cwd": "/fixture/cwd",
+    "supportsTerminalOutputMeta": false
+  },
+  "steps": [
+    { "op": "prompt", "promptId": "p1", "text": "p one" },
+    { "op": "pi_event", "event": { "type": "agent_start" } },
+    { "op": "prompt", "promptId": "p2", "text": "p two" },
+    { "op": "cancel" },
+    { "op": "pi_event", "event": { "type": "agent_settled" } }
+  ],
+  "expected": {
+    "pi": [{ "kind": "prompt", "message": "p one" }, { "kind": "abort" }],
+    "acp": [
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "Queued message (position 1)." }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 1, "running": true } }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "Cleared queued prompts." }
+        }
+      },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": true } }
+        }
+      },
+      { "kind": "stop", "promptId": "p2", "stopReason": "cancelled" },
+      {
+        "kind": "session_update",
+        "update": {
+          "sessionUpdate": "session_info_update",
+          "_meta": { "piAcp": { "queueDepth": 0, "running": false } }
+        }
+      },
+      { "kind": "stop", "promptId": "p1", "stopReason": "cancelled" }
+    ]
+  }
+}
