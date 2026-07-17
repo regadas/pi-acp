@@ -15,6 +15,10 @@ coverage/
 # OS / editor cruft
 .DS_Store
 
+# Agent harness artifacts
+.pi-subagents/
+.agent-shell/
+
 # Large generated artifacts
 *.map
 *.tsbuildinfo
