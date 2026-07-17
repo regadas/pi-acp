@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { PiAcpSession, SessionManager } from '../../src/acp/session.js'
+import { PiAcpSession } from '../../src/acp/session.js'
+import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess): PiAcpSession {

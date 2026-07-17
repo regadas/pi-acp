@@ -5,22 +5,14 @@ import type {
   PermissionOption,
   SessionUpdate,
   ToolCallContent,
-  ToolCallLocation,
-  ToolKind
+  ToolCallLocation
 } from '@agentclientprotocol/sdk'
-import { RequestError } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
-import { lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs'
-import { dirname, isAbsolute, resolve as resolvePath } from 'node:path'
-import {
-  PiRpcProcess,
-  PiRpcRequestTimeoutError,
-  PiRpcSpawnError,
-  type PiRpcEvent,
-  type PiRpcTermination
-} from '../pi-rpc/process.js'
+import { readFileSync } from 'node:fs'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { PiRpcProcess, PiRpcRequestTimeoutError, type PiRpcEvent, type PiRpcTermination } from '../pi-rpc/process.js'
 import { maybeAuthRequiredError } from './auth-required.js'
-import { SessionStore } from './session-store.js'
+import { terminationError, toRequestError } from './session-errors.js'
 import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
@@ -36,18 +28,13 @@ import {
 } from './translate/bash.js'
 import { translateCustomMessageContent, type TranslatedUserBlock } from './translate/pi-messages.js'
 import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
-
-type SessionCreateParams = {
-  cwd: string
-  mcpServers: McpServer[]
-  conn: AcpClient
-  fileCommands?: import('./slash-commands.js').FileSlashCommand[]
-  piCommand?: string
-  /** Client negotiated Zed's `_meta.terminal_output` tool rendering convention. */
-  supportsTerminalOutputMeta?: boolean
-  /** Auth methods the owning agent advertised at initialize (for auth-required errors). */
-  authMethods?: AuthMethod[]
-}
+import {
+  findUniqueLineNumber,
+  getEditOldTexts,
+  getToolPath,
+  toToolCallLocations,
+  toToolKind
+} from './translate/tool-calls.js'
 
 export type StopReason = 'end_turn' | 'cancelled' | 'max_tokens'
 
@@ -79,29 +66,6 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
 
-function findUniqueLineNumber(text: string, needle: string): number | undefined {
-  if (!needle) return undefined
-
-  const first = text.indexOf(needle)
-  if (first < 0) return undefined
-
-  const second = text.indexOf(needle, first + needle.length)
-  if (second >= 0) return undefined
-
-  let line = 1
-  for (let i = 0; i < first; i += 1) {
-    if (text.charCodeAt(i) === 10) line += 1
-  }
-  return line
-}
-
-function getToolPath(args: unknown): string | undefined {
-  const record = args as { path?: unknown; file_path?: unknown } | null | undefined
-  if (typeof record?.path === 'string') return record.path
-  if (typeof record?.file_path === 'string') return record.file_path
-  return undefined
-}
-
 /**
  * Stable counted identity for a custom message across live events and
  * persisted `custom_message` tree entries. Timestamps are deliberately
@@ -124,278 +88,6 @@ function customMessageIdentity(message: unknown, blocks: TranslatedUserBlock[]):
     blocks.map(block => (block.kind === 'text' ? ['text', block.text] : ['image', block.mimeType, block.data])),
     detailsIdentity
   ])
-}
-
-// Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
-// legacy top-level oldText/newText still accepted. Pi also normalizes stringified edits.
-// https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts
-function getParsedEdits(args: unknown): Array<{ oldText: string; newText: string }> {
-  const record = args as { oldText?: unknown; newText?: unknown; edits?: unknown } | null | undefined
-  const parsed: Array<{ oldText: string; newText: string }> = []
-
-  if (typeof record?.oldText === 'string' && typeof record?.newText === 'string') {
-    parsed.push({ oldText: record.oldText, newText: record.newText })
-  }
-
-  let edits = record?.edits
-  if (typeof edits === 'string') {
-    try {
-      edits = JSON.parse(edits) as unknown
-    } catch {
-      edits = undefined
-    }
-  }
-
-  if (Array.isArray(edits)) {
-    for (const edit of edits) {
-      const item = edit as { oldText?: unknown; newText?: unknown } | null | undefined
-      if (typeof item?.oldText === 'string' && typeof item?.newText === 'string') {
-        parsed.push({ oldText: item.oldText, newText: item.newText })
-      }
-    }
-  }
-
-  return parsed
-}
-
-function getEditOldTexts(args: unknown): string[] {
-  const record = args as { oldText?: unknown; edits?: unknown } | null | undefined
-  const oldTexts = getParsedEdits(args).map(edit => edit.oldText)
-
-  if (typeof record?.oldText === 'string' && !oldTexts.includes(record.oldText)) oldTexts.push(record.oldText)
-
-  let edits = record?.edits
-  if (typeof edits === 'string') {
-    try {
-      edits = JSON.parse(edits) as unknown
-    } catch {
-      edits = undefined
-    }
-  }
-
-  if (Array.isArray(edits)) {
-    for (const edit of edits) {
-      const oldText = (edit as { oldText?: unknown } | null | undefined)?.oldText
-      if (typeof oldText === 'string' && !oldTexts.includes(oldText)) oldTexts.push(oldText)
-    }
-  }
-
-  return oldTexts
-}
-
-function toToolCallLocations(
-  toolName: string,
-  args: unknown,
-  cwd: string,
-  line?: number
-): ToolCallLocation[] | undefined {
-  const path = getToolPath(args)
-  if (!path) return undefined
-
-  const resolvedPath = isAbsolute(path) ? path : resolvePath(cwd, path)
-  let entry: ReturnType<typeof lstatSync>
-  try {
-    entry = lstatSync(resolvedPath)
-  } catch (error) {
-    const isMissing = (error as NodeJS.ErrnoException).code === 'ENOENT'
-    if (!isMissing || toolName.toLowerCase() !== 'write') return undefined
-    return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
-  }
-
-  if (entry.isSymbolicLink()) {
-    try {
-      entry = statSync(resolvedPath)
-    } catch {
-      return undefined
-    }
-  }
-
-  if (!entry.isFile()) return undefined
-  return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
-}
-
-export class SessionManager {
-  private sessions = new Map<string, PiAcpSession>()
-  private readonly store: SessionStore
-  private disposed = false
-
-  /** The owning agent shares its store so both sides see one mapping. */
-  constructor(store: SessionStore = new SessionStore()) {
-    this.store = store
-  }
-
-  /**
-   * Dispose all sessions and their underlying pi subprocesses and refuse any
-   * later registration: an in-flight create/restore that finishes spawning
-   * after teardown must dispose its fresh process instead of installing it.
-   */
-  disposeAll(): void {
-    this.disposed = true
-    for (const [id] of this.sessions) this.close(id)
-  }
-
-  isDisposed(): boolean {
-    return this.disposed
-  }
-
-  private assertNotDisposed(proc?: PiRpcProcess): void {
-    if (!this.disposed) return
-    proc?.dispose()
-    throw RequestError.internalError({}, 'pi-acp session manager is disposed')
-  }
-
-  /** Get a registered, usable session if it exists (no throw). */
-  maybeGet(sessionId: string): PiAcpSession | undefined {
-    const session = this.sessions.get(sessionId)
-    if (!session?.isUnavailable()) return session
-
-    session.dispose()
-    this.sessions.delete(sessionId)
-    return undefined
-  }
-
-  /** Remove a session only if it is still the instance the caller observed. */
-  evictIfCurrent(sessionId: string, expectedSession: PiAcpSession): boolean {
-    if (this.sessions.get(sessionId) !== expectedSession) return false
-    this.close(sessionId)
-    return true
-  }
-
-  /**
-   * Dispose a session's underlying pi process and remove it from the manager.
-   * Used when clients explicitly reload a session and we want a fresh pi subprocess.
-   */
-  close(sessionId: string): void {
-    const s = this.sessions.get(sessionId)
-    if (!s) return
-    try {
-      s.dispose()
-    } catch {
-      // ignore
-    }
-    this.sessions.delete(sessionId)
-  }
-
-  async create(params: SessionCreateParams): Promise<PiAcpSession> {
-    this.assertNotDisposed()
-
-    // Let pi manage session persistence in its default location (~/.pi/agent/sessions/...)
-    // so sessions are visible to the regular `pi` CLI.
-    let proc: PiRpcProcess
-    try {
-      proc = await PiRpcProcess.spawn({
-        cwd: params.cwd,
-        piCommand: params.piCommand
-      })
-    } catch (e) {
-      if (e instanceof PiRpcSpawnError) {
-        throw RequestError.internalError({ code: e.code }, e.message)
-      }
-      throw e
-    }
-    this.assertNotDisposed(proc)
-
-    // The ACP sessionId must be pi's authoritative persisted session identity;
-    // fabricating one would return an ID that can never be found, listed, or
-    // loaded again. Any failure past this point owns the spawned process.
-    let state: any = null
-    try {
-      state = (await proc.getState()) as any
-    } catch (e) {
-      proc.dispose()
-      throw maybeAuthRequiredError(e, params.authMethods) ?? toRequestError(e)
-    }
-    this.assertNotDisposed(proc)
-
-    const sessionId = typeof state?.sessionId === 'string' && state.sessionId.trim() ? state.sessionId : null
-    const sessionFile = typeof state?.sessionFile === 'string' && state.sessionFile.trim() ? state.sessionFile : null
-    if (!sessionId || !sessionFile) {
-      proc.dispose()
-      throw RequestError.internalError(
-        {},
-        'pi did not report an authoritative sessionId/sessionFile for the new session'
-      )
-    }
-
-    // pi creates its session directory lazily; ensure it exists up-front so
-    // commands that read the session file (e.g. export_html) cannot fail on a
-    // missing parent directory. Best-effort: pi itself creates it on write.
-    try {
-      mkdirSync(dirname(sessionFile), { recursive: true })
-    } catch {
-      // ignore
-    }
-
-    try {
-      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
-    } catch (e) {
-      proc.dispose()
-      throw toRequestError(e)
-    }
-
-    let session: PiAcpSession
-    try {
-      session = new PiAcpSession({
-        sessionId,
-        cwd: params.cwd,
-        mcpServers: params.mcpServers,
-        proc,
-        conn: params.conn,
-        fileCommands: params.fileCommands ?? [],
-        supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
-        authMethods: params.authMethods
-      })
-    } catch (error) {
-      proc.dispose()
-      throw error
-    }
-
-    this.sessions.set(sessionId, session)
-    return session
-  }
-
-  get(sessionId: string): PiAcpSession {
-    const session = this.maybeGet(sessionId)
-    if (!session) throw RequestError.resourceNotFound(sessionId)
-    return session
-  }
-
-  /**
-   * Used by session/load: create a session object bound to an existing sessionId/proc
-   * if it isn't already registered. When a registered session wins the race,
-   * the caller's freshly spawned losing process is disposed here so it can
-   * never leak; after disposeAll the fresh process is disposed and the call
-   * fails instead of registering.
-   */
-  getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiRpcProcess }): PiAcpSession {
-    this.assertNotDisposed(params.proc)
-
-    const existing = this.maybeGet(sessionId)
-    if (existing) {
-      if (existing.proc !== params.proc) params.proc.dispose()
-      return existing
-    }
-
-    let session: PiAcpSession
-    try {
-      session = new PiAcpSession({
-        sessionId,
-        cwd: params.cwd,
-        mcpServers: params.mcpServers,
-        proc: params.proc,
-        conn: params.conn,
-        fileCommands: params.fileCommands ?? [],
-        supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
-        authMethods: params.authMethods
-      })
-    } catch (error) {
-      params.proc.dispose()
-      throw error
-    }
-
-    this.sessions.set(sessionId, session)
-    return session
-  }
 }
 
 export class PiAcpSession {
@@ -1611,21 +1303,6 @@ function stringProp(source: Record<string, unknown>, key: string): string | null
   return typeof value === 'string' ? value : null
 }
 
-function toRequestError(err: unknown): RequestError {
-  if (err instanceof RequestError) return err
-  const message = err instanceof Error ? err.message : String(err)
-  return RequestError.internalError({}, message)
-}
-
-function terminationError(termination: PiRpcTermination): Error {
-  const base =
-    termination.reason === 'error'
-      ? `pi process failed: ${termination.error instanceof Error ? termination.error.message : String(termination.error)}`
-      : `pi process exited unexpectedly (code=${termination.code}, signal=${termination.signal})`
-  const tail = termination.stderrTail.trim()
-  return new Error(tail ? `${base}. Last stderr output: ${tail.slice(-400)}` : base)
-}
-
 function optionIndex(optionId: string): number | null {
   if (!optionId.startsWith(CHOICE_OPTION_PREFIX)) {
     return null
@@ -1653,18 +1330,4 @@ function formatAutoRetryMessage(ev: PiRpcEvent): string {
   if (delayMs > 0 && delaySeconds === 0) delaySeconds = 1
 
   return `Retrying (attempt ${attempt}/${maxAttempts}, waiting ${delaySeconds}s)...`
-}
-
-function toToolKind(toolName: string): ToolKind {
-  switch (toolName) {
-    case 'read':
-      return 'read'
-    case 'write':
-    case 'edit':
-      return 'edit'
-    case 'bash':
-      return 'execute'
-    default:
-      return 'other'
-  }
 }

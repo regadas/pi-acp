@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { client, RequestError, methods, type ClientConnection } from '@agentclientprotocol/sdk'
 import { createPiAcpAgentApp } from '../../src/acp/app.js'
 import type { PiAcpAgent } from '../../src/acp/agent.js'
-import { SessionManager } from '../../src/acp/session.js'
+import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 let oldAgentDir: string | undefined

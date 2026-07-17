@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
-import { SessionManager } from '../../src/acp/session.js'
+import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 

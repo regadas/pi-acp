@@ -30,7 +30,8 @@ import {
 } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
 import { getAuthMethods } from './auth.js'
-import { SessionManager, type PiAcpSession } from './session.js'
+import type { PiAcpSession } from './session.js'
+import { SessionManager } from './session-manager.js'
 import {
   MODEL_CONFIG_ID,
   THOUGHT_LEVEL_CONFIG_ID,

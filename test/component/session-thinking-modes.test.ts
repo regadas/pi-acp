@@ -4,7 +4,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
-import { SessionManager } from '../../src/acp/session.js'
+import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 class FakeConn {
