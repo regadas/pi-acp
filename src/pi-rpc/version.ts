@@ -22,27 +22,71 @@ export class PiVersionError extends Error {
   }
 }
 
-/** Parse `pi --version` output into a bare semver string, or null. */
+const SEMVER_REGEX =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+
+/** Parse `pi --version` output into a bare, standard SemVer string, or null. */
 export function parsePiVersion(raw: string): string | null {
   const cleaned = raw.trim().replace(/^v/i, '')
-  return /^\d+\.\d+\.\d+(?:[-+].+)?$/.test(cleaned) ? cleaned : null
+  return SEMVER_REGEX.test(cleaned) ? cleaned : null
 }
 
-/** Compare two x.y.z versions (pre-release/build metadata is ignored). */
+type ParsedSemver = { base: [bigint, bigint, bigint]; prerelease: string[] }
+
+function parseSemverParts(v: string): ParsedSemver {
+  const normalized = parsePiVersion(v)
+  if (!normalized) throw new TypeError(`Invalid semantic version: ${v}`)
+
+  // Build metadata never affects precedence (SemVer §10).
+  const withoutBuild = normalized.split('+')[0]
+  const dashIndex = withoutBuild.indexOf('-')
+  const base = dashIndex === -1 ? withoutBuild : withoutBuild.slice(0, dashIndex)
+  const prerelease = dashIndex === -1 ? [] : withoutBuild.slice(dashIndex + 1).split('.')
+  const [major, minor, patch] = base.split('.').map(BigInt)
+  return { base: [major!, minor!, patch!], prerelease }
+}
+
+/**
+ * Compare two semver versions with full precedence rules (SemVer §11):
+ * numeric x.y.z first; a prerelease sorts below its stable release
+ * (0.80.4-alpha < 0.80.4); prerelease identifiers compare numerically when
+ * both numeric, numeric below alphanumeric otherwise lexically; a shorter
+ * identifier list sorts below a longer one with an equal prefix. Build
+ * metadata is ignored.
+ */
 export function comparePiVersions(a: string, b: string): number {
-  const pa = a
-    .split(/[.+-]/)
-    .slice(0, 3)
-    .map(n => Number(n))
-  const pb = b
-    .split(/[.+-]/)
-    .slice(0, 3)
-    .map(n => Number(n))
+  const pa = parseSemverParts(a)
+  const pb = parseSemverParts(b)
+
   for (let i = 0; i < 3; i++) {
-    const da = pa[i] ?? 0
-    const db = pb[i] ?? 0
-    if (da > db) return 1
-    if (da < db) return -1
+    if (pa.base[i] > pb.base[i]) return 1
+    if (pa.base[i] < pb.base[i]) return -1
+  }
+
+  if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0
+  if (pa.prerelease.length === 0) return 1
+  if (pb.prerelease.length === 0) return -1
+
+  const length = Math.max(pa.prerelease.length, pb.prerelease.length)
+  for (let i = 0; i < length; i++) {
+    const ia = pa.prerelease[i]
+    const ib = pb.prerelease[i]
+    if (ia === undefined) return -1
+    if (ib === undefined) return 1
+
+    const numericA = /^\d+$/.test(ia)
+    const numericB = /^\d+$/.test(ib)
+    if (numericA && numericB) {
+      const na = BigInt(ia)
+      const nb = BigInt(ib)
+      if (na !== nb) return na < nb ? -1 : 1
+    } else if (numericA) {
+      return -1
+    } else if (numericB) {
+      return 1
+    } else if (ia !== ib) {
+      return ia < ib ? -1 : 1
+    }
   }
   return 0
 }

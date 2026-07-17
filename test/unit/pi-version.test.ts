@@ -39,6 +39,23 @@ test('parsePiVersion accepts semver output with optional v prefix', () => {
   assert.equal(parsePiVersion('pi help text'), null)
   assert.equal(parsePiVersion(''), null)
   assert.equal(parsePiVersion('0.80'), null)
+  assert.equal(parsePiVersion('1.2.3-alpha.1+sha.abc'), '1.2.3-alpha.1+sha.abc')
+})
+
+test('parsePiVersion rejects non-standard SemVer forms', () => {
+  for (const invalid of [
+    '01.2.3',
+    '1.02.3',
+    '1.2.03',
+    '1.2.3-01',
+    '1.2.3-',
+    '1.2.3-alpha..1',
+    '1.2.3+build..1',
+    '1.2.3-alpha_1',
+    '1.2.3+'
+  ]) {
+    assert.equal(parsePiVersion(invalid), null, invalid)
+  }
 })
 
 test('comparePiVersions orders x.y.z numerically', () => {
@@ -47,6 +64,38 @@ test('comparePiVersions orders x.y.z numerically', () => {
   assert.equal(comparePiVersions('0.80.3', '0.80.4'), -1)
   assert.equal(comparePiVersions('0.79.10', '0.80.0'), -1)
   assert.equal(comparePiVersions('1.0.0', '0.99.99'), 1)
+})
+
+test('comparePiVersions is arbitrary-precision safe for core and prerelease numbers', () => {
+  assert.equal(comparePiVersions('999999999999999999999999999999.0.0', '999999999999999999999999999998.999.999'), 1)
+  assert.equal(
+    comparePiVersions('1.0.0-alpha.999999999999999999999999999999', '1.0.0-alpha.999999999999999999999999999998'),
+    1
+  )
+})
+
+test('comparePiVersions applies full SemVer prerelease precedence', () => {
+  // A prerelease sorts below its stable release (SemVer §11).
+  assert.equal(comparePiVersions('0.80.4-alpha', '0.80.4'), -1)
+  assert.equal(comparePiVersions('0.80.4', '0.80.4-alpha'), 1)
+  assert.equal(comparePiVersions('0.80.4-alpha', '0.80.4-alpha'), 0)
+
+  // Numeric identifiers compare numerically and rank below alphanumeric.
+  assert.equal(comparePiVersions('1.0.0-alpha.2', '1.0.0-alpha.11'), -1)
+  assert.equal(comparePiVersions('1.0.0-1', '1.0.0-alpha'), -1)
+
+  // A shorter identifier list ranks below a longer one with an equal prefix.
+  assert.equal(comparePiVersions('1.0.0-alpha', '1.0.0-alpha.1'), -1)
+
+  // Alphanumeric identifiers compare lexically.
+  assert.equal(comparePiVersions('1.0.0-alpha', '1.0.0-beta'), -1)
+
+  // Build metadata never affects precedence.
+  assert.equal(comparePiVersions('1.0.0+build.5', '1.0.0'), 0)
+  assert.equal(comparePiVersions('1.0.0-alpha+sha.1', '1.0.0-alpha'), 0)
+
+  // A prerelease of a higher base still ranks above a lower stable base.
+  assert.equal(comparePiVersions('0.80.5-alpha', '0.80.4'), 1)
 })
 
 function fakeWindowsFiles(...paths: string[]): (path: string) => boolean {
@@ -123,6 +172,26 @@ test('resolveWindowsScriptCommand anchors relative PATH entries to cwd and suppo
     'C:\\Program Files\\Pi\\pi.cmd',
     'surrounding quotes on a PATH entry are ignored'
   )
+})
+
+test('PiRpcProcess.spawn observes a child that exits immediately after spawn', { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-immediate-exit-'))
+  const stub = makePiStubIn(dir, 'pi-immediate', MIN_PI_VERSION)
+  const proc = await PiRpcProcess.spawn({ cwd: dir, piCommand: stub })
+  let timer: NodeJS.Timeout | undefined
+  try {
+    const termination = await Promise.race([
+      new Promise<import('../../src/pi-rpc/process.js').PiRpcTermination>(resolve => proc.onTermination(resolve)),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('immediate exit was not observed')), 2_000)
+      })
+    ])
+    assert.equal(termination.reason, 'exit')
+    assert.equal(termination.code, 0)
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 })
 
 test('assertSupportedPiVersion accepts the minimum and newer versions', { skip: isWindows }, () => {

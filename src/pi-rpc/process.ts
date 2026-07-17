@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import * as readline from 'node:readline'
 import { getPiCommand, resolvePiCommandForVersionPreflight, shouldUseShellForPiCommand } from './command.js'
+import { LfLineDecoder } from './line-decoder.js'
 import { assertSupportedPiVersion, PiVersionError } from './version.js'
 
 export class PiRpcSpawnError extends Error {
@@ -20,6 +20,65 @@ function piExecutableNotFoundError(cmd: string, cause?: unknown): PiRpcSpawnErro
     `Could not start pi: executable not found (command: ${cmd}). Pi needs to be installed before it can run in ACP clients. Install it via \`npm install -g @earendil-works/pi-coding-agent\` or ensure \`pi\` is on your PATH. Then try again.`,
     { code: 'ENOENT', cause }
   )
+}
+
+export class PiRpcRequestTimeoutError extends Error {
+  readonly command: string
+  readonly timeoutMs: number
+
+  constructor(command: string, timeoutMs: number) {
+    super(`pi ${command} timed out after ${timeoutMs}ms: no RPC response from the pi subprocess.`)
+    this.name = 'PiRpcRequestTimeoutError'
+    this.command = command
+    this.timeoutMs = timeoutMs
+  }
+}
+
+export class PiRpcClosedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PiRpcClosedError'
+  }
+}
+
+/** Terminal state of the pi child process, reported at most once. */
+export type PiRpcTermination = {
+  reason: 'exit' | 'error'
+  code: number | null
+  signal: NodeJS.Signals | null
+  /** True when the adapter itself requested disposal before termination. */
+  expected: boolean
+  error?: unknown
+  /** Bounded tail of the child's stderr output for diagnostics. */
+  stderrTail: string
+}
+
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const ABORT_TIMEOUT_MS = 10_000
+// Prompt preflight may run extension hooks and overflow compaction before pi
+// sends its acceptance response, so give it the same bounded budget as an
+// explicit compaction rather than the short control-command default.
+const PROMPT_TIMEOUT_MS = 10 * 60_000
+const COMPACT_TIMEOUT_MS = 10 * 60_000
+// get_tree serializes the entire session tree and export_html renders the
+// whole session; both scale with history size, so give them a larger (still
+// finite) budget than short control commands.
+const GET_TREE_TIMEOUT_MS = 2 * 60_000
+const EXPORT_TIMEOUT_MS = 2 * 60_000
+const KILL_GRACE_MS = 2_000
+// If stdio never closes after exit (e.g. an orphaned grandchild holds the
+// pipe), force termination settlement so accepted prompts cannot hang.
+const CLOSE_FALLBACK_MS = 1_000
+const STDERR_TAIL_LIMIT = 8 * 1024
+// Human-readable prelude output is retained only as a bounded tail so a
+// misbehaving child cannot grow adapter memory without bound.
+const PRELUDE_TAIL_LIMIT = 64 * 1024
+
+type PiRpcProcessOptions = {
+  requestTimeoutMs?: number
+  killGraceMs?: number
+  closeFallbackMs?: number
+  maxStdoutRecordBytes?: number
 }
 
 const ESC = String.fromCharCode(0x1b)
@@ -43,7 +102,7 @@ type PiRpcCommand =
   | { type: 'get_available_models'; id?: string }
   | { type: 'set_model'; id?: string; provider: string; modelId: string }
   // Thinking
-  | { type: 'set_thinking_level'; id?: string; level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' }
+  | { type: 'set_thinking_level'; id?: string; level: PiThinkingLevel }
   // Modes
   | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
   | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
@@ -57,8 +116,11 @@ type PiRpcCommand =
   | { type: 'switch_session'; id?: string; sessionPath: string }
   // Messages
   | { type: 'get_messages'; id?: string }
+  | { type: 'get_tree'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
+
+export type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 type PiRpcResponse = {
   type: 'response'
@@ -84,66 +146,220 @@ type SpawnParams = {
   sessionPath?: string
 }
 
+type PendingEntry = {
+  resolve: (v: PiRpcResponse) => void
+  reject: (e: unknown) => void
+  beforeResolve?: () => void
+  timer?: NodeJS.Timeout
+}
+
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
-  private readonly pending = new Map<
-    string,
-    {
-      resolve: (v: PiRpcResponse) => void
-      reject: (e: unknown) => void
-      beforeResolve?: () => void
-    }
-  >()
+  private readonly pending = new Map<string, PendingEntry>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
+  private terminationHandlers: Array<(t: PiRpcTermination) => void> = []
   private readonly preludeLines: string[] = []
+  private preludeBytes = 0
+  private readonly requestTimeoutMs?: number
+  private readonly killGraceMs: number
+  private readonly closeFallbackMs: number
+  private stderrTailBuf = ''
+  private termination: PiRpcTermination | null = null
+  private disposeRequested = false
+  private disposeIsExpected = false
+  private killTimer: NodeJS.Timeout | undefined
+  private exitFallbackTimer: NodeJS.Timeout | undefined
 
-  private constructor(child: ChildProcessWithoutNullStreams) {
+  private constructor(child: ChildProcessWithoutNullStreams, opts?: PiRpcProcessOptions) {
     this.child = child
+    this.requestTimeoutMs = opts?.requestTimeoutMs
+    this.killGraceMs = opts?.killGraceMs ?? KILL_GRACE_MS
+    this.closeFallbackMs = opts?.closeFallbackMs ?? CLOSE_FALLBACK_MS
 
-    const rl = readline.createInterface({ input: child.stdout })
-    rl.on('line', line => {
-      if (!line.trim()) return
-      let msg: any
+    const decoder = new LfLineDecoder(opts?.maxStdoutRecordBytes)
+    child.stdout.on('data', (chunk: Buffer) => {
       try {
-        msg = JSON.parse(line)
+        for (const line of decoder.push(chunk)) this.handleStdoutLine(line)
       } catch {
-        // pi may emit a human-readable prelude on stdout before NDJSON starts.
-        // Capture it so the ACP adapter can surface it on session start.
-        const cleaned = stripAnsi(String(line)).trimEnd()
-        if (cleaned) this.preludeLines.push(cleaned)
-        return
+        // An unterminated framing flood makes the channel unusable. Dispose as
+        // an unexpected fault; subsequent bytes/events are ignored.
+        this.dispose({ expected: false })
       }
-
-      if (msg?.type === 'response') {
-        const id = typeof msg.id === 'string' ? msg.id : undefined
-        if (id) {
-          const pending = this.pending.get(id)
-          if (pending) {
-            this.pending.delete(id)
-            try {
-              pending.beforeResolve?.()
-              pending.resolve(msg as PiRpcResponse)
-            } catch (error) {
-              pending.reject(error)
-            }
-            return
-          }
-        }
+    })
+    child.stdout.on('end', () => {
+      try {
+        const rest = decoder.end()
+        if (rest !== null) this.handleStdoutLine(rest)
+      } catch {
+        this.dispose({ expected: false })
       }
-
-      for (const h of this.eventHandlers) h(msg as PiRpcEvent)
     })
 
-    child.on('exit', (code, signal) => {
-      const err = new Error(`pi process exited (code=${code}, signal=${signal})`)
-      for (const [, p] of this.pending) p.reject(err)
-      this.pending.clear()
+    child.stderr.on('data', (chunk: Buffer) => {
+      this.stderrTailBuf = (this.stderrTailBuf + chunk.toString('utf8')).slice(-STDERR_TAIL_LIMIT)
     })
 
     child.on('error', err => {
-      for (const [, p] of this.pending) p.reject(err)
-      this.pending.clear()
+      this.settleTermination({ reason: 'error', code: null, signal: null, error: err })
     })
+    child.on('exit', (code, signal) => {
+      // Prefer settling on 'close' so stdout data already buffered in the pipe
+      // is dispatched to event handlers first; the fallback timer guards
+      // against stdio that never closes.
+      const timer = setTimeout(() => this.settleTermination({ reason: 'exit', code, signal }), this.closeFallbackMs)
+      timer.unref?.()
+      this.exitFallbackTimer = timer
+    })
+    child.on('close', (code, signal) => {
+      this.settleTermination({ reason: 'exit', code, signal })
+    })
+  }
+
+  /**
+   * Wrap an already-spawned pi RPC child process.
+   * Test seam: production code must go through {@link PiRpcProcess.spawn}.
+   */
+  static fromChild(child: ChildProcessWithoutNullStreams, opts?: PiRpcProcessOptions): PiRpcProcess {
+    return new PiRpcProcess(child, opts)
+  }
+
+  private handleStdoutLine(line: string): void {
+    // Once the channel is quarantined or terminal, no record can safely be
+    // attributed to an ACP turn. An orphaned descendant may still hold and
+    // write to stdout after the pi child exits.
+    if (this.disposeRequested || this.termination || !line.trim()) return
+    let msg: unknown
+    try {
+      msg = JSON.parse(line)
+    } catch {
+      // pi may emit a human-readable prelude on stdout before NDJSON starts.
+      // Capture a bounded tail so the ACP adapter can surface it on session
+      // start without letting a malformed-output flood grow memory unbounded.
+      const cleaned = stripAnsi(line).trimEnd()
+      if (cleaned) {
+        // Bound an individual line as well as the aggregate. Keep the newest
+        // tail because it usually contains the actionable diagnostic.
+        const retained = cleaned.slice(-PRELUDE_TAIL_LIMIT)
+        this.preludeLines.push(retained)
+        this.preludeBytes += retained.length
+        while (this.preludeLines.length > 1 && this.preludeBytes > PRELUDE_TAIL_LIMIT) {
+          const dropped = this.preludeLines.shift()
+          this.preludeBytes -= dropped?.length ?? 0
+        }
+      }
+      return
+    }
+
+    const record = msg as { type?: unknown; id?: unknown }
+    if (record?.type === 'response') {
+      // Responses are correlation records, never pi events. A response whose
+      // request already timed out is stale and must not reach session event
+      // handlers or a later turn.
+      if (typeof record.id !== 'string') return
+      const entry = this.takePending(record.id)
+      if (!entry) return
+      try {
+        entry.beforeResolve?.()
+        entry.resolve(msg as PiRpcResponse)
+      } catch (error) {
+        entry.reject(error)
+      }
+      return
+    }
+
+    this.dispatchEvent(msg as PiRpcEvent)
+  }
+
+  private dispatchEvent(ev: PiRpcEvent): void {
+    for (const handler of [...this.eventHandlers]) {
+      try {
+        handler(ev)
+      } catch {
+        // One subscriber must not break sibling handlers or the stdout reader.
+      }
+    }
+  }
+
+  private takePending(id: string): PendingEntry | undefined {
+    const entry = this.pending.get(id)
+    if (!entry) return undefined
+    this.pending.delete(id)
+    if (entry.timer) clearTimeout(entry.timer)
+    return entry
+  }
+
+  private rejectAllPending(err: unknown): void {
+    const entries = [...this.pending.values()]
+    this.pending.clear()
+    for (const entry of entries) {
+      if (entry.timer) clearTimeout(entry.timer)
+      entry.reject(err)
+    }
+  }
+
+  private settleTermination(info: {
+    reason: 'exit' | 'error'
+    code: number | null
+    signal: NodeJS.Signals | null
+    error?: unknown
+  }): void {
+    if (this.termination) return
+    if (this.killTimer) {
+      clearTimeout(this.killTimer)
+      this.killTimer = undefined
+    }
+    if (this.exitFallbackTimer) {
+      clearTimeout(this.exitFallbackTimer)
+      this.exitFallbackTimer = undefined
+    }
+
+    this.termination = {
+      ...info,
+      expected: this.disposeIsExpected,
+      stderrTail: this.stderrTailBuf
+    }
+
+    this.rejectAllPending(this.closedError())
+
+    const handlers = [...this.terminationHandlers]
+    this.terminationHandlers = []
+    for (const handler of handlers) {
+      try {
+        handler(this.termination)
+      } catch {
+        // Isolate subscriber failures from each other and from the exit path.
+      }
+    }
+  }
+
+  private closedError(): PiRpcClosedError {
+    const t = this.termination
+    if (!t) return new PiRpcClosedError('pi process is shutting down')
+
+    const base =
+      t.reason === 'error'
+        ? `pi process failed: ${t.error instanceof Error ? t.error.message : String(t.error)}`
+        : `pi process exited (code=${t.code}, signal=${t.signal})`
+    const tail = t.stderrTail.trim()
+    return new PiRpcClosedError(tail ? `${base}. Last stderr output: ${tail.slice(-400)}` : base)
+  }
+
+  private timeoutForCommand(type: PiRpcCommand['type']): number {
+    if (this.requestTimeoutMs !== undefined) return this.requestTimeoutMs
+    switch (type) {
+      case 'abort':
+        return ABORT_TIMEOUT_MS
+      case 'prompt':
+        return PROMPT_TIMEOUT_MS
+      case 'compact':
+        return COMPACT_TIMEOUT_MS
+      case 'get_tree':
+        return GET_TREE_TIMEOUT_MS
+      case 'export_html':
+        return EXPORT_TIMEOUT_MS
+      default:
+        return DEFAULT_REQUEST_TIMEOUT_MS
+    }
   }
 
   static async spawn(params: SpawnParams): Promise<PiRpcProcess> {
@@ -184,6 +400,10 @@ export class PiRpcProcess {
       env: process.env,
       shell: shouldUseShellForPiCommand(cmd)
     })
+    // Wire stdout/stderr and lifecycle listeners immediately. A child can exit
+    // directly after its `spawn` event; constructing only after awaiting that
+    // event creates a window where the terminal event is lost.
+    const proc = new PiRpcProcess(child)
 
     // Ensure spawn failures (e.g. ENOENT when pi isn't installed) are surfaced as a
     // deterministic error instead of later EPIPE/internal-error noise.
@@ -206,6 +426,7 @@ export class PiRpcProcess {
         child.once('error', onError)
       })
     } catch (e: any) {
+      proc.dispose({ expected: false })
       const code = typeof e?.code === 'string' ? e.code : undefined
       if (code === 'ENOENT') {
         throw piExecutableNotFoundError(cmd, e)
@@ -218,28 +439,10 @@ export class PiRpcProcess {
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
 
-    child.stderr.on('data', () => {
-      // leave stderr untouched; ACP clients may capture it.
-    })
-
-    const proc = new PiRpcProcess(child)
-
-    // Best-effort handshake.
-    // Important: pi may emit a get_state response pointing at a sessionFile in a directory
-    // that is created lazily. Create the parent dir up-front to avoid later parse errors
-    // when we call commands like export_html.
-    try {
-      const state = (await proc.getState()) as any
-      const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-      if (sessionFile) {
-        const { mkdirSync } = await import('node:fs')
-        const { dirname } = await import('node:path')
-        mkdirSync(dirname(sessionFile), { recursive: true })
-      }
-    } catch {
-      // ignore for now
-    }
-
+    // No hidden handshake: spawn returns as soon as the OS process exists so
+    // the caller owns the child immediately. Authoritative get_state
+    // validation (and session-dir setup) happens in SessionManager.create /
+    // PiAcpAgent.restoreSession, which also own failure disposal.
     return proc
   }
 
@@ -250,13 +453,60 @@ export class PiRpcProcess {
     }
   }
 
-  dispose(signal: NodeJS.Signals | number = 'SIGTERM'): void {
-    if (this.child.killed) return
+  /**
+   * Subscribe to the child's terminal state. The handler is invoked at most
+   * once, even when Node emits both 'error' and 'exit' for the same child.
+   * Subscribing after termination delivers the recorded state asynchronously.
+   */
+  onTermination(handler: (termination: PiRpcTermination) => void): () => void {
+    const settled = this.termination
+    if (settled) {
+      queueMicrotask(() => {
+        try {
+          handler(settled)
+        } catch {
+          // Isolate subscriber failures.
+        }
+      })
+      return () => {}
+    }
+
+    this.terminationHandlers.push(handler)
+    return () => {
+      this.terminationHandlers = this.terminationHandlers.filter(h => h !== handler)
+    }
+  }
+
+  /** Bounded tail of the child's stderr output (for diagnostics). */
+  stderrTail(): string {
+    return this.stderrTailBuf
+  }
+
+  dispose(options?: { expected?: boolean }): void {
+    if (this.disposeRequested) return
+    this.disposeRequested = true
+    this.disposeIsExpected = options?.expected ?? true
+
+    // Nothing can answer once shutdown starts; fail pending requests now
+    // instead of leaving them to time out.
+    this.rejectAllPending(this.closedError())
+    if (this.termination) return
+
     try {
-      this.child.kill(signal as any)
+      this.child.kill('SIGTERM')
     } catch {
       // ignore
     }
+
+    const timer = setTimeout(() => {
+      try {
+        this.child.kill('SIGKILL')
+      } catch {
+        // ignore
+      }
+    }, this.killGraceMs)
+    timer.unref?.()
+    this.killTimer = timer
   }
 
   /**
@@ -265,6 +515,7 @@ export class PiRpcProcess {
    */
   consumePreludeLines(): string[] {
     const lines = this.preludeLines.splice(0, this.preludeLines.length)
+    this.preludeBytes = 0
     return lines
   }
 
@@ -296,7 +547,7 @@ export class PiRpcProcess {
     return res.data
   }
 
-  async setThinkingLevel(level: 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'): Promise<void> {
+  async setThinkingLevel(level: PiThinkingLevel): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
@@ -350,8 +601,18 @@ export class PiRpcProcess {
    * later stdout events can be dispatched from the same input chunk.
    */
   async getMessages(beforeResponseResolve?: () => void): Promise<unknown> {
-    const res = await this.request({ type: 'get_messages' }, beforeResponseResolve)
+    const res = await this.request({ type: 'get_messages' }, { beforeResolve: beforeResponseResolve })
     if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
+  }
+
+  /**
+   * The callback runs synchronously at the response line boundary, before
+   * later stdout events can be dispatched from the same input chunk.
+   */
+  async getTree(beforeResponseResolve?: () => void): Promise<unknown> {
+    const res = await this.request({ type: 'get_tree' }, { beforeResolve: beforeResponseResolve })
+    if (!res.success) throw new Error(`pi get_tree failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
 
@@ -365,18 +626,39 @@ export class PiRpcProcess {
     await this.writeLine(`${JSON.stringify({ type: 'extension_ui_response', ...response })}\n`)
   }
 
-  private request(cmd: PiRpcCommand, beforeResolve?: () => void): Promise<PiRpcResponse> {
+  private request(cmd: PiRpcCommand, opts?: { beforeResolve?: () => void }): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
-    const withId = { ...cmd, id }
-
-    const line = `${JSON.stringify(withId)}\n`
+    const line = `${JSON.stringify({ ...cmd, id })}\n`
 
     return new Promise<PiRpcResponse>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, beforeResolve })
+      if (this.termination || this.disposeRequested) {
+        reject(this.closedError())
+        return
+      }
+
+      const entry: PendingEntry = { resolve, reject, beforeResolve: opts?.beforeResolve }
+      const timeoutMs = this.timeoutForCommand(cmd.type)
+      if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+        const timer = setTimeout(() => {
+          if (!this.takePending(id)) return
+          const error = new PiRpcRequestTimeoutError(cmd.type, timeoutMs)
+          // Any timed-out command leaves both the command outcome and channel
+          // health unknown: pi may still execute it later and stream output
+          // (a prompt after slow preflight, a compact mutating state, a
+          // wedged event loop recovering). Quarantine the channel as an
+          // unexpected fault before rejecting so no late response or event
+          // can escape into a closed or replacement ACP turn, and every
+          // future request fails fast instead of hanging.
+          this.dispose({ expected: false })
+          reject(error)
+        }, timeoutMs)
+        timer.unref?.()
+        entry.timer = timer
+      }
+      this.pending.set(id, entry)
 
       void this.writeLine(line).catch(error => {
-        this.pending.delete(id)
-        reject(error)
+        if (this.takePending(id)) reject(error)
       })
     })
   }
