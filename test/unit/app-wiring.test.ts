@@ -44,6 +44,7 @@ test('app wiring: initialize advertises exactly the implemented capabilities', a
   const res = await conn.agent.request(methods.agent.initialize, { protocolVersion: 1 })
 
   assert.equal(res.protocolVersion, 1)
+  assert.equal(res.agentInfo?.name, 'pi-acp')
   assert.equal(res.agentCapabilities?.loadSession, true)
   assert.deepEqual(res.agentCapabilities?.mcpCapabilities, { http: false, sse: false })
   assert.deepEqual(res.agentCapabilities?.promptCapabilities, {

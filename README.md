@@ -4,6 +4,8 @@ ACP ([Agent Client Protocol](https://agentclientprotocol.com/overview/introducti
 
 `pi-acp` communicates **ACP JSON-RPC 2.0 over stdio** to an ACP client (e.g. Zed editor) and spawns `pi --mode rpc`, bridging requests/events between the two.
 
+This repository is independently maintained by [Filipe Regadas](https://github.com/regadas). It originated from [svkozak/pi-acp](https://github.com/svkozak/pi-acp) and preserves that project's Git history and MIT attribution, but it is not affiliated with the upstream project or its unscoped `pi-acp` npm package. The intended npm identity for a future release is `@regadas/pi-acp`; it is not currently published.
+
 ## Status
 
 `pi-acp` targets the stable ACP v1 core using the current `@agentclientprotocol/sdk` builder API. It implements the baseline prompt lifecycle plus stable session list, load, resume, close, and delete methods. It is not fully ACP v1 conformant because client-provided stdio MCP servers are not supported: pi itself has no MCP support, so requests with a non-empty `mcpServers` list are rejected explicitly instead of being silently ignored; see [Limitations](#limitations).
@@ -52,42 +54,27 @@ npm install -g @earendil-works/pi-coding-agent
 
 ## Install
 
-### Add pi-acp to your ACP client, e.g. [Zed](https://zed.dev/docs/agents/external-agents/)
+This independently maintained version is not currently published in the ACP Registry or on npm. The Registry entry and unscoped `pi-acp` npm package install the upstream project, not this repository.
 
-#### Using ACP Registry in Zed or other clients that support it:
-
-In Zed launch the registry with `zed: acp registry` command and select `pi ACP` adapter from the list. This will automatically add the agent server configuration to your `settings.json` and keep it up to date:
-
-```json
-  "agent_servers": {
-    "pi-acp": {
-      "type": "registry",
-    },
-  }
-```
-
-#### Using with `npx` (no global install needed, always loads the latest version):
-
-Add the following to your Zed `settings.json`:
-
-```json
-  "agent_servers": {
-    "pi": {
-      "type": "custom",
-      "command": "npx",
-      "args": ["-y", "pi-acp"],
-      "env": {}
-    }
-  }
-```
-
-#### Global install
+### From source
 
 ```bash
-npm install -g pi-acp
+git clone https://github.com/regadas/pi-acp.git
+cd pi-acp
+npm ci
+npm run build
 ```
 
+To expose the existing `pi-acp` executable on your `PATH`, link the package:
+
+```bash
+npm link
+```
+
+Then configure a custom agent in [Zed](https://zed.dev/docs/agents/external-agents/):
+
 ```json
+{
   "agent_servers": {
     "pi": {
       "type": "custom",
@@ -96,18 +83,13 @@ npm install -g pi-acp
       "env": {}
     }
   }
+}
 ```
 
-#### From source
-
-```bash
-npm install
-npm run build
-```
-
-Point your ACP client to the built `dist/index.js`:
+Alternatively, point Zed directly to the built entry point without linking it:
 
 ```json
+{
   "agent_servers": {
     "pi": {
       "type": "custom",
@@ -116,6 +98,7 @@ Point your ACP client to the built `dist/index.js`:
       "env": {}
     }
   }
+}
 ```
 
 ### Environment variables
@@ -176,9 +159,9 @@ Other built-in commands:
 
 **Note**: Slash commands provided by pi extensions are not currently supported.
 
-## Authentication (ACP Registry support)
+## Authentication (ACP client support)
 
-This agent supports **Terminal Auth** for the [ACP Registry](https://agentclientprotocol.com/get-started/registry).
+This agent supports **Terminal Auth** for ACP clients that negotiate it.
 In Zed, this will show an **Authenticate** banner that launches pi in a terminal.
 Launch pi in a terminal for interactive login/setup:
 
@@ -209,11 +192,11 @@ Project layout:
 - No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally. Bash tool calls are rendered through Zed's `_meta.terminal_output` convention only when the client negotiates it; otherwise output is plain tool content.
 - Terminal login is advertised only to clients that declare the (unstable) `clientCapabilities.auth.terminal` capability; Zed's `_meta["terminal-auth"]` launch banner additionally requires its matching client `_meta` flag.
 - ACP v1 requires agents to connect client-provided stdio MCP servers, but pi has no MCP support (it would require a pi extension to bridge them). `pi-acp` therefore rejects `session/new`, `session/load`, and `session/resume` requests that carry a non-empty `mcpServers` list with an explicit `invalid params` error instead of silently ignoring the requested servers; empty lists are accepted. This remains an explicit protocol conformance gap. Installing the [pi MCP adapter](https://github.com/nicobailon/pi-mcp-adapter) makes separately configured MCP servers available to pi, but does not wire the ACP request's `mcpServers` automatically.
-- Simultaneously operating on the same persisted pi session from multiple `pi-acp` or pi processes is unsupported. Atomic adapter mapping records prevent cross-process map updates from being lost, but they are not a session-ownership lease; keep one active process per session to avoid corrupting its history.
+- Pi session files do not coordinate concurrent writers: each pi process keeps its own in-memory view while appending to the shared history. `pi-acp` inherits this constraint, so simultaneously operating on the same persisted session from multiple `pi-acp` or pi processes is unsupported. Atomic adapter mapping records prevent cross-process map updates from being lost, but they are not a session-ownership lease; keep one active writer per persisted session to prevent divergent or damaged history.
 - Assistant text streams as `agent_message_chunk`; extended thinking streams separately as `agent_thought_chunk`.
 - Queue is implemented client-side and should work like pi's `one-at-a-time`
 - ~~ACP clients don't yet suport session history, but ACP sessions from `pi-acp` can be `/resume`d in pi directly~~
 
 ## License
 
-MIT (see [LICENSE](LICENSE)).
+MIT (see [LICENSE](LICENSE)). This project originated from [svkozak/pi-acp](https://github.com/svkozak/pi-acp) and retains its original copyright and license attribution; independently maintained changes are attributed separately.
