@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync, openSync, readSync, closeSync, existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { join, resolve, isAbsolute } from 'node:path'
+import { getAgentDir } from './pi-settings.js'
 
 export type PiSessionListItem = {
   sessionId: string
@@ -12,12 +12,9 @@ export type PiSessionListItem = {
 
 const DEFAULT_TAIL_BYTES = 256 * 1024
 const DEFAULT_HEAD_BYTES = 64 * 1024
-
-function getPiAgentDir(): string {
-  // pi supports overriding config dir via PI_CODING_AGENT_DIR.
-  // See pi README.
-  return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
-}
+// Fallback-title scans read at most this much of a session file's head; the
+// first user message is expected there and huge files must not be read whole.
+const TITLE_HEAD_BYTES = 256 * 1024
 
 function readSessionDirFromSettings(agentDir: string): string | null {
   const settingsPath = join(agentDir, 'settings.json')
@@ -37,37 +34,50 @@ function readSessionDirFromSettings(agentDir: string): string | null {
 }
 
 export function getPiSessionsDir(): string {
-  const agentDir = getPiAgentDir()
+  const agentDir = getAgentDir()
   return readSessionDirFromSettings(agentDir) ?? join(agentDir, 'sessions')
 }
 
-function walkJsonlFiles(dir: string, out: string[]) {
-  let entries: import('node:fs').Dirent[]
+function readDirectory(dir: string): import('node:fs').Dirent[] {
   try {
-    // Force string names.
-    entries = readdirSync(dir, { withFileTypes: true, encoding: 'utf8' }) as unknown as import('node:fs').Dirent[]
+    const entries = readdirSync(dir, {
+      withFileTypes: true,
+      encoding: 'utf8'
+    }) as unknown as import('node:fs').Dirent[]
+    return entries.sort((a, b) => String(a.name).localeCompare(String(b.name)))
   } catch {
-    return
-  }
-
-  for (const e of entries) {
-    const name = typeof (e as any).name === 'string' ? (e as any).name : String((e as any).name)
-    const p = join(dir, name)
-    if (e.isDirectory()) walkJsonlFiles(p, out)
-    else if (e.isFile() && name.endsWith('.jsonl')) out.push(p)
+    return []
   }
 }
 
-function readFirstLine(path: string): string | null {
-  // Avoid reading the whole file.
-  const fd = openSync(path, 'r')
+function walkJsonlFiles(dir: string, out: string[]): void {
+  for (const entry of readDirectory(dir)) {
+    const name = String(entry.name)
+    const path = join(dir, name)
+    try {
+      if (entry.isDirectory()) walkJsonlFiles(path, out)
+      else if (entry.isFile() && name.endsWith('.jsonl')) out.push(path)
+    } catch {
+      // A vanished or unreadable entry must not abort discovery.
+    }
+  }
+}
+
+/** Bounded head read; returns null (never throws) for vanished/unreadable files. */
+function readHead(path: string, maxBytes: number): string | null {
+  let fd: number
   try {
-    const buf = Buffer.alloc(DEFAULT_HEAD_BYTES)
+    // openSync itself throws for vanished (ENOENT) or unreadable (EACCES)
+    // files; one bad file must not break an entire directory scan.
+    fd = openSync(path, 'r')
+  } catch {
+    return null
+  }
+  try {
+    const buf = Buffer.alloc(maxBytes)
     const n = readSync(fd, buf, 0, buf.length, 0)
     if (n <= 0) return null
-    const s = buf.subarray(0, n).toString('utf-8')
-    const idx = s.indexOf('\n')
-    return idx === -1 ? s.trim() : s.slice(0, idx).trim()
+    return buf.subarray(0, n).toString('utf-8')
   } catch {
     return null
   } finally {
@@ -77,6 +87,14 @@ function readFirstLine(path: string): string | null {
       // ignore
     }
   }
+}
+
+function readFirstLine(path: string): string | null {
+  // Avoid reading the whole file.
+  const s = readHead(path, DEFAULT_HEAD_BYTES)
+  if (s === null) return null
+  const idx = s.indexOf('\n')
+  return idx === -1 ? s.trim() : s.slice(0, idx).trim()
 }
 
 function readTail(path: string, tailBytes = DEFAULT_TAIL_BYTES): string {
@@ -130,64 +148,6 @@ function pickTitleFromTail(tail: string): string | null {
   return null
 }
 
-function scanSessionInfoNameFromFile(path: string): string | null {
-  // Fallback when the session_info entry is older than our tail window.
-  // Scan the whole file line-by-line and remember the last session_info.name.
-  const fd = openSync(path, 'r')
-  try {
-    const buf = Buffer.alloc(256 * 1024)
-    let leftover = ''
-    let offset = 0
-    let lastName: string | null = null
-
-    while (true) {
-      const n = readSync(fd, buf, 0, buf.length, offset)
-      if (n <= 0) break
-      offset += n
-
-      const chunk = leftover + buf.subarray(0, n).toString('utf8')
-      const lines = chunk.split(/\r?\n/)
-      leftover = lines.pop() ?? ''
-
-      for (const line0 of lines) {
-        const line = line0.trim()
-        if (!line) continue
-        try {
-          const obj = JSON.parse(line) as any
-          if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
-            lastName = obj.name.trim()
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    // Best-effort: parse leftover if it was a full line without trailing newline.
-    const tailLine = leftover.trim()
-    if (tailLine) {
-      try {
-        const obj = JSON.parse(tailLine) as any
-        if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
-          lastName = obj.name.trim()
-        }
-      } catch {
-        // ignore
-      }
-    }
-
-    return lastName
-  } catch {
-    return null
-  } finally {
-    try {
-      closeSync(fd)
-    } catch {
-      // ignore
-    }
-  }
-}
-
 function pickUpdatedAtFromTail(tail: string): string | null {
   // pi's `/resume` effectively orders sessions by last *message* activity.
   // We scan backwards and pick the timestamp of the most recent entry with type === "message".
@@ -227,39 +187,40 @@ function pickUpdatedAtFromTail(tail: string): string | null {
   return null
 }
 
-function pickFallbackTitleFromHead(path: string): string | null {
-  // Fallback to first user message.
-  // NOTE: we keep this simple: read a small head chunk and parse line-by-line.
-  try {
-    const raw = readFileSync(path, { encoding: 'utf8' })
-    const lines = raw.split(/\r?\n/)
-    for (const line0 of lines) {
-      const line = line0.trim()
-      if (!line) continue
-      try {
-        const obj = JSON.parse(line) as any
-        if (obj?.type === 'message' && obj?.message?.role === 'user') {
-          const content = obj?.message?.content
-          if (typeof content === 'string') return content.slice(0, 80)
-          if (Array.isArray(content)) {
-            const t = content.find((c: any) => c?.type === 'text' && typeof c?.text === 'string')
-            if (t?.text) return String(t.text).slice(0, 80)
-          }
-        }
-      } catch {
-        // ignore
-      }
+function pickTitleFromHead(path: string): string | null {
+  // Bounded fallback: retain the latest early session name, otherwise the
+  // first user message. Never scan the middle of a large session file.
+  const head = readHead(path, TITLE_HEAD_BYTES)
+  if (head === null) return null
 
-      // Avoid scanning extremely large files fully.
-      // If we didn't find a user message in the first ~2000 lines, give up.
-      // (Most sessions have it early.)
-      if (lines.length > 2000) break
+  const lines = head.split(/\r?\n/)
+  if (lines.length > 1) lines.pop()
+
+  let sessionName: string | null = null
+  let firstUserMessage: string | null = null
+  for (const line0 of lines) {
+    const line = line0.trim()
+    if (!line) continue
+    try {
+      const obj = JSON.parse(line) as any
+      if (obj?.type === 'session_info' && typeof obj?.name === 'string' && obj.name.trim()) {
+        sessionName = obj.name.trim()
+        continue
+      }
+      if (firstUserMessage || obj?.type !== 'message' || obj?.message?.role !== 'user') continue
+
+      const content = obj?.message?.content
+      if (typeof content === 'string') firstUserMessage = content.slice(0, 80)
+      else if (Array.isArray(content)) {
+        const text = content.find((block: any) => block?.type === 'text' && typeof block?.text === 'string')
+        if (text?.text) firstUserMessage = String(text.text).slice(0, 80)
+      }
+    } catch {
+      // Ignore malformed or truncated records inside the bounded head.
     }
-  } catch {
-    // ignore
   }
 
-  return null
+  return sessionName ?? firstUserMessage
 }
 
 export function listPiSessions(): PiSessionListItem[] {
@@ -270,47 +231,46 @@ export function listPiSessions(): PiSessionListItem[] {
   const items: PiSessionListItem[] = []
 
   for (const file of files) {
-    const first = readFirstLine(file)
-    if (!first) continue
-    const header = parseSessionHeader(first)
-    if (!header) continue
-
-    let updatedAt: string | null = null
-
-    let title: string | null = null
+    // Isolate every file: one vanished (ENOENT race) or unreadable session
+    // file must not abort the whole listing.
     try {
-      const tail = readTail(file)
-      title = pickTitleFromTail(tail)
-      updatedAt = pickUpdatedAtFromTail(tail)
-    } catch {
-      // ignore
-    }
+      const first = readFirstLine(file)
+      if (!first) continue
+      const header = parseSessionHeader(first)
+      if (!header) continue
 
-    // If the session was named early and grew large, it may fall outside of the tail window.
-    if (!title) {
-      title = scanSessionInfoNameFromFile(file)
-    }
+      let updatedAt: string | null = null
 
-    // Fallback for updatedAt when we couldn't parse timestamps from tail.
-    if (!updatedAt) {
+      let title: string | null = null
       try {
-        updatedAt = statSync(file).mtime.toISOString()
+        const tail = readTail(file)
+        title = pickTitleFromTail(tail)
+        updatedAt = pickUpdatedAtFromTail(tail)
       } catch {
-        updatedAt = null
+        // ignore
       }
-    }
 
-    if (!title) {
-      title = pickFallbackTitleFromHead(file)
-    }
+      // Fallback for updatedAt when we couldn't parse timestamps from tail.
+      if (!updatedAt) {
+        try {
+          updatedAt = statSync(file).mtime.toISOString()
+        } catch {
+          updatedAt = null
+        }
+      }
 
-    items.push({
-      sessionId: header.sessionId,
-      cwd: header.cwd,
-      title,
-      updatedAt,
-      sessionFile: file
-    })
+      if (!title) title = pickTitleFromHead(file)
+
+      items.push({
+        sessionId: header.sessionId,
+        cwd: header.cwd,
+        title,
+        updatedAt,
+        sessionFile: file
+      })
+    } catch {
+      // ignore this file
+    }
   }
 
   // Sort most recent first.
@@ -323,9 +283,51 @@ export function listPiSessions(): PiSessionListItem[] {
   return items
 }
 
-export function findPiSession(sessionId: string): PiSessionListItem | null {
-  const all = listPiSessions()
-  return all.find(s => s.sessionId === sessionId) ?? null
+type FindPiSessionOptions = {
+  /** Local deterministic test seam; production callers leave this unset. */
+  sessionsDir?: string
+  onDirectoryVisited?: (dir: string) => void
+}
+
+function findPiSessionUnder(
+  sessionId: string,
+  dir: string,
+  onDirectoryVisited?: (dir: string) => void
+): PiSessionListItem | null {
+  onDirectoryVisited?.(dir)
+  for (const entry of readDirectory(dir)) {
+    const name = String(entry.name)
+    const path = join(dir, name)
+    try {
+      if (entry.isDirectory()) {
+        const found = findPiSessionUnder(sessionId, path, onDirectoryVisited)
+        if (found) return found
+        continue
+      }
+      if (!entry.isFile() || !name.endsWith('.jsonl')) continue
+
+      const first = readFirstLine(path)
+      if (!first) continue
+      const header = parseSessionHeader(first)
+      if (!header || header.sessionId !== sessionId) continue
+      return {
+        sessionId: header.sessionId,
+        cwd: header.cwd,
+        title: null,
+        updatedAt: null,
+        sessionFile: path
+      }
+    } catch {
+      // Isolate a vanished/unreadable entry and continue the targeted walk.
+    }
+  }
+  return null
+}
+
+export function findPiSession(sessionId: string, options: FindPiSessionOptions = {}): PiSessionListItem | null {
+  // Read headers while walking and return immediately on a match. Unlike
+  // listPiSessions this neither collects every path nor reads title/tail data.
+  return findPiSessionUnder(sessionId, options.sessionsDir ?? getPiSessionsDir(), options.onDirectoryVisited)
 }
 
 export function findPiSessionFile(sessionId: string): string | null {
