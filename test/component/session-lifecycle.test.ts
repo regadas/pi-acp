@@ -172,9 +172,12 @@ test(
     }
 
     let rejectFirstPrompt!: (error: Error) => void
-    proc.prompt = (message, attachments = []) => {
+    proc.prompt = (message, attachments = [], onAccepted) => {
       proc.prompts.push({ message, attachments })
-      if (message !== 'first') return Promise.resolve()
+      if (message !== 'first') {
+        onAccepted?.()
+        return Promise.resolve()
+      }
       return new Promise<void>((_resolve, reject) => {
         rejectFirstPrompt = reject
       })

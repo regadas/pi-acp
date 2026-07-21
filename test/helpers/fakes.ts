@@ -33,6 +33,7 @@ export class FakePiRpcProcess {
   abortCount = 0
   disposeCount = 0
   readonly disposeOptions: Array<{ expected?: boolean } | undefined> = []
+  beforePromptAccepted: ((message: string) => void) | null = null
 
   // Mutable fake pi state returned by getState(). Defaults to an active agent
   // run so lifecycle tests behave like a real running pi; tests exercising
@@ -71,8 +72,10 @@ export class FakePiRpcProcess {
     for (const h of this.terminationHandlers) h(termination)
   }
 
-  async prompt(message: string, attachments: unknown[] = []): Promise<void> {
+  async prompt(message: string, attachments: unknown[] = [], onAccepted?: () => void): Promise<void> {
     this.prompts.push({ message, attachments })
+    this.beforePromptAccepted?.(message)
+    onAccepted?.()
   }
 
   async abort(): Promise<void> {

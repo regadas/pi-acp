@@ -42,6 +42,16 @@ type PendingTurn = {
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
   completionStarted: boolean
+  // Transport and lifecycle ownership are separate: a written prompt can be
+  // queued behind an unobserved autonomous run. Only the synchronous success
+  // response boundary can move dispatched -> accepted, and queued prompts do
+  // not own turn-bound events until their user message enters pi's run.
+  promptDispatched: boolean
+  promptAccepted: boolean
+  piRunOwned: boolean
+  promptQueued: boolean
+  expectedPromptText: string
+  matchingPromptMessagesToSkip: number
 }
 
 type QueuedTurn = {
@@ -63,6 +73,22 @@ const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
   { optionId: 'no', name: 'No', kind: 'reject_once' }
 ]
+const PI_TURN_BOUND_EVENT_TYPES = new Set([
+  'message_update',
+  'tool_execution_start',
+  'tool_execution_update',
+  'tool_execution_end',
+  'auto_retry_start',
+  'auto_retry_end',
+  'auto_compaction_start',
+  'auto_compaction_end',
+  'compaction_start',
+  'compaction_end'
+])
+// An observed out-of-band run should always emit agent_settled. Keep the wait
+// finite so a lost event cannot hang ACP forever, but fail closed rather than
+// dispatching into a run whose lifecycle this turn does not own.
+const DEFERRED_ADMISSION_TIMEOUT_MS = 10 * 60_000
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
 
@@ -128,9 +154,10 @@ export class PiAcpSession {
   // closes one low-level agent run, after which pi (>= 0.80.4) may continue
   // with automatic retries, compaction retries, and queued continuations.
   // Only `agent_settled` marks the fully settled prompt. This flag tracks
-  // whether the current ACP turn observed an agent run at all (`agent_start`),
-  // so prompts that pi handles without starting a run (e.g. extension
-  // commands or input hooks) can complete without hanging.
+  // whether the current ACP turn claimed execution via its `agent_start` or,
+  // for a queued follow-up inside an existing run, its user `message_start`.
+  // Prompts handled without either boundary (e.g. extension commands or input
+  // hooks) can then complete without hanging.
   private agentRunObserved = false
 
   // Stop-reason tracking for the current turn. `lastDoneReason` records the
@@ -143,6 +170,25 @@ export class PiAcpSession {
   // Set once when the pi child terminates; used to fail (or cancel) any
   // accepted turn deterministically instead of waiting for agent_settled.
   private procTermination: PiRpcTermination | null = null
+
+  // pi can run autonomously with no ACP-owned turn (e.g. an extension calling
+  // sendMessage with triggerTurn). `agent_start` with no owned ACP turn raises
+  // this gate; only an unambiguous `agent_settled` clears it (a get_state
+  // isStreaming=false snapshot is not authoritative: pi flips the flag before
+  // emitting agent_settled). While raised, an admitted turn defers its raw
+  // prompt dispatch instead of racing pi's busy check.
+  private piBusyOutOfBand = false
+  // Pi's low-level agent can restart inside one AgentSession run for retries,
+  // compaction, or messages queued by agent_end hooks. A restart without one
+  // of those observable precursors is an uncorrelatable nested top-level run;
+  // fail closed rather than consuming its settlement as the current boundary.
+  private lowLevelAgentEnded = false
+  private piQueueHasMessages = false
+  private continuationExpected = false
+  private lifecycleAmbiguity: Error | null = null
+  private deferredDispatch: { turn: PendingTurn; message: string; images: unknown[] } | null = null
+  private deferredAdmissionTimer: NodeJS.Timeout | null = null
+  private readonly deferredAdmissionTimeoutMs: number
 
   // For ACP diff support: capture file contents before edit/write mutations,
   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
@@ -174,6 +220,8 @@ export class PiAcpSession {
     fileCommands?: FileSlashCommand[]
     supportsTerminalOutputMeta?: boolean
     authMethods?: AuthMethod[]
+    /** Test seam: maximum wait for an observed out-of-band run to settle. */
+    deferredAdmissionTimeoutMs?: number
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -183,6 +231,7 @@ export class PiAcpSession {
     this.fileCommands = opts.fileCommands ?? []
     this.supportsTerminalOutputMeta = opts.supportsTerminalOutputMeta ?? false
     this.authMethods = opts.authMethods ?? []
+    this.deferredAdmissionTimeoutMs = opts.deferredAdmissionTimeoutMs ?? DEFERRED_ADMISSION_TIMEOUT_MS
 
     this.unsubscribe = this.proc.onEvent(ev => this.handlePiEvent(ev))
     // Intentionally never unsubscribed: onTermination fires at most once and
@@ -207,6 +256,8 @@ export class PiAcpSession {
     if (this.disposed) return
     this.disposed = true
     this.disposalExpected = options?.expected ?? true
+    // A held dispatch must never fire into a disposed channel.
+    this.clearDeferredDispatch()
     try {
       this.unsubscribe()
     } finally {
@@ -375,8 +426,30 @@ export class PiAcpSession {
       })
     }
 
+    const activeTurn = this.pendingTurn
+    if (activeTurn && !activeTurn.promptDispatched) {
+      // Nothing of this turn ever reached pi: the active run (if any) is
+      // out-of-band work this session does not own, so aborting pi would
+      // interrupt unrelated work. Settle locally with zero sends.
+      this.clearDeferredDispatch()
+      this.completeTurn(activeTurn)
+      await this.flushEmits()
+      for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
+      return
+    }
+
+    if (!activeTurn || activeTurn.completionStarted) {
+      // There is no live ACP-owned turn to abort. In particular, a completing
+      // turn remains installed only while updates flush; autonomous work that
+      // starts in that window must not be interrupted by a late cancellation.
+      if (queued.length) {
+        await this.flushEmits()
+        for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
+      }
+      return
+    }
+
     try {
-      // Abort the currently running turn (if any). If nothing is running, this is a no-op.
       await this.proc.abort()
     } catch {
       // If abort cannot be acknowledged, pi may still be generating output.
@@ -411,6 +484,10 @@ export class PiAcpSession {
 
   private async runShutdown(): Promise<void> {
     this.cancelRequested = true
+
+    // Drop any held dispatch before the first await so its admission timeout
+    // cannot race shutdown settlement.
+    this.clearDeferredDispatch()
 
     // Drain the queue synchronously so nothing already queued can start while
     // abort is in flight, but settle those requests only after final updates.
@@ -549,7 +626,17 @@ export class PiAcpSession {
     this.lastDoneReason = null
     this.turnFailure = null
 
-    const turn: PendingTurn = { resolve: t.resolve, reject: t.reject, completionStarted: false }
+    const turn: PendingTurn = {
+      resolve: t.resolve,
+      reject: t.reject,
+      completionStarted: false,
+      promptDispatched: false,
+      promptAccepted: false,
+      piRunOwned: false,
+      promptQueued: false,
+      expectedPromptText: t.message,
+      matchingPromptMessagesToSkip: 0
+    }
     this.pendingTurn = turn
 
     // Flush the deferred startup banner (pi version / context / skills) as the
@@ -558,9 +645,10 @@ export class PiAcpSession {
     // emitted right after session/new (https://github.com/svkozak/pi-acp/issues/59).
     this.sendStartupInfoIfPending()
 
-    // Custom messages can arrive while pi is idle. Defer them until a prompt
-    // is active so their agent_message_chunks remain inside an ACP turn.
-    this.sendPendingCustomMessages()
+    // Custom messages can arrive while pi is idle. Flush them now on the
+    // normal idle path. If an out-of-band run owns the Pi event stream, keep
+    // them buffered until dispatch so its content does not leak into this turn.
+    if (!this.piBusyOutOfBand) this.sendPendingCustomMessages()
 
     // Publish queue depth (0 because we're starting the turn now).
     this.emit({
@@ -578,9 +666,82 @@ export class PiAcpSession {
     //   immediately by an extension command or input hook) emits no agent
     //   events at all; handlePromptAccepted detects that and completes the
     //   turn so the ACP request does not hang.
+    // While pi is observably busy with an out-of-band run, the raw prompt is
+    // held (the ACP turn stays admitted) and dispatched only after that run's
+    // authoritative settlement. A finite timeout fails closed.
+    this.dispatchOrDefer(turn, t.message, t.images)
+  }
+
+  private dispatchOrDefer(turn: PendingTurn, message: string, images: unknown[]): void {
+    if (this.pendingTurn !== turn || turn.completionStarted) return
+
+    // A dead channel never defers: dispatching fails fast through the normal
+    // prompt rejection path instead of parking the turn behind a run that can
+    // no longer settle.
+    if (this.piBusyOutOfBand && !this.procTermination) {
+      this.deferredDispatch = { turn, message, images }
+      const timer = setTimeout(() => {
+        if (this.deferredAdmissionTimer === timer) this.deferredAdmissionTimer = null
+        if (this.deferredDispatch?.turn !== turn) return
+
+        this.deferredDispatch = null
+        const error = new Error('Timed out waiting for out-of-band pi work to settle before dispatching the prompt.')
+        // The child lifecycle can no longer be correlated safely. Quarantine
+        // it and reject every admitted/queued turn without sending the prompt.
+        this.dispose({ expected: false })
+        this.failTurn(turn, error)
+      }, this.deferredAdmissionTimeoutMs)
+      timer.unref?.()
+      this.deferredAdmissionTimer = timer
+      return
+    }
+
+    this.dispatchPrompt(turn, message, images)
+  }
+
+  private dispatchPrompt(turn: PendingTurn, message: string, images: unknown[]): void {
+    if (this.pendingTurn !== turn || turn.completionStarted) return
+
+    // Custom messages that arrived during deferral were buffered because the
+    // Pi run was not owned by this ACP turn. Flush them now, still inside the
+    // open request and before its raw prompt is written.
+    this.sendPendingCustomMessages()
+
+    // Foreign run events observed while this turn was deferred can overwrite
+    // the turn-scoped observation/result state that startTurn reset (a
+    // foreign `done: 'length'` would map to max_tokens; a foreign provisional
+    // retry failure would fail this turn at its own settlement). Re-reset
+    // that state synchronously at dispatch so only events from this point on
+    // shape the result. `cancelRequested` is intentionally preserved: a
+    // client cancel issued while deferred must still resolve `cancelled`.
+    this.agentRunObserved = false
+    this.lastDoneReason = null
+    this.turnFailure = null
+
+    // Mark only the transport write here. A foreign agent_start may already be
+    // buffered ahead of pi's response, so raw dispatch cannot establish event
+    // ownership. PiRpcProcess invokes this callback synchronously on the
+    // successful response record, before later records in the same chunk.
+    turn.promptDispatched = true
+    const markAccepted = () => {
+      if (this.pendingTurn !== turn || turn.completionStarted || turn.promptAccepted) return
+      turn.promptAccepted = true
+      // With no observed run and no pre-response follow-up queue update, pi
+      // took its idle path. It writes success immediately before starting
+      // this prompt without yielding, so ownership is safe at this boundary.
+      if (!this.piBusyOutOfBand && !turn.promptQueued && !this.lifecycleAmbiguity) {
+        turn.piRunOwned = true
+        this.sendPendingCustomMessages()
+      }
+    }
     this.proc
-      .prompt(t.message, t.images)
-      .then(() => this.handlePromptAccepted(turn))
+      .prompt(message, images, markAccepted)
+      .then(() => {
+        // Compatibility for test doubles and older embedders that implement
+        // prompt() but ignore the optional synchronous acceptance callback.
+        markAccepted()
+        this.handlePromptAccepted(turn)
+      })
       .catch(err => {
         if (err instanceof PiRpcRequestTimeoutError && err.command === 'prompt') {
           // PiRpcProcess already quarantined the channel. Unsubscribe session
@@ -593,6 +754,20 @@ export class PiAcpSession {
   }
 
   /**
+   * Drop the held dispatch payload and its admission timer. `deferredDispatch`
+   * always refers to the current pending turn, so every settlement path
+   * (complete, fail, cancel, shutdown, disposal, process termination) clears
+   * it unconditionally and no late timeout can send or settle it twice.
+   */
+  private clearDeferredDispatch(): void {
+    this.deferredDispatch = null
+    if (this.deferredAdmissionTimer) {
+      clearTimeout(this.deferredAdmissionTimer)
+      this.deferredAdmissionTimer = null
+    }
+  }
+
+  /**
    * Called when pi's `prompt` RPC request settles successfully. That response
    * is an acceptance response, not an execution result: if an agent run was
    * (or is being) started, keep the ACP turn open until `agent_settled`.
@@ -601,7 +776,7 @@ export class PiAcpSession {
    * instead of hanging forever.
    */
   private handlePromptAccepted(turn: PendingTurn): void {
-    if (this.pendingTurn !== turn || turn.completionStarted || this.agentRunObserved) return
+    if (this.pendingTurn !== turn || turn.completionStarted || !turn.promptAccepted || this.agentRunObserved) return
 
     void this.proc.getState().then(
       state => {
@@ -636,6 +811,7 @@ export class PiAcpSession {
   private completeTurn(turn: PendingTurn): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
+    this.clearDeferredDispatch()
     const reason: StopReason = this.cancelRequested
       ? 'cancelled'
       : this.lastDoneReason === 'length'
@@ -655,6 +831,7 @@ export class PiAcpSession {
   private failTurn(turn: PendingTurn, err: unknown): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
+    this.clearDeferredDispatch()
 
     // Keep the failed turn installed while its existing updates flush so any
     // concurrent prompts queue rather than leapfrog it. Once that first flush
@@ -739,6 +916,85 @@ export class PiAcpSession {
 
   private handlePiEvent(ev: PiRpcEvent) {
     const type = String((ev as any).type ?? '')
+    const turn = this.pendingTurn
+
+    // A streaming prompt queues its expanded text before pi writes the prompt
+    // success response. Preserve that text as the only available correlation
+    // boundary for the follow-up's later user message.
+    if (type === 'queue_update') {
+      const steering = Array.isArray(ev.steering) ? ev.steering : []
+      const followUp = Array.isArray(ev.followUp) ? ev.followUp : []
+      this.piQueueHasMessages = steering.length > 0 || followUp.length > 0
+
+      if (turn?.promptDispatched && !turn.promptAccepted && !turn.completionStarted) {
+        const queuedText = followUp.at(-1)
+        if (typeof queuedText === 'string') {
+          turn.promptQueued = true
+          turn.expectedPromptText = queuedText
+          // Pi removes equal queue strings with indexOf. Existing identical
+          // follow-ups ahead of ours must remain foreign until their FIFO
+          // message_start records have been skipped.
+          turn.matchingPromptMessagesToSkip = followUp.slice(0, -1).filter(item => item === queuedText).length
+        }
+      }
+      // Pi invokes agent_end extension handlers before publishing agent_end,
+      // so their queue_update can precede our low-level end flag. Retain the
+      // queue state and also cover messages queued just after the visible end.
+      if (this.lowLevelAgentEnded && this.piQueueHasMessages) this.continuationExpected = true
+    }
+
+    if (type === 'auto_retry_start' || type === 'auto_compaction_start' || type === 'compaction_start') {
+      // These events are explicit Pi promises that another low-level start
+      // belongs to the same AgentSession run. Some supported versions emit the
+      // marker before their corresponding agent_end, so do not key it on the
+      // local end flag.
+      this.continuationExpected = true
+    }
+    if (
+      (type === 'compaction_end' || type === 'auto_compaction_end') &&
+      (ev as { willRetry?: unknown }).willRetry !== true
+    ) {
+      this.continuationExpected = false
+    }
+
+    // A follow-up queued behind unobserved autonomous work stays in the same
+    // low-level run and emits no new agent_start. Its user message is therefore
+    // the first protocol record that can establish ownership.
+    if (
+      type === 'message_start' &&
+      turn?.promptAccepted &&
+      !turn.piRunOwned &&
+      !turn.completionStarted &&
+      !this.lifecycleAmbiguity &&
+      piUserMessageText(ev) === turn.expectedPromptText
+    ) {
+      if (turn.matchingPromptMessagesToSkip > 0) {
+        turn.matchingPromptMessagesToSkip -= 1
+      } else {
+        turn.piRunOwned = true
+        this.agentRunObserved = true
+        this.sendPendingCustomMessages()
+      }
+    }
+
+    const ownsPiTurn = Boolean(
+      turn &&
+      !turn.completionStarted &&
+      !this.lifecycleAmbiguity &&
+      (turn.piRunOwned || (turn.promptDispatched && !turn.promptAccepted && !this.piBusyOutOfBand))
+    )
+
+    // Pi extensions may run autonomously. Until an accepted prompt owns pi's
+    // run, turn-bound output must not escape, mutate its result, or race a turn
+    // already completing. Preserve the legacy translator test seam for
+    // isolated events with no observed lifecycle; real pi emits agent_start.
+    const suppressUnownedPiOutput =
+      !ownsPiTurn &&
+      (this.piBusyOutOfBand ||
+        Boolean(turn?.promptDispatched) ||
+        Boolean(turn?.completionStarted) ||
+        Boolean(this.lifecycleAmbiguity))
+    if (PI_TURN_BOUND_EVENT_TYPES.has(type) && suppressUnownedPiOutput) return
 
     switch (type) {
       case 'message_update': {
@@ -877,7 +1133,14 @@ export class PiAcpSession {
           identity: customMessageIdentity(message, blocks),
           sequence: ++this.customMessageSequence
         }
-        const forwardedTurnActive = Boolean(this.pendingTurn && !this.pendingTurn.completionStarted)
+        const activeTurn = this.pendingTurn
+        const forwardedTurnActive = Boolean(
+          activeTurn &&
+          !activeTurn.completionStarted &&
+          !this.lifecycleAmbiguity &&
+          (activeTurn.piRunOwned ||
+            (activeTurn.promptDispatched && !activeTurn.promptAccepted && !this.piBusyOutOfBand))
+        )
 
         if (forwardedTurnActive || this.activeAdapterPromptTurns > 0) {
           this.emitCustomMessageBlocks(blocks)
@@ -1114,7 +1377,42 @@ export class PiAcpSession {
       }
 
       case 'agent_start': {
-        this.agentRunObserved = true
+        const activeTurn = this.pendingTurn
+        const initialOwnedStart = Boolean(
+          activeTurn?.piRunOwned && !activeTurn.completionStarted && !this.agentRunObserved
+        )
+        const ownedContinuation = Boolean(
+          activeTurn?.piRunOwned && !activeTurn.completionStarted && this.continuationExpected
+        )
+
+        if (initialOwnedStart || ownedContinuation) {
+          // Idle accepted prompts own their first start. Pi may later restart
+          // the low-level agent for an explicitly signalled retry/compaction
+          // continuation without ending the AgentSession run.
+          this.agentRunObserved = true
+          this.continuationExpected = false
+        } else if (this.piBusyOutOfBand && this.continuationExpected) {
+          // Equivalent continuation inside autonomous work: keep one busy gate
+          // because AgentSession emits only one final agent_settled.
+          this.continuationExpected = false
+        } else if (this.piBusyOutOfBand || (activeTurn?.piRunOwned && !activeTurn.completionStarted)) {
+          // A second start without a retry/compaction/queued-continuation
+          // precursor can be a nested top-level run from an agent_settled hook.
+          // Its later settlement cannot be correlated with the older run.
+          this.lifecycleAmbiguity ??= new Error(
+            'Pi started an uncorrelatable nested run before the current run settled.'
+          )
+          this.piBusyOutOfBand = true
+          this.continuationExpected = false
+        } else {
+          // pi started work no accepted ACP turn owns (e.g. an extension
+          // sendMessage with triggerTurn, including a start buffered ahead of
+          // this prompt's success response). Raise the admission gate.
+          this.piBusyOutOfBand = true
+          this.continuationExpected = false
+        }
+
+        this.lowLevelAgentEnded = false
         break
       }
 
@@ -1128,21 +1426,68 @@ export class PiAcpSession {
         // Low-level agent run boundary. pi may continue after this event with
         // automatic retries, compaction retries, and queued continuations,
         // and their thought/tool updates must stay inside the active ACP
-        // turn. Do NOT resolve the ACP `session/prompt` here; wait for
-        // `agent_settled`.
+        // turn. Their precursor events mark the next agent_start as expected.
+        // Do NOT resolve here; wait for AgentSession's agent_settled.
+        this.lowLevelAgentEnded = true
+        if (this.piQueueHasMessages || (ev as { willRetry?: unknown }).willRetry === true) {
+          this.continuationExpected = true
+        }
         break
       }
 
       case 'agent_settled': {
+        const ambiguity = this.lifecycleAmbiguity
+        if (ambiguity) {
+          // Nested AgentSession runs can produce a newer settlement before an
+          // older outer settlement. With no run IDs, neither boundary is safe
+          // to consume. Quarantine even when no turn is pending so a prompt
+          // cannot race the remaining stale settlement.
+          this.dispose({ expected: false })
+          const ambiguousTurn = this.pendingTurn
+          if (ambiguousTurn && !ambiguousTurn.completionStarted) this.failTurn(ambiguousTurn, ambiguity)
+          break
+        }
+
+        // Whatever unambiguous run was active has now reached its sole
+        // authoritative AgentSession boundary.
+        this.piBusyOutOfBand = false
+        this.lowLevelAgentEnded = false
+        this.piQueueHasMessages = false
+        this.continuationExpected = false
+        const activeTurn = this.pendingTurn
+        if (!activeTurn) break
+
+        if (!activeTurn.promptDispatched) {
+          // Settlement of a run this ACP turn does not own. It is purely the
+          // admission signal for the held dispatch: send exactly once and
+          // keep the turn open for its own lifecycle.
+          const deferred = this.deferredDispatch
+          if (deferred?.turn === activeTurn) {
+            this.clearDeferredDispatch()
+            this.dispatchPrompt(activeTurn, deferred.message, deferred.images)
+          }
+          break
+        }
+
+        // A settlement buffered before pi's prompt response cannot settle the
+        // new turn. The response callback will establish idle ownership or a
+        // later matching user message will establish queued ownership.
+        if (!activeTurn.promptAccepted) break
+
+        if (!activeTurn.piRunOwned) {
+          const error = new Error('Pi settled before the accepted prompt could be correlated with its run.')
+          this.dispose({ expected: false })
+          this.failTurn(activeTurn, error)
+          break
+        }
+
         // pi has fully settled this prompt: no automatic retry, compaction
         // retry, or queued continuation remains. This is the safe boundary to
         // resolve (or fail) the ACP `session/prompt`.
-        const turn = this.pendingTurn
-        if (!turn) break
         if (this.turnFailure && !this.cancelRequested) {
-          this.failTurn(turn, this.turnFailure)
+          this.failTurn(activeTurn, this.turnFailure)
         } else {
-          this.completeTurn(turn)
+          this.completeTurn(activeTurn)
         }
         break
       }
@@ -1186,6 +1531,22 @@ export class PiAcpSession {
     const id = stringProp(ev, 'id')
     const method = stringProp(ev, 'method')
     if (!id) {
+      return
+    }
+
+    const activeTurn = this.pendingTurn
+    const belongsToPrompt = Boolean(
+      activeTurn &&
+      !activeTurn.completionStarted &&
+      !this.lifecycleAmbiguity &&
+      (activeTurn.piRunOwned || (activeTurn.promptDispatched && !this.piBusyOutOfBand))
+    )
+    if (!belongsToPrompt && (this.piBusyOutOfBand || Boolean(activeTurn) || Boolean(this.lifecycleAmbiguity))) {
+      // ACP permission requests and visible UI updates are turn-bound. An
+      // observed autonomous extension run has no client request to attach
+      // them to, so unblock pi by cancelling without contacting the client.
+      // The no-lifecycle branch remains as a translator-test seam.
+      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
 
@@ -1296,6 +1657,25 @@ function extensionUiToolCall(id: string, ev: PiRpcEvent) {
     status: 'pending' as const,
     rawInput
   }
+}
+
+function piUserMessageText(ev: PiRpcEvent): string | null {
+  const message = ev.message as { role?: unknown; content?: unknown } | null | undefined
+  if (message?.role !== 'user') return null
+  if (typeof message.content === 'string') return message.content
+  if (!Array.isArray(message.content)) return null
+
+  const text = message.content
+    .filter((part): part is { type: 'text'; text: string } => {
+      if (!part || typeof part !== 'object') return false
+      const record = part as { type?: unknown; text?: unknown }
+      return record.type === 'text' && typeof record.text === 'string'
+    })
+    .map(part => part.text)
+    .join('\n')
+  // Empty text is meaningful for image-only prompts: Pi always queues a text
+  // block alongside the images, and the empty string is their correlation key.
+  return text
 }
 
 function stringProp(source: Record<string, unknown>, key: string): string | null {

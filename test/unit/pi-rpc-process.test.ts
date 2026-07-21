@@ -256,6 +256,45 @@ test('PiRpcProcess: prompt timeout quarantines the channel and suppresses late r
   assert.equal(terminations[0]?.expected, false, 'fault quarantine is not an ACP cancellation')
 })
 
+test('PiRpcProcess: prompt wires followUp streaming behavior and resolves on success', async () => {
+  const mock = new MockChild()
+  const proc = PiRpcProcess.fromChild(asChild(mock), { requestTimeoutMs: 5_000 })
+  const stdinLines = collectStdin(mock)
+
+  const ordering: string[] = []
+  proc.onEvent(event => ordering.push(String(event.type)))
+
+  const images = [{ type: 'image', data: 'aGk=', mimeType: 'image/png' }]
+  const prompt = proc.prompt('hello world', images, () => ordering.push('accepted'))
+  await tick()
+
+  assert.equal(stdinLines.length, 1, 'exactly one raw request line per prompt')
+  const request = JSON.parse(stdinLines[0]!) as Record<string, unknown>
+  assert.equal(request.type, 'prompt')
+  assert.equal(request.message, 'hello world')
+  assert.deepEqual(request.images, images)
+  assert.equal(typeof request.id, 'string')
+  assert.ok((request.id as string).length > 0)
+  // Non-interrupting TOCTOU backstop: pi only consults streamingBehavior when
+  // already streaming, where a bare prompt would be rejected outright.
+  assert.equal(request.streamingBehavior, 'followUp')
+
+  // A success response (immediate acceptance or queued as follow-up) resolves.
+  // The synchronous callback is the exact ownership boundary: records already
+  // ahead of the response remain foreign, while later records in the same
+  // stdout chunk observe acceptance before Promise callbacks can run.
+  mock.stdout.write(
+    [
+      JSON.stringify({ type: 'foreign_start' }),
+      JSON.stringify({ type: 'response', id: request.id, command: 'prompt', success: true }),
+      JSON.stringify({ type: 'accepted_start' })
+    ].join('\n') + '\n'
+  )
+  await prompt
+  assert.deepEqual(ordering, ['foreign_start', 'accepted', 'accepted_start'])
+  proc.dispose()
+})
+
 test('PiRpcProcess: close fallback settles once and ignores later pipe data', async () => {
   const mock = new MockChild()
   const proc = PiRpcProcess.fromChild(asChild(mock), { closeFallbackMs: 20 })

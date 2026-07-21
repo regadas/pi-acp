@@ -95,7 +95,7 @@ function stripAnsi(s: string): string {
 }
 
 type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[] }
+  | { type: 'prompt'; id?: string; message: string; images?: unknown[]; streamingBehavior?: 'steer' | 'followUp' }
   | { type: 'abort'; id?: string }
   | { type: 'get_state'; id?: string }
   // Model
@@ -149,7 +149,7 @@ type SpawnParams = {
 type PendingEntry = {
   resolve: (v: PiRpcResponse) => void
   reject: (e: unknown) => void
-  beforeResolve?: () => void
+  beforeResolve?: (response: PiRpcResponse) => void
   timer?: NodeJS.Timeout
 }
 
@@ -259,8 +259,9 @@ export class PiRpcProcess {
       const entry = this.takePending(record.id)
       if (!entry) return
       try {
-        entry.beforeResolve?.()
-        entry.resolve(msg as PiRpcResponse)
+        const response = msg as PiRpcResponse
+        entry.beforeResolve?.(response)
+        entry.resolve(response)
       } catch (error) {
         entry.reject(error)
       }
@@ -519,8 +520,25 @@ export class PiRpcProcess {
     return lines
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<void> {
-    const res = await this.request({ type: 'prompt', message, images })
+  async prompt(message: string, images: unknown[] = [], onAccepted?: () => void): Promise<void> {
+    // TOCTOU backstop: pi consults streamingBehavior only when it is already
+    // streaming, where a bare prompt is rejected outright ("Agent is already
+    // processing"). Extensions can start runs pi-acp does not own, so a
+    // dispatch that races such a run is queued non-interruptively as a
+    // follow-up instead of failing the ACP request. The idle path is
+    // unchanged: pi ignores the field entirely when not streaming.
+    const res = await this.request(
+      { type: 'prompt', message, images, streamingBehavior: 'followUp' },
+      {
+        // This callback runs synchronously at the successful response record,
+        // before any later event records from the same stdout chunk. Session
+        // ownership must cross that wire boundary rather than the earlier
+        // stdin-write boundary.
+        beforeResolve: response => {
+          if (response.success) onAccepted?.()
+        }
+      }
+    )
     if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
   }
 
@@ -626,7 +644,10 @@ export class PiRpcProcess {
     await this.writeLine(`${JSON.stringify({ type: 'extension_ui_response', ...response })}\n`)
   }
 
-  private request(cmd: PiRpcCommand, opts?: { beforeResolve?: () => void }): Promise<PiRpcResponse> {
+  private request(
+    cmd: PiRpcCommand,
+    opts?: { beforeResolve?: (response: PiRpcResponse) => void }
+  ): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const line = `${JSON.stringify({ ...cmd, id })}\n`
 

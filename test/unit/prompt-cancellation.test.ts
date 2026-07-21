@@ -194,11 +194,14 @@ test('PiAcpAgent: stale cancel completion does not evict a replacement session',
   const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = manager
 
+  const pending = first.prompt('work')
+  firstProc.emit({ type: 'agent_start' })
   const cancellation = agent.cancel({ sessionId: first.sessionId })
   await abortStarted.promise
   ;(manager as any).sessions.set(first.sessionId, replacement)
   releaseAbort.resolve()
   await cancellation
+  assert.equal(await pending, 'cancelled')
 
   assert.equal(manager.maybeGet(first.sessionId), replacement)
   assert.equal(secondProc.disposeCount, 0)
