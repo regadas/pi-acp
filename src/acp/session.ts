@@ -196,6 +196,7 @@ export class PiAcpSession {
   private fileSnapshots = new Map<string, { path: string; oldText: string | null }>()
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
+  private subagentToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, string>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
@@ -617,6 +618,7 @@ export class PiAcpSession {
     this.fileSnapshots.delete(toolCallId)
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
+    this.subagentToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
@@ -1030,6 +1032,9 @@ export class PiAcpSession {
           const toolName = String((toolCall as any)?.name ?? 'tool')
 
           if (toolCallId) {
+            if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
+            if (ame.type === 'toolcall_delta' && this.subagentToolCallIds.has(toolCallId)) break
+
             const rawInput =
               (toolCall as any)?.arguments && typeof (toolCall as any).arguments === 'object'
                 ? (toolCall as any).arguments
@@ -1156,6 +1161,8 @@ export class PiAcpSession {
         const args = (ev as any).args
         let line: number | undefined
 
+        if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
+
         if (isBashTool(toolName)) {
           const locations = toToolCallLocations(toolName, args, this.cwd)
           const existingStatus = this.currentToolCalls.get(toolCallId)
@@ -1234,6 +1241,7 @@ export class PiAcpSession {
           this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
           break
         }
+        if (this.subagentToolCallIds.has(toolCallId)) break
 
         const content = this.fileMutationToolCallIds.has(toolCallId) ? [] : toolResultToolCallContent(partial)
 

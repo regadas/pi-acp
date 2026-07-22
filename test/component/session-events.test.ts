@@ -286,6 +286,125 @@ test('PiAcpSession: bash output falls back to standard content without terminal_
   ])
 })
 
+test('PiAcpSession: suppresses cumulative subagent progress snapshots but preserves start and completion', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const args = { agent: 'worker', task: 'Implement the fix' }
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'subagent-1', toolName: 'subagent', args })
+
+  const messages: unknown[] = []
+  for (let i = 0; i < 100; i += 1) {
+    messages.push({ role: 'assistant', content: [{ type: 'text', text: 'x'.repeat(64) }] })
+    proc.emit({
+      type: 'tool_execution_update',
+      toolCallId: 'subagent-1',
+      partialResult: {
+        content: [{ type: 'text', text: `(running ${i})` }],
+        details: { mode: 'single', results: [{ messages: [...messages] }] }
+      }
+    })
+  }
+
+  const result = {
+    content: [{ type: 'text', text: 'final report' }],
+    details: { mode: 'single', results: [{ status: 'complete' }] }
+  }
+  proc.emit({ type: 'tool_execution_end', toolCallId: 'subagent-1', isError: false, result })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 2)
+  assert.deepEqual(conn.updates[0]!.update, {
+    sessionUpdate: 'tool_call',
+    toolCallId: 'subagent-1',
+    title: 'subagent',
+    kind: 'other',
+    status: 'in_progress',
+    locations: undefined,
+    rawInput: args
+  })
+  assert.deepEqual(conn.updates[1]!.update, {
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'subagent-1',
+    status: 'completed',
+    content: [{ type: 'content', content: { type: 'text', text: 'final report' } }],
+    rawOutput: result
+  })
+})
+
+test('PiAcpSession: suppresses streamed subagent argument deltas but preserves boundary input and status', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    mcpServers: [],
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const toolCallId = 'subagent-stream'
+  const finalInput = { agent: 'worker', task: 'A complete delegated task' }
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_start',
+      toolCall: { id: toolCallId, name: 'subagent', partialArgs: '' }
+    }
+  })
+  for (let i = 0; i < 50; i += 1) {
+    proc.emit({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'toolcall_delta',
+        toolCall: { id: toolCallId, name: 'subagent', partialArgs: `{"task":"${'x'.repeat(i)}` }
+      }
+    })
+  }
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'toolcall_end',
+      toolCall: { id: toolCallId, name: 'subagent', arguments: finalInput }
+    }
+  })
+  proc.emit({ type: 'tool_execution_start', toolCallId, toolName: 'subagent', args: finalInput })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId,
+    isError: false,
+    result: { content: [{ type: 'text', text: 'done' }] }
+  })
+
+  await new Promise(r => setTimeout(r, 0))
+
+  assert.equal(conn.updates.length, 4)
+  assert.deepEqual(
+    conn.updates.map(entry => [entry.update.sessionUpdate, (entry.update as any).status]),
+    [
+      ['tool_call', 'pending'],
+      ['tool_call_update', 'pending'],
+      ['tool_call_update', 'in_progress'],
+      ['tool_call_update', 'completed']
+    ]
+  )
+  assert.equal((conn.updates[0]!.update as any).rawInput, undefined)
+  assert.deepEqual((conn.updates[1]!.update as any).rawInput, finalInput)
+  assert.deepEqual((conn.updates[2]!.update as any).rawInput, finalInput)
+})
+
 test('PiAcpSession: preserves tool-result image content in live tool_call_update', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
