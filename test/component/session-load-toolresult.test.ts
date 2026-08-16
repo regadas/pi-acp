@@ -1,13 +1,19 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-load-toolresult-cwd-'))
+
 class FakeStore {
   get(_sessionId: string) {
-    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
+    return { sessionId: 's1', cwd: TEST_CWD, sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
   }
   upsert() {}
 }
@@ -66,7 +72,7 @@ test('PiAcpAgent: loadSession replays toolResult with negotiated Zed terminal me
       protocolVersion: 1,
       clientCapabilities: { _meta: { terminal_output: true } }
     } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
 
     const updates = conn.updates.map(u => (u as any).update)
 
@@ -77,7 +83,7 @@ test('PiAcpAgent: loadSession replays toolResult with negotiated Zed terminal me
     assert.equal(toolCall.kind, 'execute')
     assert.equal(toolCall.status, 'in_progress')
     assert.deepEqual(toolCall.content, [{ type: 'terminal', terminalId: 'call_1' }])
-    assert.deepEqual(toolCall._meta, { terminal_info: { terminal_id: 'call_1', cwd: '/tmp/project' } })
+    assert.deepEqual(toolCall._meta, { terminal_info: { terminal_id: 'call_1', cwd: TEST_CWD } })
     assert.equal(toolCall.rawOutput, undefined)
 
     const toolCallUpdate = updates.find(u => u?.sessionUpdate === 'tool_call_update')
@@ -104,7 +110,7 @@ test('PiAcpAgent: loadSession replays bash output as standard content without ne
     ;(agent as any).store = new FakeStore()
 
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
 
     const updates = conn.updates.map(u => (u as any).update)
 
@@ -164,7 +170,7 @@ test('PiAcpAgent: loadSession retains bash image blocks alongside negotiated ter
       protocolVersion: 1,
       clientCapabilities: { _meta: { terminal_output: true } }
     } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
 
     const updates = conn.updates.map(u => (u as any).update)
     const end = updates.find(u => u?.sessionUpdate === 'tool_call_update' && u.toolCallId === 'call_img')
@@ -193,7 +199,7 @@ test('PiAcpAgent: loadSession retains bash image blocks as standard content for 
     ;(agent as any).store = new FakeStore()
 
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
 
     const updates = conn.updates.map(u => (u as any).update)
     const end = updates.find(u => u?.sessionUpdate === 'tool_call_update' && u.toolCallId === 'call_img')
@@ -241,7 +247,7 @@ test('PiAcpAgent: loadSession keeps failed replayed tools monotonic (never compl
     ;(agent as any).store = new FakeStore()
 
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
 
     const statuses = conn.updates
       .map(u => (u as any).update)

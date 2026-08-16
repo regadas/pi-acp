@@ -1,13 +1,19 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-load-tree-cwd-'))
+
 class FakeStore {
   get(_sessionId: string) {
-    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
+    return { sessionId: 's1', cwd: TEST_CWD, sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
   }
   upsert() {}
 }
@@ -41,7 +47,7 @@ async function loadWith(tree: unknown, supportsTerminalOutputMeta = false): Prom
       protocolVersion: 1,
       clientCapabilities: supportsTerminalOutputMeta ? { _meta: { terminal_output: true } } : {}
     } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
     return conn
   } finally {
     PiRpcProcess.spawn = originalSpawn
@@ -414,7 +420,7 @@ test('PiAcpAgent: loadSession fails clearly on malformed trees instead of replay
     ;(PiRpcProcess as any).spawn = mockSpawn(tree)
     try {
       await assert.rejects(
-        () => agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any),
+        () => agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] }),
         (e: any) => {
           assert.equal(e?.code, -32603, label)
           assert.match(String(e?.message), /Cannot replay session history/, label)
@@ -434,7 +440,7 @@ test('PiAcpAgent: loadSession replays an empty session (null leaf) without updat
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = mockSpawn({ tree: [], leafId: null })
   try {
-    const res = await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    const res = await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
     assert.equal('models' in (res as any), false, 'no custom root models field')
     const replayKinds = conn.updates
       .map(u => (u as any).update.sessionUpdate)

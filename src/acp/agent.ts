@@ -69,6 +69,7 @@ import { loadSlashCommands, parseCommandArgs, toAvailableCommands, type FileSlas
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
+import { assertValidSessionCwd, sessionCwdsEquivalent } from './session-cwd.js'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -94,6 +95,15 @@ function assertNoMcpServers(mcpServers: readonly unknown[] | undefined): void {
     `pi does not support MCP servers, so pi-acp cannot connect the ${mcpServers.length} requested MCP server(s). ` +
       'Remove mcpServers from the session request. To use MCP tools with pi, configure them through a pi extension ' +
       '(e.g. https://github.com/nicobailon/pi-mcp-adapter) instead.'
+  )
+}
+
+function assertNoAdditionalDirectories(additionalDirectories: readonly string[] | undefined): void {
+  if (!additionalDirectories?.length) return
+  throw RequestError.invalidParams(
+    { reason: 'ADDITIONAL_DIRECTORIES_UNSUPPORTED' },
+    `pi-acp does not support additional workspace directories, so it cannot use the ${additionalDirectories.length} ` +
+      'requested additional directories. Remove additionalDirectories from the session request.'
   )
 }
 
@@ -579,10 +589,9 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async newSession(params: NewSessionRequest) {
-    if (!isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams({}, `cwd must be an absolute path: ${params.cwd}`)
-    }
+    assertValidSessionCwd(params.cwd)
     assertNoMcpServers(params.mcpServers)
+    assertNoAdditionalDirectories(params.additionalDirectories)
 
     const fileCommands = loadSlashCommands(params.cwd)
     const enableSkillCommands = getEnableSkillCommands(params.cwd)
@@ -1247,7 +1256,8 @@ export class PiAcpAgent implements ACPAgent {
 
     // Stable ACP semantics: no cwd filter means all known sessions.
     const all = listPiSessions()
-    const filtered = params.cwd ? all.filter(s => s.cwd === params.cwd) : all
+    const cwdFilter = params.cwd
+    const filtered = cwdFilter ? all.filter(s => sessionCwdsEquivalent(s.cwd, cwdFilter)) : all
 
     // Cursors are opaque numeric offsets issued by this agent in `nextCursor`;
     // anything else is malformed and rejected rather than treated as page 0.
@@ -1286,21 +1296,24 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
-    if (!isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams({}, `cwd must be an absolute path: ${params.cwd}`)
-    }
+    assertValidSessionCwd(params.cwd)
     assertNoMcpServers(params.mcpServers)
+    assertNoAdditionalDirectories(params.additionalDirectories)
 
     const stored = this.findStoredSession(params.sessionId)
     if (!stored) {
       throw RequestError.resourceNotFound(params.sessionId)
     }
-    if (stored.cwd !== params.cwd) {
+    if (!sessionCwdsEquivalent(stored.cwd, params.cwd)) {
       throw RequestError.invalidParams(
         {},
         `cwd does not match the session's recorded cwd (${stored.cwd}): ${params.cwd}`
       )
     }
+
+    // The request only had to name an equivalent directory; the recorded cwd
+    // stays authoritative so an alias cannot rebind the session's workspace.
+    const cwd = stored.cwd
 
     this.bumpCancellationEpoch(params.sessionId)
     const generation = this.bumpLoadGeneration(params.sessionId)
@@ -1317,15 +1330,15 @@ export class PiAcpAgent implements ACPAgent {
         this.assertLoadActive(params.sessionId, generation)
       }
 
-      const enableSkillCommands = getEnableSkillCommands(params.cwd)
+      const enableSkillCommands = getEnableSkillCommands(cwd)
       const session = await this.restoreSession(params.sessionId, {
-        cwd: params.cwd,
+        cwd,
         mcpServers: params.mcpServers
       })
       try {
         this.assertLoadActive(params.sessionId, generation)
         const proc = session.proc
-        const fileCommands = loadSlashCommands(params.cwd)
+        const fileCommands = loadSlashCommands(cwd)
 
         // Replay the complete raw active-branch history via pi's get_tree
         // (available on every supported pi version): unlike get_messages it
@@ -1446,7 +1459,7 @@ export class PiAcpAgent implements ACPAgent {
                   ...(isBash && this.supportsTerminalOutputMeta
                     ? {
                         content: bashTerminalContent(block.toolCallId),
-                        _meta: bashTerminalInfoMeta(block.toolCallId, params.cwd)
+                        _meta: bashTerminalInfoMeta(block.toolCallId, cwd)
                       }
                     : {})
                 }
@@ -1493,7 +1506,7 @@ export class PiAcpAgent implements ACPAgent {
                     ...(this.supportsTerminalOutputMeta
                       ? {
                           content: bashTerminalContent(toolCallId),
-                          _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+                          _meta: bashTerminalInfoMeta(toolCallId, cwd)
                         }
                       : {})
                   }
@@ -1582,7 +1595,7 @@ export class PiAcpAgent implements ACPAgent {
                 ...(this.supportsTerminalOutputMeta
                   ? {
                       content: bashTerminalContent(toolCallId),
-                      _meta: bashTerminalInfoMeta(toolCallId, params.cwd)
+                      _meta: bashTerminalInfoMeta(toolCallId, cwd)
                     }
                   : {})
               }
@@ -1670,10 +1683,9 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
-    if (!isAbsolute(params.cwd)) {
-      throw RequestError.invalidParams({}, `cwd must be an absolute path: ${params.cwd}`)
-    }
+    assertValidSessionCwd(params.cwd)
     assertNoMcpServers(params.mcpServers)
+    assertNoAdditionalDirectories(params.additionalDirectories)
 
     const stored = this.findStoredSession(params.sessionId)
     if (!stored) {
@@ -1682,15 +1694,19 @@ export class PiAcpAgent implements ACPAgent {
 
     // ACP allows resuming only under the session's recorded cwd; pi session
     // files are bound to the cwd they were created in.
-    if (stored.cwd !== params.cwd) {
+    if (!sessionCwdsEquivalent(stored.cwd, params.cwd)) {
       throw RequestError.invalidParams(
         {},
         `cwd does not match the session's recorded cwd (${stored.cwd}): ${params.cwd}`
       )
     }
 
+    // The recorded cwd stays authoritative: an equivalent alias in the request
+    // must not rebind where this session's pi subprocess runs or reads from.
+    const cwd = stored.cwd
+
     const session = await this.restoreSessionAwaitingLoads(params.sessionId, {
-      cwd: params.cwd,
+      cwd,
       mcpServers: params.mcpServers
     })
 

@@ -1,12 +1,18 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-startup-load-cwd-'))
+
 class FakeStore {
   get(_sessionId: string) {
-    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
+    return { sessionId: 's1', cwd: TEST_CWD, sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
   }
   upsert() {
     // noop
@@ -39,7 +45,7 @@ test('PiAcpAgent: does not emit startup info on loadSession', async () => {
     // Inject store so loadSession resolves without depending on actual filesystem.
     ;(agent as any).store = new FakeStore()
 
-    const res = await agent.loadSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
+    const res = await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
 
     assert.equal((res as any)?._meta?.piAcp?.startupInfo, null)
 

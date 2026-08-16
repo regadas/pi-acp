@@ -82,7 +82,7 @@ test('PiAcpAgent: listSessions returns all known sessions when cwd is omitted', 
 
 test('PiAcpAgent: listSessions filters by the supplied cwd', async () => {
   await withSeededAgent(async agent => {
-    const listed = await agent.listSessions({ cwd: '/cwd/a' })
+    const listed = await agent.listSessions({ cwd: '/cwd/a///' })
     assert.equal(listed.sessions.length, 1)
     assert.equal(listed.sessions[0]?.sessionId, 'sess-a')
 

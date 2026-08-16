@@ -1,10 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
+
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-load-ownership-cwd-'))
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void
@@ -18,7 +24,7 @@ function deferred<T = void>() {
 
 class FakeStore {
   get(_sessionId: string) {
-    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
+    return { sessionId: 's1', cwd: TEST_CWD, sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
   }
   upsert() {}
   delete() {}
@@ -104,7 +110,7 @@ function makeAgent() {
   return { agent, conn, manager }
 }
 
-const loadParams = { sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any
+const loadParams = { sessionId: 's1', cwd: TEST_CWD, mcpServers: [] }
 
 test('resumeSession waits for an active load and recovers after that load fails', async () => {
   const treeStarted = deferred()
@@ -126,12 +132,10 @@ test('resumeSession waits for an active load and recovers after that load fails'
     // The load's restored process is provisional; a concurrent resume must
     // wait for the load to settle instead of sharing it.
     let resumeSettled = false
-    const resume = agent
-      .resumeSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any)
-      .then(response => {
-        resumeSettled = true
-        return response
-      })
+    const resume = agent.resumeSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] }).then(response => {
+      resumeSettled = true
+      return response
+    })
 
     await new Promise(resolve => setTimeout(resolve, 0))
     assert.equal(resumeSettled, false, 'resume must not proceed while the load owns the provisional session')
@@ -172,7 +176,7 @@ test('resumeSession configuration probe errors reject instead of returning fallb
 
   await withMockSpawn([proc], async () => {
     await assert.rejects(
-      () => agent.resumeSession({ sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any),
+      () => agent.resumeSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] }),
       /resume models unavailable/
     )
   })

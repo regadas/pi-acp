@@ -1,16 +1,22 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-load-failure-cwd-'))
+
 class FakeStore {
   readonly deletes: string[] = []
 
   get(_sessionId: string) {
-    return { sessionId: 's1', cwd: '/tmp/project', sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
+    return { sessionId: 's1', cwd: TEST_CWD, sessionFile: '/tmp/s.jsonl', updatedAt: new Date().toISOString() }
   }
   upsert() {}
   delete(sessionId: string) {
@@ -86,7 +92,7 @@ function makeAgent(conn = new FakeAgentSideConnection()) {
   return { agent, conn, store, manager }
 }
 
-const loadParams = { sessionId: 's1', cwd: '/tmp/project', mcpServers: [] } as any
+const loadParams = { sessionId: 's1', cwd: TEST_CWD, mcpServers: [] }
 
 test('loadSession: get_tree rejection evicts and disposes the freshly restored session', async () => {
   const proc = new MockProc({

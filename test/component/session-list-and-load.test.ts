@@ -10,6 +10,9 @@ import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 // We mock PiRpcProcess.spawn so loadSession doesn't actually spawn `pi`.
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-list-load-cwd-'))
+
 test('PiAcpAgent: loadSession replays visible custom history once across the response boundary', async () => {
   // Create a fake PI_CODING_AGENT_DIR with one session.
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
@@ -27,7 +30,7 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
         version: 3,
         id: 'sess-1',
         timestamp: '2026-02-11T00:00:00.000Z',
-        cwd: '/tmp/project'
+        cwd: TEST_CWD
       }),
       JSON.stringify({
         type: 'message',
@@ -69,7 +72,7 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
 
     const s = listed.sessions.find(x => x.sessionId === 'sess-1')
     assert.ok(s)
-    assert.equal(s?.cwd, '/tmp/project')
+    assert.equal(s?.cwd, TEST_CWD)
     assert.equal(s?.title, 'My Named Session')
 
     // 2) load session: mock spawn to return fake proc with getMessages
@@ -216,11 +219,11 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
 
     try {
       await assert.rejects(
-        () => agent.loadSession({ sessionId: 'sess-1', cwd: '/different/project', mcpServers: [], _meta: null } as any),
+        () => agent.loadSession({ sessionId: 'sess-1', cwd: root, mcpServers: [], _meta: null }),
         /does not match the session's recorded cwd/i
       )
 
-      await agent.loadSession({ sessionId: 'sess-1', cwd: '/tmp/project', mcpServers: [], _meta: null } as any)
+      await agent.loadSession({ sessionId: 'sess-1', cwd: TEST_CWD, mcpServers: [], _meta: null })
 
       // loadSession should have replayed messages as session/update notifications.
       const texts = conn.updates
