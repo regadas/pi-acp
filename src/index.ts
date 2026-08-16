@@ -1,6 +1,7 @@
 import { ndJsonStream } from '@agentclientprotocol/sdk'
 import { createPiAcpAgentApp } from './acp/app.js'
 import type { PiAcpAgent } from './acp/agent.js'
+import { createShutdownCoordinator } from './acp/shutdown.js'
 import { getPiCommand, shouldUseShellForPiCommand } from './pi-rpc/command.js'
 // Terminal Auth entrypoint. The ACP client launches the agent with `--terminal-login`.
 if (process.argv.includes('--terminal-login')) {
@@ -50,30 +51,27 @@ const output = new ReadableStream<Uint8Array>({
 
 const stream = ndJsonStream(input, output)
 
-let activeAgent: PiAcpAgent | null = null
-let shuttingDown = false
-createPiAcpAgentApp({
-  onAgent: agent => {
-    activeAgent = agent
-  }
-}).connect(stream)
+// Slightly above PiRpcProcess's 2s SIGTERM -> SIGKILL grace so a child that
+// ignores SIGTERM is still killed before the adapter exits.
+const SHUTDOWN_TERMINATION_TIMEOUT_MS = 3_000
 
-function shutdown() {
-  if (shuttingDown) return
-  shuttingDown = true
+// Disposes session subprocesses, then gives them a bounded window to actually
+// terminate: exiting immediately would preempt the SIGTERM -> SIGKILL
+// escalation and orphan a pi child that ignores SIGTERM.
+const coordinator = createShutdownCoordinator<PiAcpAgent>({
+  timeoutMs: SHUTDOWN_TERMINATION_TIMEOUT_MS,
+  exit: () => {
+    try {
+      process.exit(0)
+    } catch {
+      // ignore
+    }
+  }
+})
 
-  try {
-    // Best-effort: dispose session subprocesses when the client disconnects.
-    activeAgent?.dispose()
-  } catch {
-    // ignore
-  }
-  try {
-    process.exit(0)
-  } catch {
-    // ignore
-  }
-}
+createPiAcpAgentApp({ onAgent: agent => coordinator.trackAgent(agent) }).connect(stream)
+
+const shutdown = () => coordinator.shutdown()
 
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)

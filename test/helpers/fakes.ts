@@ -68,6 +68,7 @@ export class FakePiRpcProcess {
   readonly prompts: Array<{ message: string; attachments: unknown[] }> = []
   readonly extensionUiResponses: unknown[] = []
   abortCount = 0
+  disposed = false
   disposeCount = 0
   readonly disposeOptions: Array<{ expected?: boolean } | undefined> = []
   beforePromptAccepted: ((message: string) => void) | null = null
@@ -106,7 +107,17 @@ export class FakePiRpcProcess {
       stderrTail: '',
       ...info
     }
+    this.terminated = true
     for (const h of this.terminationHandlers) h(termination)
+  }
+
+  terminated = false
+
+  whenTerminated(): Promise<void> {
+    if (this.terminated) return Promise.resolve()
+    return new Promise<void>(resolve => {
+      this.onTermination(() => resolve())
+    })
   }
 
   async prompt(message: string, attachments: unknown[] = [], onAccepted?: () => void): Promise<void> {
@@ -115,15 +126,53 @@ export class FakePiRpcProcess {
     onAccepted?.()
   }
 
+  // Mirrors real pi: `abort` stops an agent run. It does NOT settle an
+  // in-flight manual RPC such as compaction or export, so it must never be
+  // used by tests to make a blocked command's promise resolve.
   async abort(): Promise<void> {
     this.abortCount += 1
   }
 
-  // Mirrors PiRpcProcess.dispose(options?) so sessions exercising the
-  // expected/unexpected disposal distinction compile against the fake.
+  // Outstanding pi RPCs, mirroring PiRpcProcess's correlation map.
+  private readonly pending = new Set<(err: unknown) => void>()
+
+  hasPendingRequests(): boolean {
+    return this.pending.size > 0
+  }
+
+  /**
+   * Model an RPC that stays outstanding until `settlement` settles. Only
+   * `dispose()` can reject it early, exactly like the real channel.
+   */
+  pendingRequest<T>(settlement: Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.pending.add(reject)
+      const done = () => this.pending.delete(reject)
+      settlement.then(
+        value => {
+          done()
+          resolve(value)
+        },
+        error => {
+          done()
+          reject(error)
+        }
+      )
+    })
+  }
+
+  // Mirrors PiRpcProcess.dispose(options?), including its idempotency, so
+  // sessions exercising the expected/unexpected disposal distinction compile
+  // against the fake and repeated disposals stay observable as one.
   dispose(options?: { expected?: boolean }): void {
+    if (this.disposed) return
+    this.disposed = true
     this.disposeCount += 1
     this.disposeOptions.push(options)
+
+    const pending = [...this.pending]
+    this.pending.clear()
+    for (const reject of pending) reject(new Error('pi process closed'))
   }
 
   async sendExtensionUiResponse(response: unknown): Promise<void> {
@@ -154,11 +203,6 @@ export class FakePiRpcProcess {
     return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
   }
 
-  async getMessages(beforeResponseResolve?: () => void): Promise<any> {
-    beforeResponseResolve?.()
-    return { messages: [] }
-  }
-
   // Mutable fake get_tree payload; tests set `tree` to replay history.
   tree: { tree: unknown[]; leafId: string | null } = { tree: [], leafId: null }
 
@@ -166,6 +210,20 @@ export class FakePiRpcProcess {
     beforeResponseResolve?.()
     return this.tree
   }
+}
+
+/**
+ * Text of the last `agent_message_chunk` delivered. Settled work publishes
+ * terminal `session_info_update` queue metadata afterwards, so the last update
+ * overall is not the command's output.
+ */
+export function lastAgentMessageText(conn: FakeAgentSideConnection): string {
+  for (let i = conn.updates.length - 1; i >= 0; i--) {
+    const update = conn.updates[i]!.update as { sessionUpdate?: string; content?: { type?: string; text?: unknown } }
+    if (update.sessionUpdate !== 'agent_message_chunk') continue
+    if (update.content?.type === 'text' && typeof update.content.text === 'string') return update.content.text
+  }
+  throw new Error('no agent_message_chunk was delivered')
 }
 
 export function asAgentConn(conn: FakeAgentSideConnection): AcpClient {

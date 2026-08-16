@@ -305,3 +305,44 @@ test('PiRpcProcess.spawn proceeds for supported pi versions', { skip: isWindows 
   const proc = await PiRpcProcess.spawn({ cwd: process.cwd(), piCommand: stub })
   proc.dispose()
 })
+
+test('PiRpcProcess.spawn reports the child to its owner before resolving', { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  const stub = makePiStub('pi-onprocess-spawn', '0.80.6')
+  const reported: PiRpcProcess[] = []
+
+  const spawning = PiRpcProcess.spawn({
+    cwd: process.cwd(),
+    piCommand: stub,
+    onProcess: proc => reported.push(proc)
+  })
+
+  // The OS child already exists here, so shutdown must be able to see it
+  // without waiting for the spawn promise.
+  assert.equal(reported.length, 1, 'the child is handed over before the spawn resolves')
+
+  const proc = await spawning
+  assert.equal(proc, reported[0], 'the reported child is the one handed back')
+  proc.dispose()
+})
+
+test('PiRpcProcess.spawn disposes the child when its ownership hook throws', { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  const stub = makePiStub('pi-onprocess-throws', '0.80.6')
+  const reported: PiRpcProcess[] = []
+
+  await assert.rejects(
+    PiRpcProcess.spawn({
+      cwd: process.cwd(),
+      piCommand: stub,
+      onProcess: proc => {
+        reported.push(proc)
+        throw new Error('ownership registration failed')
+      }
+    }),
+    /ownership registration failed/
+  )
+
+  // Failing closed: the child is torn down rather than left running unowned.
+  await reported[0]!.whenTerminated()
+})

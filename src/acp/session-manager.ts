@@ -23,6 +23,18 @@ type SessionCreateParams = {
 
 export class SessionManager {
   private sessions = new Map<string, PiAcpSession>()
+  // Every pi child this manager is responsible for terminating, tracked from
+  // the moment ownership starts until the child actually exits. This is the
+  // single ownership record: a process is here whether it is registered under
+  // a live session, still being validated by an in-flight create/restore,
+  // disposed by a failure path, dropped as a registration race loser, or
+  // closed earlier by an ACP connection abort. Final shutdown therefore waits
+  // for all of them instead of exiting mid SIGTERM -> SIGKILL escalation.
+  private readonly owned = new Set<PiRpcProcess>()
+  // Spawn operations that have not settled yet. A pi child exists inside
+  // `PiRpcProcess.spawn` before its promise resolves, so shutdown has to know
+  // work is in flight even before it can see the process itself.
+  private readonly pendingSpawns = new Set<Promise<void>>()
   private readonly store: SessionStore
   private disposed = false
 
@@ -41,8 +53,95 @@ export class SessionManager {
     for (const [id] of this.sessions) this.close(id)
   }
 
-  isDisposed(): boolean {
-    return this.disposed
+  /**
+   * Dispose every session and every other owned pi child, then wait (bounded
+   * by `timeoutMs`) for them to actually exit. Final adapter shutdown uses
+   * this so a child that ignores SIGTERM is still SIGKILLed instead of being
+   * orphaned when the adapter process exits.
+   */
+  async disposeAllAndWait(timeoutMs: number): Promise<void> {
+    this.disposeAll()
+
+    let timedOut = false
+    let timer: NodeJS.Timeout | undefined
+    const deadline = new Promise<void>(resolve => {
+      timer = setTimeout(() => {
+        timedOut = true
+        resolve()
+      }, timeoutMs)
+    })
+
+    // A child can still appear while this waits: a spawn started before the
+    // teardown may only now be creating -- or handing back -- its child. Drain
+    // repeatedly until nothing is owned or pending, all under one deadline.
+    // `handled` keeps the loop finite regardless of when a terminated child
+    // drops out of `owned`.
+    const handled = new Set<unknown>()
+    try {
+      while (!timedOut) {
+        const procs = [...this.owned].filter(proc => !handled.has(proc))
+        const spawns = [...this.pendingSpawns].filter(spawn => !handled.has(spawn))
+        if (!procs.length && !spawns.length) return
+
+        // Children owned outside a registered session (in-flight create/restore,
+        // failure cleanup, race losers) are signalled here; disposal is
+        // idempotent, so already-disposed children are unaffected.
+        for (const proc of procs) {
+          handled.add(proc)
+          proc.dispose()
+        }
+        for (const spawn of spawns) handled.add(spawn)
+
+        await Promise.race([Promise.all([...procs.map(proc => proc.whenTerminated()), ...spawns]), deadline])
+      }
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Take ownership of a pi child until it terminates. Idempotent: a process
+   * handed back through {@link getOrCreate} is not tracked twice.
+   */
+  private own(proc: PiRpcProcess): void {
+    if (this.owned.has(proc)) return
+    this.owned.add(proc)
+    void proc.whenTerminated().then(() => this.owned.delete(proc))
+
+    // Ownership starting after teardown began must not leave a child running.
+    // `disposeAllAndWait` still waits for its termination.
+    if (this.disposed) proc.dispose()
+  }
+
+  /**
+   * Spawn a pi subprocess owned by this manager. Ownership starts before the
+   * caller (or a racing shutdown) can observe the child: `PiRpcProcess.spawn`
+   * reports it through `onProcess` the moment the OS process exists, and the
+   * operation itself is registered synchronously for the window before that.
+   * Every later path -- validation failure, registration race, teardown during
+   * the spawn -- is then covered by {@link disposeAllAndWait}.
+   */
+  spawnOwned(params: { cwd: string; sessionPath?: string; piCommand?: string }): Promise<PiRpcProcess> {
+    const spawning = PiRpcProcess.spawn({ ...params, onProcess: proc => this.own(proc) })
+
+    // Ownership is also taken on resolution: a spawn seam that never calls the
+    // hook still hands its child over before the caller resumes. Failures and
+    // hook errors settle this tracker without rejecting it, so shutdown only
+    // ever waits on it.
+    const tracked = spawning.then(proc => this.own(proc)).catch(() => {})
+    this.pendingSpawns.add(tracked)
+    void tracked.then(() => this.pendingSpawns.delete(tracked))
+
+    return spawning
+  }
+
+  /** Dispose a session; its process stays owned until the child terminates. */
+  private retire(session: PiAcpSession): void {
+    try {
+      session.dispose()
+    } catch {
+      // ignore
+    }
   }
 
   private assertNotDisposed(proc?: PiRpcProcess): void {
@@ -56,7 +155,7 @@ export class SessionManager {
     const session = this.sessions.get(sessionId)
     if (!session?.isUnavailable()) return session
 
-    session.dispose()
+    this.retire(session)
     this.sessions.delete(sessionId)
     return undefined
   }
@@ -73,13 +172,9 @@ export class SessionManager {
    * Used when clients explicitly reload a session and we want a fresh pi subprocess.
    */
   close(sessionId: string): void {
-    const s = this.sessions.get(sessionId)
-    if (!s) return
-    try {
-      s.dispose()
-    } catch {
-      // ignore
-    }
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+    this.retire(session)
     this.sessions.delete(sessionId)
   }
 
@@ -90,7 +185,7 @@ export class SessionManager {
     // so sessions are visible to the regular `pi` CLI.
     let proc: PiRpcProcess
     try {
-      proc = await PiRpcProcess.spawn({
+      proc = await this.spawnOwned({
         cwd: params.cwd,
         piCommand: params.piCommand
       })
@@ -175,6 +270,9 @@ export class SessionManager {
    * fails instead of registering.
    */
   getOrCreate(sessionId: string, params: SessionCreateParams & { proc: PiRpcProcess }): PiAcpSession {
+    // Restores spawn through `spawnOwned`; take ownership anyway so a process
+    // handed over by any other path is still awaited at shutdown.
+    this.own(params.proc)
     this.assertNotDisposed(params.proc)
 
     const existing = this.maybeGet(sessionId)

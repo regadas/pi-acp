@@ -119,18 +119,17 @@ test('PiRpcProcess: records split across stdout chunks (including mid code point
   assert.equal(events[0]!.text, 'héllo 🌍 world')
 })
 
-test('PiRpcProcess: a malformed stdout record is isolated and captured as prelude', async () => {
+test('PiRpcProcess: malformed stdout records do not block later valid records', async () => {
   const mock = new MockChild()
   const proc = PiRpcProcess.fromChild(asChild(mock))
   const events: PiRpcEvent[] = []
   proc.onEvent(ev => events.push(ev))
 
-  mock.stdout.write('\u001b[1mstarting fake pi...\u001b[0m\n{not json\n')
+  mock.stdout.write('starting fake pi...\n{not json\n')
   mock.stdout.write(JSON.stringify({ type: 'marker', ok: true }) + '\n')
   await tick()
 
   assert.deepEqual(events, [{ type: 'marker', ok: true }])
-  assert.deepEqual(proc.consumePreludeLines(), ['starting fake pi...', '{not json'])
 })
 
 test('PiRpcProcess: an unterminated framing flood is caught and quarantines the child', async () => {
@@ -194,39 +193,6 @@ test('PiRpcProcess: every command timeout quarantines the channel and drops late
 
   await sleep(60)
   assert.deepEqual(mock.kills, ['SIGTERM', 'SIGKILL'], 'quarantine escalates to SIGKILL after the grace period')
-})
-
-test('PiRpcProcess: prelude retention is bounded to a tail', async () => {
-  const mock = new MockChild()
-  const proc = PiRpcProcess.fromChild(asChild(mock))
-
-  // Flood far more non-JSON prelude output than the 64KB bound.
-  const line = 'prelude '.repeat(128).trim()
-  for (let index = 0; index < 200; index++) {
-    mock.stdout.write(`${line} #${index}\n`)
-  }
-  mock.stdout.write('FINAL-PRELUDE-LINE\n')
-  await tick()
-
-  const lines = proc.consumePreludeLines()
-  const totalBytes = lines.reduce((sum, l) => sum + l.length, 0)
-  assert.ok(totalBytes <= 64 * 1024 + line.length + 32, `prelude must stay bounded, got ${totalBytes}`)
-  assert.equal(lines[lines.length - 1], 'FINAL-PRELUDE-LINE', 'the newest prelude lines are retained')
-  assert.ok(lines.length < 201, 'oldest prelude lines were dropped')
-  assert.deepEqual(proc.consumePreludeLines(), [], 'consuming resets the retained prelude')
-})
-
-test('PiRpcProcess: one giant malformed prelude line is individually bounded to its newest tail', async () => {
-  const mock = new MockChild()
-  const proc = PiRpcProcess.fromChild(asChild(mock))
-  const suffix = 'ACTIONABLE-TAIL'
-  mock.stdout.write(`${'x'.repeat(200_000)}${suffix}\n`)
-  await tick()
-
-  const [retained] = proc.consumePreludeLines()
-  assert.ok(retained)
-  assert.ok(retained!.length <= 64 * 1024)
-  assert.ok(retained!.endsWith(suffix))
 })
 
 test('PiRpcProcess: prompt timeout quarantines the channel and suppresses late records', async () => {
@@ -377,6 +343,49 @@ test('PiRpcProcess: dispose rejects pending requests immediately and escalates S
   assert.deepEqual(mock.kills, ['SIGTERM', 'SIGKILL'])
 
   // Requests after dispose fail fast.
+  await assert.rejects(proc.getState(), PiRpcClosedError)
+})
+
+test('PiRpcProcess: a failed stdin write quarantines the channel as an unexpected fault', async () => {
+  for (const mode of ['callback', 'throw'] as const) {
+    const mock = new MockChild()
+    const failure = new Error(`stdin ${mode} failure`)
+    mock.stdin.write = ((_chunk: unknown, cb?: (error?: Error | null) => void) => {
+      if (mode === 'throw') throw failure
+      cb?.(failure)
+      return false
+    }) as unknown as typeof mock.stdin.write
+
+    const proc = PiRpcProcess.fromChild(asChild(mock), { requestTimeoutMs: 5_000, killGraceMs: 30 })
+    let termination: PiRpcTermination | null = null
+    proc.onTermination(info => {
+      termination = info
+    })
+
+    // How much of the record pi received is unknown, so the channel can no
+    // longer be framed: it is torn down instead of reused.
+    await assert.rejects(proc.getState(), PiRpcClosedError)
+    assert.deepEqual(mock.kills, ['SIGTERM'], `a failed stdin write (${mode}) terminates the child`)
+    await assert.rejects(proc.abort(), PiRpcClosedError)
+
+    mock.emit('close', 0, null)
+    await tick()
+    assert.equal(termination!.expected, false, 'the quarantine is reported as an unexpected fault')
+  }
+})
+
+test('PiRpcProcess: a failed fire-and-forget stdin write rejects and quarantines the channel', async () => {
+  const mock = new MockChild()
+  const failure = new Error('stdin closed')
+  mock.stdin.write = ((_chunk: unknown, cb?: (error?: Error | null) => void) => {
+    cb?.(failure)
+    return false
+  }) as unknown as typeof mock.stdin.write
+
+  const proc = PiRpcProcess.fromChild(asChild(mock), { killGraceMs: 30 })
+
+  await assert.rejects(proc.sendExtensionUiResponse({ id: 'ui-1', cancelled: true }), /stdin closed/)
+  assert.deepEqual(mock.kills, ['SIGTERM'])
   await assert.rejects(proc.getState(), PiRpcClosedError)
 })
 

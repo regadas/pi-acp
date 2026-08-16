@@ -70,28 +70,12 @@ const KILL_GRACE_MS = 2_000
 // pipe), force termination settlement so accepted prompts cannot hang.
 const CLOSE_FALLBACK_MS = 1_000
 const STDERR_TAIL_LIMIT = 8 * 1024
-// Human-readable prelude output is retained only as a bounded tail so a
-// misbehaving child cannot grow adapter memory without bound.
-const PRELUDE_TAIL_LIMIT = 64 * 1024
 
 type PiRpcProcessOptions = {
   requestTimeoutMs?: number
   killGraceMs?: number
   closeFallbackMs?: number
   maxStdoutRecordBytes?: number
-}
-
-const ESC = String.fromCharCode(0x1b)
-const CSI = String.fromCharCode(0x9b)
-
-const ANSI_ESCAPE_REGEX = new RegExp(
-  `[${ESC}${CSI}][[\\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]`,
-  'g'
-)
-
-function stripAnsi(s: string): string {
-  // Basic ANSI escape stripping (colors, cursor movement, etc.)
-  return s.replace(ANSI_ESCAPE_REGEX, '')
 }
 
 type PiRpcCommand =
@@ -113,9 +97,6 @@ type PiRpcCommand =
   | { type: 'get_session_stats'; id?: string }
   | { type: 'set_session_name'; id?: string; name: string }
   | { type: 'export_html'; id?: string; outputPath?: string }
-  | { type: 'switch_session'; id?: string; sessionPath: string }
-  // Messages
-  | { type: 'get_messages'; id?: string }
   | { type: 'get_tree'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
@@ -144,6 +125,14 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /**
+   * Called synchronously with the wrapper as soon as the OS child exists,
+   * which is before this spawn resolves. Owners take responsibility for
+   * terminating the child here so a teardown racing the spawn cannot miss it.
+   * A throwing hook fails the spawn with the child disposed, never leaving it
+   * alive and unowned.
+   */
+  onProcess?: (proc: PiRpcProcess) => void
 }
 
 type PendingEntry = {
@@ -158,8 +147,6 @@ export class PiRpcProcess {
   private readonly pending = new Map<string, PendingEntry>()
   private eventHandlers: Array<(ev: PiRpcEvent) => void> = []
   private terminationHandlers: Array<(t: PiRpcTermination) => void> = []
-  private readonly preludeLines: string[] = []
-  private preludeBytes = 0
   private readonly requestTimeoutMs?: number
   private readonly killGraceMs: number
   private readonly closeFallbackMs: number
@@ -232,21 +219,8 @@ export class PiRpcProcess {
     try {
       msg = JSON.parse(line)
     } catch {
-      // pi may emit a human-readable prelude on stdout before NDJSON starts.
-      // Capture a bounded tail so the ACP adapter can surface it on session
-      // start without letting a malformed-output flood grow memory unbounded.
-      const cleaned = stripAnsi(line).trimEnd()
-      if (cleaned) {
-        // Bound an individual line as well as the aggregate. Keep the newest
-        // tail because it usually contains the actionable diagnostic.
-        const retained = cleaned.slice(-PRELUDE_TAIL_LIMIT)
-        this.preludeLines.push(retained)
-        this.preludeBytes += retained.length
-        while (this.preludeLines.length > 1 && this.preludeBytes > PRELUDE_TAIL_LIMIT) {
-          const dropped = this.preludeLines.shift()
-          this.preludeBytes -= dropped?.length ?? 0
-        }
-      }
+      // Ignore human-readable startup output and malformed records without
+      // letting either break later NDJSON events.
       return
     }
 
@@ -406,6 +380,15 @@ export class PiRpcProcess {
     // event creates a window where the terminal event is lost.
     const proc = new PiRpcProcess(child)
 
+    // The OS child is alive now. Hand it to its owner before the first await
+    // so a shutdown starting inside this window still terminates it.
+    try {
+      params.onProcess?.(proc)
+    } catch (error) {
+      proc.dispose()
+      throw error
+    }
+
     // Ensure spawn failures (e.g. ENOENT when pi isn't installed) are surfaced as a
     // deterministic error instead of later EPIPE/internal-error noise.
     try {
@@ -483,6 +466,28 @@ export class PiRpcProcess {
     return this.stderrTailBuf
   }
 
+  /**
+   * Whether a request is still awaiting its correlated pi response. pi has no
+   * command that cancels in-flight RPC work (`abort` only stops an agent run,
+   * not a manual compaction/export), so callers that must settle promptly use
+   * this to decide whether the channel has to be quarantined.
+   */
+  hasPendingRequests(): boolean {
+    return this.pending.size > 0
+  }
+
+  /**
+   * Resolves once the child has actually terminated (immediately if it
+   * already has). Final adapter shutdown awaits this so the SIGTERM ->
+   * SIGKILL escalation in {@link dispose} can complete before process exit.
+   */
+  whenTerminated(): Promise<void> {
+    if (this.termination) return Promise.resolve()
+    return new Promise<void>(resolve => {
+      this.onTermination(() => resolve())
+    })
+  }
+
   dispose(options?: { expected?: boolean }): void {
     if (this.disposeRequested) return
     this.disposeRequested = true
@@ -508,16 +513,6 @@ export class PiRpcProcess {
     }, this.killGraceMs)
     timer.unref?.()
     this.killTimer = timer
-  }
-
-  /**
-   * Human-readable stdout lines emitted before RPC NDJSON begins (e.g. Context/Skills/Extensions info).
-   * Themes are typically noisy/less useful for ACP, so callers can filter as needed.
-   */
-  consumePreludeLines(): string[] {
-    const lines = this.preludeLines.splice(0, this.preludeLines.length)
-    this.preludeBytes = 0
-    return lines
   }
 
   async prompt(message: string, images: unknown[] = [], onAccepted?: () => void): Promise<void> {
@@ -609,21 +604,6 @@ export class PiRpcProcess {
     return { path: String(data?.path ?? '') }
   }
 
-  async switchSession(sessionPath: string): Promise<void> {
-    const res = await this.request({ type: 'switch_session', sessionPath })
-    if (!res.success) throw new Error(`pi switch_session failed: ${res.error ?? JSON.stringify(res.data)}`)
-  }
-
-  /**
-   * The callback runs synchronously at the response line boundary, before
-   * later stdout events can be dispatched from the same input chunk.
-   */
-  async getMessages(beforeResponseResolve?: () => void): Promise<unknown> {
-    const res = await this.request({ type: 'get_messages' }, { beforeResolve: beforeResponseResolve })
-    if (!res.success) throw new Error(`pi get_messages failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
-  }
-
   /**
    * The callback runs synchronously at the response line boundary, before
    * later stdout events can be dispatched from the same input chunk.
@@ -686,17 +666,26 @@ export class PiRpcProcess {
 
   private writeLine(line: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      const fail = (error: unknown) => {
+        // A failed stdin write leaves it unknown how much of the record pi
+        // received, so the channel can no longer be framed reliably.
+        // Quarantine it as an unexpected fault before rejecting: later
+        // requests must fail fast instead of running on a broken channel.
+        this.dispose({ expected: false })
+        reject(error)
+      }
+
       try {
         this.child.stdin.write(line, error => {
           if (error) {
-            reject(error)
+            fail(error)
             return
           }
 
           resolve()
         })
       } catch (error: unknown) {
-        reject(error)
+        fail(error)
       }
     })
   }
