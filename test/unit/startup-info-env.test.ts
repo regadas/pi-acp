@@ -4,7 +4,10 @@ import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpAgent, getCachedUpdateNoticeForTests, resetUpdateNoticeCacheForTests } from '../../src/acp/agent.js'
-import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, asAgentConn, fakeSessionConfigSync } from '../helpers/fakes.js'
+
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-startup-info-cwd-'))
 
 class FakeSessions {
   constructor(private readonly session: any) {}
@@ -27,7 +30,8 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
     let setStartupInfoCalled = false
     const session = {
       sessionId: 's1',
-      cwd: process.cwd(),
+      cwd: TEST_CWD,
+      ...fakeSessionConfigSync(),
       proc: {
         async getAvailableModels() {
           return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
@@ -58,7 +62,7 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
       deferred.push(task)
     }
 
-    const res = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+    const res = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] } as any)
 
     const startupInfo = res?._meta?.piAcp?.startupInfo ?? null
 
@@ -111,6 +115,7 @@ test('PiAcpAgent: startup info uses PI_CODING_AGENT_DIR for every global pi reso
   const session = {
     sessionId: 's-startup',
     cwd,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'model', name: 'Model' }] }

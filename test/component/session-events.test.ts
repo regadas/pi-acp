@@ -4,7 +4,11 @@ import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpSession } from '../../src/acp/session.js'
+import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
+
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-session-events-cwd-'))
 
 test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   const conn = new FakeAgentSideConnection()
@@ -12,7 +16,7 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -40,7 +44,7 @@ test('PiAcpSession: emits visible custom messages in-turn and omits hidden custo
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -97,7 +101,7 @@ test('PiAcpSession: buffers out-of-turn custom messages until the next prompt ex
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -149,7 +153,7 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -171,13 +175,125 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   })
 })
 
+test('PiAcpSession: synchronizes session info and thinking configuration events without duplicate updates', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.state = {
+    isStreaming: false,
+    thinkingLevel: 'high',
+    model: { provider: 'test', id: 'model', reasoning: true }
+  }
+
+  new PiAcpSession({
+    sessionId: 's1',
+    cwd: TEST_CWD,
+    mcpServers: [],
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'session_info_changed', name: 'Project session' })
+  proc.emit({ type: 'session_info_changed', name: 'Project session' })
+  proc.emit({ type: 'thinking_level_changed', level: 'high' })
+  proc.emit({ type: 'thinking_level_changed', level: 'high' })
+  await new Promise(r => setTimeout(r, 0))
+
+  const infoUpdates = conn.updates
+    .map(notification => notification.update)
+    .filter(update => update.sessionUpdate === 'session_info_update')
+  assert.equal(infoUpdates.length, 1)
+  assert.equal(infoUpdates[0]?.title, 'Project session')
+  assert.equal(typeof infoUpdates[0]?.updatedAt, 'string')
+
+  const modeUpdates = conn.updates
+    .map(notification => notification.update)
+    .filter(update => update.sessionUpdate === 'current_mode_update')
+  assert.deepEqual(modeUpdates, [{ sessionUpdate: 'current_mode_update', currentModeId: 'high' }])
+
+  const configUpdates = conn.updates
+    .map(notification => notification.update)
+    .filter(update => update.sessionUpdate === 'config_option_update')
+  assert.equal(configUpdates.length, 1)
+  assert.deepEqual(
+    configUpdates[0]?.configOptions.map(option => [option.id, option.currentValue]),
+    [
+      ['model', 'test/model'],
+      ['thought_level', 'high']
+    ]
+  )
+
+  proc.emit({ type: 'session_info_changed', name: undefined })
+  proc.emit({ type: 'session_info_changed', name: undefined })
+  proc.emit({ type: 'thinking_level_changed', level: 'high' })
+  await new Promise(r => setTimeout(r, 0))
+
+  const finalInfoUpdates = conn.updates
+    .map(notification => notification.update)
+    .filter(update => update.sessionUpdate === 'session_info_update')
+  assert.equal(finalInfoUpdates.length, 2)
+  assert.equal(finalInfoUpdates[1]?.title, null)
+  assert.equal(
+    conn.updates.filter(notification => notification.update.sessionUpdate === 'config_option_update').length,
+    1
+  )
+})
+
+test('PiAcpSession: coalesces thinking events produced by ACP configuration mutations', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.state = {
+    isStreaming: false,
+    thinkingLevel: 'high',
+    model: { provider: 'test', id: 'model', reasoning: true }
+  }
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: TEST_CWD,
+    mcpServers: [],
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  proc.emit({ type: 'thinking_level_changed', level: 'high' })
+  await new Promise(r => setTimeout(r, 0))
+  const initialConfigUpdate = conn.updates
+    .map(notification => notification.update)
+    .find(update => update.sessionUpdate === 'config_option_update')
+  assert.ok(initialConfigUpdate)
+  conn.updates.length = 0
+
+  const lowConfigOptions = initialConfigUpdate.configOptions.map(option =>
+    option.id === 'thought_level' && option.type === 'select' ? { ...option, currentValue: 'low' } : option
+  )
+  session.beginConfigurationMutation()
+  proc.state = { ...proc.state, thinkingLevel: 'low' }
+  proc.emit({ type: 'thinking_level_changed', level: 'low' })
+  await session.sendSessionUpdate({
+    sessionId: 's1',
+    update: { sessionUpdate: 'current_mode_update', currentModeId: 'low' }
+  })
+  await session.sendSessionUpdate({
+    sessionId: 's1',
+    update: { sessionUpdate: 'config_option_update', configOptions: lowConfigOptions }
+  })
+  session.seedSessionConfiguration(lowConfigOptions, 'low')
+  await session.endConfigurationMutation()
+
+  assert.deepEqual(
+    conn.updates.map(notification => notification.update.sessionUpdate),
+    ['current_mode_update', 'config_option_update']
+  )
+})
+
 test('PiAcpSession: emits tool_call + tool_call_update + completes', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -211,7 +327,7 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[0]!.update as any).locations, undefined)
   assert.deepEqual((conn.updates[0]!.update as any).content, [{ type: 'terminal', terminalId: 't1' }])
   assert.deepEqual((conn.updates[0]!.update as any)._meta, {
-    terminal_info: { terminal_id: 't1', cwd: process.cwd() }
+    terminal_info: { terminal_id: 't1', cwd: TEST_CWD }
   })
   assert.equal((conn.updates[0]!.update as any).rawInput, undefined)
 
@@ -235,13 +351,221 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   assert.equal((conn.updates[2]!.update as any).rawOutput, undefined)
 })
 
+test('PiAcpSession: synthesizes starts before prompt-owned completion-only tool events', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: TEST_CWD,
+    mcpServers: [],
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    supportsTerminalOutputMeta: true
+  })
+
+  const prompt = session.prompt('run tools')
+  proc.emit({ type: 'agent_start' })
+  const readResult = { content: [{ type: 'text', text: 'file contents' }] }
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'missing-read-start',
+    toolName: 'read',
+    isError: false,
+    result: readResult
+  })
+  proc.emit({
+    type: 'tool_execution_end',
+    toolCallId: 'missing-bash-start',
+    toolName: 'bash',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'done' }] }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await prompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+
+  const updates = conn.updates
+    .map(notification => notification.update)
+    .filter(update => update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
+  assert.deepEqual(updates, [
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'missing-read-start',
+      title: 'read',
+      kind: 'read',
+      status: 'in_progress'
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'missing-read-start',
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: 'file contents' } }],
+      rawOutput: readResult
+    },
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'missing-bash-start',
+      title: 'bash',
+      kind: 'execute',
+      status: 'in_progress',
+      locations: undefined,
+      content: [{ type: 'terminal', terminalId: 'missing-bash-start' }],
+      _meta: { terminal_info: { terminal_id: 'missing-bash-start', cwd: TEST_CWD } }
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'missing-bash-start',
+      status: 'completed',
+      _meta: {
+        terminal_output: { terminal_id: 'missing-bash-start', data: 'done' },
+        terminal_exit: { terminal_id: 'missing-bash-start', exit_code: 0, signal: null }
+      }
+    }
+  ])
+})
+
+test('PiAcpSession: synthesizes starts for progress-only tool events and keeps subagent partials hidden', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: TEST_CWD,
+    mcpServers: [],
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn),
+    fileCommands: [],
+    supportsTerminalOutputMeta: true
+  })
+
+  const prompt = session.prompt('run tools')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'missing-read-start',
+    toolName: 'read',
+    args: { path: 'notes.md' },
+    partialResult: { content: [{ type: 'text', text: 'partial' }] }
+  })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'missing-bash-start',
+    toolName: 'bash',
+    args: { command: 'ls' },
+    partialResult: { content: [{ type: 'text', text: 'streaming' }] }
+  })
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'missing-subagent-start',
+    toolName: 'subagent',
+    args: { prompt: 'investigate' },
+    partialResult: { content: [{ type: 'text', text: 'inner reasoning' }] }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await prompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+
+  const updates = conn.updates
+    .map(notification => notification.update)
+    .filter(update => update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
+  assert.deepEqual(updates, [
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'missing-read-start',
+      title: 'read',
+      kind: 'read',
+      status: 'in_progress',
+      rawInput: { path: 'notes.md' }
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'missing-read-start',
+      status: 'in_progress',
+      content: [{ type: 'content', content: { type: 'text', text: 'partial' } }],
+      rawOutput: { content: [{ type: 'text', text: 'partial' }] }
+    },
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'missing-bash-start',
+      title: 'ls',
+      kind: 'execute',
+      status: 'in_progress',
+      locations: undefined,
+      content: [{ type: 'terminal', terminalId: 'missing-bash-start' }],
+      _meta: { terminal_info: { terminal_id: 'missing-bash-start', cwd: TEST_CWD } }
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'missing-bash-start',
+      status: 'in_progress',
+      _meta: { terminal_output: { terminal_id: 'missing-bash-start', data: 'streaming' } }
+    },
+    {
+      // The subagent's own transcript stays hidden, but the card still exists.
+      sessionUpdate: 'tool_call',
+      toolCallId: 'missing-subagent-start',
+      title: 'subagent',
+      kind: 'other',
+      status: 'in_progress',
+      rawInput: { prompt: 'investigate' }
+    }
+  ])
+})
+
+test('PiAcpSession: a duplicate tool_execution_end does not resurrect a completed tool call', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: TEST_CWD,
+    mcpServers: [],
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn),
+    fileCommands: []
+  })
+
+  const prompt = session.prompt('run tools')
+  proc.emit({ type: 'agent_start' })
+  const end = {
+    type: 'tool_execution_end',
+    toolCallId: 'call-1',
+    toolName: 'read',
+    isError: false,
+    result: { content: [{ type: 'text', text: 'file contents' }] }
+  }
+  proc.emit({ type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'read', args: { path: 'notes.md' } })
+  proc.emit(end)
+  proc.emit(end)
+  proc.emit({
+    type: 'tool_execution_update',
+    toolCallId: 'call-1',
+    toolName: 'read',
+    partialResult: { content: [{ type: 'text', text: 'late partial' }] }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await prompt, 'end_turn')
+  await new Promise(r => setTimeout(r, 0))
+
+  const kinds = conn.updates
+    .map(notification => notification.update)
+    .filter(update => update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update')
+    .map(update => [update.sessionUpdate, (update as { status?: string }).status])
+  assert.deepEqual(kinds, [
+    ['tool_call', 'in_progress'],
+    ['tool_call_update', 'completed']
+  ])
+})
+
 test('PiAcpSession: bash output falls back to standard content without terminal_output negotiation', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -292,7 +616,7 @@ test('PiAcpSession: suppresses cumulative subagent progress snapshots but preser
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -348,7 +672,7 @@ test('PiAcpSession: suppresses streamed subagent argument deltas but preserves b
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -411,7 +735,7 @@ test('PiAcpSession: preserves tool-result image content in live tool_call_update
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -448,7 +772,7 @@ test('PiAcpSession: preserves interleaved and image-only tool-result order in li
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -500,7 +824,7 @@ test('PiAcpSession: emits custom-message image blocks in order during an active 
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -539,7 +863,7 @@ test('PiAcpSession: flushes idle custom-message image blocks in order on the nex
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -585,7 +909,7 @@ test('PiAcpSession: retains bash tool-result image blocks for generic clients', 
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -621,7 +945,7 @@ test('PiAcpSession: retains bash tool-result image blocks alongside negotiated t
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -658,11 +982,14 @@ test('PiAcpSession: retains bash tool-result image blocks alongside negotiated t
 test('PiAcpSession: emits existing file locations for built-in and custom tools', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-file-location-'))
+  mkdirSync(join(cwd, 'src', 'acp'), { recursive: true })
+  writeFileSync(join(cwd, 'src', 'acp', 'session.ts'), 'export {}\n', 'utf8')
   const args = { path: 'src/acp/session.ts' }
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -676,8 +1003,8 @@ test('PiAcpSession: emits existing file locations for built-in and custom tools'
 
   assert.equal(conn.updates.length, 2)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
-  assert.deepEqual((conn.updates[1]!.update as any).locations, [{ path: `${process.cwd()}/src/acp/session.ts` }])
+  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: join(cwd, 'src', 'acp', 'session.ts') }])
+  assert.deepEqual((conn.updates[1]!.update as any).locations, [{ path: join(cwd, 'src', 'acp', 'session.ts') }])
 })
 
 test('PiAcpSession: omits directory tool locations', async () => {
@@ -787,7 +1114,7 @@ test('PiAcpSession: handles extension select via ACP permission request', async 
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -829,7 +1156,7 @@ test('PiAcpSession: handles extension confirm via ACP permission request', async
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -861,7 +1188,7 @@ test('PiAcpSession: sends cancelled response when ACP confirm is cancelled', asy
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -881,7 +1208,7 @@ test('PiAcpSession: cancels unsupported input and editor extension UI requests w
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -908,7 +1235,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -932,7 +1259,7 @@ test('PiAcpSession: formats a positive sub-second auto_retry_start delay as wait
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -956,7 +1283,7 @@ test('PiAcpSession: falls back to a generic retry message when auto_retry_start 
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -980,7 +1307,7 @@ test('PiAcpSession: omits raw errorMessage content from surfaced auto_retry_star
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1009,7 +1336,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1033,7 +1360,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async 
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1057,7 +1384,7 @@ test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async ()
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1084,7 +1411,7 @@ test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with
 
   new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1289,7 +1616,7 @@ test('PiAcpSession: prompt resolves end_turn only at agent_settled, not agent_en
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1322,7 +1649,7 @@ test('PiAcpSession: emits startup info once, in-turn, on the first prompt only',
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1375,7 +1702,7 @@ test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1400,7 +1727,7 @@ test('PiAcpSession: queues concurrent prompt and starts it only after agent_sett
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1444,7 +1771,7 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
@@ -1475,7 +1802,7 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
 
   const session = new PiAcpSession({
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),

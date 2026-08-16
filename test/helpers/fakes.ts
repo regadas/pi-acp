@@ -1,8 +1,45 @@
-import type { SessionNotification } from '@agentclientprotocol/sdk'
+import type { SessionConfigOption, SessionNotification } from '@agentclientprotocol/sdk'
 import type { AcpClient } from '../../src/acp/client.js'
 import type { PiRpcEvent, PiRpcTermination } from '../../src/pi-rpc/process.js'
 
 type SessionUpdateMsg = SessionNotification
+
+export type ConfigSyncRecord = {
+  seeds: Array<{ configOptions: SessionConfigOption[]; currentModeId: string | undefined }>
+  beginCalls: number
+  endCalls: number
+}
+
+/**
+ * PiAcpSession's configuration-sync and publication surface. PiAcpAgent calls
+ * both unconditionally, so session doubles must implement them (and can assert
+ * on `configSync`) instead of letting the calls be skipped. `updateSink`
+ * stands in for the session's ordered delivery queue.
+ */
+export function fakeSessionConfigSync(updateSink?: FakeAgentSideConnection) {
+  const configSync: ConfigSyncRecord = { seeds: [], beginCalls: 0, endCalls: 0 }
+  return {
+    configSync,
+    updateSink: updateSink ?? null,
+    // Reads `this` so doubles built by spreading can wire `updateSink` later.
+    async sendSessionUpdate(
+      this: { updateSink: FakeAgentSideConnection | null },
+      params: SessionUpdateMsg
+    ): Promise<void> {
+      if (!this.updateSink) throw new Error('fakeSessionConfigSync: no updateSink connected')
+      await this.updateSink.sessionUpdate(params)
+    },
+    seedSessionConfiguration(configOptions: SessionConfigOption[], currentModeId?: string): void {
+      configSync.seeds.push({ configOptions, currentModeId })
+    },
+    beginConfigurationMutation(): void {
+      configSync.beginCalls += 1
+    },
+    async endConfigurationMutation(): Promise<void> {
+      configSync.endCalls += 1
+    }
+  }
+}
 
 export class FakeAgentSideConnection {
   readonly updates: SessionUpdateMsg[] = []
@@ -95,6 +132,22 @@ export class FakePiRpcProcess {
 
   async getState(): Promise<any> {
     return this.state
+  }
+
+  readonly thinkingLevels: string[] = []
+  readonly models: Array<{ provider: string; modelId: string }> = []
+  // Optional hook so tests can model pi echoing its own state-change events.
+  afterThinkingLevelSet: ((level: string) => void) | null = null
+
+  async setThinkingLevel(level: string): Promise<void> {
+    this.thinkingLevels.push(level)
+    this.state = { ...this.state, thinkingLevel: level }
+    this.afterThinkingLevelSet?.(level)
+  }
+
+  async setModel(provider: string, modelId: string): Promise<void> {
+    this.models.push({ provider, modelId })
+    this.state = { ...this.state, model: { provider, id: modelId, reasoning: true } }
   }
 
   async getAvailableModels(): Promise<any> {

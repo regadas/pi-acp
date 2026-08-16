@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
-import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, asAgentConn, fakeSessionConfigSync } from '../helpers/fakes.js'
 
 class FakeSessions {
   restoredSession: any = null
@@ -140,7 +140,8 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
   const sessions = new FakeSessions((sessionId, params) => ({
     sessionId,
     cwd: params.cwd,
-    proc: params.proc
+    proc: params.proc,
+    ...fakeSessionConfigSync(conn)
   }))
 
   const originalSpawn = PiRpcProcess.spawn

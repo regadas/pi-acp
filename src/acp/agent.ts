@@ -667,6 +667,7 @@ export class PiAcpAgent implements ACPAgent {
       state,
       availableModels
     })
+    session.seedSessionConfiguration(configOptions, modes.currentModeId)
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -890,14 +891,7 @@ export class PiAcpAgent implements ACPAgent {
           return { stopReason: 'end_turn' }
         }
 
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'session_info_update',
-            title: name,
-            updatedAt: new Date().toISOString()
-          }
-        })
+        await session.syncSessionInfo(name)
 
         await session.sendSessionUpdate({
           sessionId: session.sessionId,
@@ -1651,6 +1645,7 @@ export class PiAcpAgent implements ACPAgent {
 
         const { configOptions, modes } = await getSessionConfiguration(proc)
         this.assertLoadActive(params.sessionId, generation)
+        session.seedSessionConfiguration(configOptions, modes.currentModeId)
 
         const response = {
           configOptions,
@@ -1712,10 +1707,11 @@ export class PiAcpAgent implements ACPAgent {
 
     // Unlike session/load, resume MUST NOT replay conversation history.
     const { configOptions, modes } = await getSessionConfiguration(session.proc)
+    session.seedSessionConfiguration(configOptions, modes.currentModeId)
 
     this.advertiseCommandsSoon(session, {
-      fileCommands: loadSlashCommands(params.cwd),
-      enableSkillCommands: getEnableSkillCommands(params.cwd)
+      fileCommands: loadSlashCommands(cwd),
+      enableSkillCommands: getEnableSkillCommands(cwd)
     })
 
     const response = {
@@ -1854,20 +1850,29 @@ export class PiAcpAgent implements ACPAgent {
     // unknown sessions.
     await this.runExclusiveConfigMutation(params.sessionId, async () => {
       const session = await this.restoreSessionAwaitingLoads(params.sessionId)
-      if (!isThinkingLevel(mode)) {
-        throw RequestError.invalidParams({}, `Unknown modeId: ${mode}`)
-      }
-      const state = await applyThinkingLevel(session.proc, mode)
-
-      await this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'current_mode_update',
-          currentModeId: mode
+      session.beginConfigurationMutation()
+      try {
+        if (!isThinkingLevel(mode)) {
+          throw RequestError.invalidParams({}, `Unknown modeId: ${mode}`)
         }
-      })
+        const state = await applyThinkingLevel(session.proc, mode)
 
-      await emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, { state })
+        // Publish through the session queue: an event-driven sync may already
+        // have a stale update in flight, and only shared ordering guarantees
+        // this mutation's state is the last one on the wire.
+        await session.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'current_mode_update',
+            currentModeId: mode
+          }
+        })
+
+        const configOptions = await emitConfigOptionsUpdate(session, session.sessionId, session.proc, { state })
+        session.seedSessionConfiguration(configOptions, mode)
+      } finally {
+        await session.endConfigurationMutation()
+      }
     })
 
     return {}
@@ -1893,20 +1898,29 @@ export class PiAcpAgent implements ACPAgent {
     // before this one's updates are delivered.
     const configOptions = await this.runExclusiveConfigMutation(params.sessionId, async () => {
       const session = await this.restoreSessionAwaitingLoads(params.sessionId)
-      if (configId === MODEL_CONFIG_ID) {
-        const state = await applySessionModel(session.proc, value)
-        return emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, { state })
-      }
-
-      const state = await applyThinkingLevel(session.proc, value as ThinkingLevel)
-      await this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'current_mode_update',
-          currentModeId: value
+      session.beginConfigurationMutation()
+      try {
+        if (configId === MODEL_CONFIG_ID) {
+          const state = await applySessionModel(session.proc, value)
+          const options = await emitConfigOptionsUpdate(session, session.sessionId, session.proc, { state })
+          session.seedSessionConfiguration(options)
+          return options
         }
-      })
-      return emitConfigOptionsUpdate(this.conn, session.sessionId, session.proc, { state })
+
+        const state = await applyThinkingLevel(session.proc, value as ThinkingLevel)
+        await session.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'current_mode_update',
+            currentModeId: value
+          }
+        })
+        const options = await emitConfigOptionsUpdate(session, session.sessionId, session.proc, { state })
+        session.seedSessionConfiguration(options, value)
+        return options
+      } finally {
+        await session.endConfigurationMutation()
+      }
     })
     return { configOptions }
   }

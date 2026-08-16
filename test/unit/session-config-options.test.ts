@@ -1,7 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
-import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, asAgentConn, fakeSessionConfigSync } from '../helpers/fakes.js'
+
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-config-options-'))
 
 class FakeSessions {
   constructor(private readonly session: any) {}
@@ -28,7 +34,8 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
     const conn = new FakeAgentSideConnection()
     const session = {
       sessionId: 's1',
-      cwd: process.cwd(),
+      cwd: TEST_CWD,
+      ...fakeSessionConfigSync(conn),
       proc: {
         async getAvailableModels() {
           return {
@@ -54,7 +61,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
     // Local seam: swallow deferred notifications instead of patching timers.
     ;(agent as any).scheduleDeferred = () => {}
 
-    const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+    const result = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] } as any)
 
     // Model state is exposed only through standard configOptions; the legacy
     // custom root `models` field is gone.
@@ -105,7 +112,8 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
 
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(conn),
     proc: {
       async getAvailableModels() {
         return {
@@ -157,7 +165,8 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
 
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(conn),
     proc: {
       async getAvailableModels() {
         return {
@@ -208,7 +217,8 @@ test('PiAcpAgent: setSessionConfigOption rejects thinking levels the current mod
   const thinkingLevels: string[] = []
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(conn),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -257,7 +267,8 @@ test('PiAcpAgent: setSessionConfigOption accepts max on a Kimi-like max-only mod
   }
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(conn),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'kimi', id: 'k3', name: 'K3' }] }
@@ -294,7 +305,8 @@ test('PiAcpAgent: model switch refreshes advertised thinking levels for the new 
   }
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(conn),
     proc: {
       async getAvailableModels() {
         return {

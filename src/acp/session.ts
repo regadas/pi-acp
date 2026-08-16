@@ -3,6 +3,7 @@ import type {
   ContentBlock,
   McpServer,
   PermissionOption,
+  SessionConfigOption,
   SessionUpdate,
   ToolCallContent,
   ToolCallLocation
@@ -28,6 +29,8 @@ import {
 } from './translate/bash.js'
 import { translateCustomMessageContent, type TranslatedUserBlock } from './translate/pi-messages.js'
 import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
+import { getSessionConfiguration, THOUGHT_LEVEL_CONFIG_ID } from './session-config.js'
+import { isThinkingLevel } from './thinking-levels.js'
 import {
   findUniqueLineNumber,
   getEditOldTexts,
@@ -126,6 +129,16 @@ export class PiAcpSession {
   private activeAdapterPromptTurns = 0
   private customMessageSequence = 0
   private readonly pendingCustomMessages: PendingCustomMessage[] = []
+  private publishedTitle: string | null | undefined
+  private sessionInfoSyncTail: Promise<void> = Promise.resolve()
+  private publishedModeId: string | undefined
+  private publishedConfigFingerprint: string | undefined
+  private publishedConfigModeId: string | undefined
+  private publishedConfigOptions: SessionConfigOption[] = []
+  private configurationSyncTail: Promise<void> = Promise.resolve()
+  private configurationMutationDepth = 0
+  private configurationEpoch = 0
+  private deferredThinkingLevel: string | undefined
 
   readonly proc: PiRpcProcess
   private readonly conn: AcpClient
@@ -148,6 +161,8 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  // Tool calls already reported as completed/failed in the current turn.
+  private readonly settledToolCallIds = new Set<string>()
 
   // pi can emit multiple `turn_end` and `agent_end` events for a single user
   // prompt: `turn_end` closes one assistant/tool exchange, and `agent_end`
@@ -539,6 +554,107 @@ export class PiAcpSession {
     return this.enqueueUpdate(params.update)
   }
 
+  syncSessionInfo(name: string | undefined): Promise<void> {
+    const title = name ?? null
+    const operation = this.sessionInfoSyncTail.then(async () => {
+      if (this.disposed) return
+      if (this.publishedTitle === title) return this.flushEmits()
+
+      await this.enqueueUpdate({
+        sessionUpdate: 'session_info_update',
+        title,
+        updatedAt: new Date().toISOString()
+      })
+      this.publishedTitle = title
+    })
+    this.sessionInfoSyncTail = operation.catch(() => {})
+    return operation
+  }
+
+  // An ACP-driven publication is authoritative: bumping the epoch discards
+  // every configuration probe requested or read before this state.
+  seedSessionConfiguration(configOptions: SessionConfigOption[], currentModeId?: string): void {
+    this.configurationEpoch += 1
+    this.applyPublishedConfiguration(configOptions, currentModeId)
+  }
+
+  private applyPublishedConfiguration(configOptions: SessionConfigOption[], currentModeId?: string): void {
+    this.publishedConfigOptions = configOptions
+    this.publishedConfigFingerprint = JSON.stringify(configOptions)
+    const thoughtOption = configOptions.find(option => option.id === THOUGHT_LEVEL_CONFIG_ID)
+    this.publishedConfigModeId =
+      thoughtOption && typeof thoughtOption.currentValue === 'string' ? thoughtOption.currentValue : undefined
+    if (currentModeId !== undefined) this.publishedModeId = currentModeId
+  }
+
+  // Pi echoes ACP thinking mutations as events; hold that echo until the
+  // request's direct mode/config publications have seeded the de-duplication state.
+  beginConfigurationMutation(): void {
+    this.configurationMutationDepth += 1
+    this.configurationEpoch += 1
+  }
+
+  async endConfigurationMutation(): Promise<void> {
+    if (this.configurationMutationDepth === 0) return
+    this.configurationMutationDepth -= 1
+    if (this.configurationMutationDepth > 0 || this.deferredThinkingLevel === undefined) return
+
+    const level = this.deferredThinkingLevel
+    this.deferredThinkingLevel = undefined
+    await this.syncSessionConfiguration(undefined, level).catch(() => {})
+  }
+
+  syncSessionConfiguration(pre?: { state?: unknown }, expectedModeId?: string): Promise<SessionConfigOption[]> {
+    // Captured at invocation rather than inside the queued callback: a probe
+    // requested before an ACP mutation must be discarded even when it only
+    // starts (and therefore reads pi) after that mutation bumped the epoch.
+    // Publishing such an answer would resurrect the pre-mutation configuration.
+    const epoch = this.configurationEpoch
+    const operation = this.configurationSyncTail.then(async () => {
+      if (this.disposed || this.configurationEpoch !== epoch) return this.publishedConfigOptions
+      if (
+        expectedModeId !== undefined &&
+        this.publishedModeId === expectedModeId &&
+        this.publishedConfigModeId === expectedModeId &&
+        this.publishedConfigFingerprint !== undefined
+      ) {
+        return this.publishedConfigOptions
+      }
+
+      const { configOptions, modes } = await getSessionConfiguration(this.proc, pre)
+      if (this.disposed || this.configurationEpoch !== epoch) return this.publishedConfigOptions
+      const fingerprint = JSON.stringify(configOptions)
+
+      if (this.publishedModeId !== modes.currentModeId) {
+        await this.enqueueUpdate({
+          sessionUpdate: 'current_mode_update',
+          currentModeId: modes.currentModeId
+        })
+        if (this.configurationEpoch !== epoch) return this.publishedConfigOptions
+        this.publishedModeId = modes.currentModeId
+      }
+
+      if (this.publishedConfigFingerprint !== fingerprint) {
+        await this.enqueueUpdate({
+          sessionUpdate: 'config_option_update',
+          configOptions
+        })
+        if (this.configurationEpoch !== epoch) return this.publishedConfigOptions
+        // A sync's own publication is not an ACP mutation: it must not
+        // invalidate probes that were already requested by later pi events.
+        this.applyPublishedConfiguration(configOptions)
+      }
+
+      return configOptions
+    })
+
+    this.configurationSyncTail = operation.then(
+      () => undefined,
+      () => undefined
+    )
+    return operation
+  }
+
   private async flushEmits(): Promise<void> {
     await this.lastEmit
   }
@@ -613,7 +729,47 @@ export class PiAcpSession {
     })
   }
 
+  /**
+   * Pi can report progress or completion for a tool whose start event was
+   * never observed. ACP requires a `tool_call` before any update for that id,
+   * so synthesize one from the reporting event. Returns false once the call
+   * settled so a duplicate or late event cannot resurrect a finished card.
+   */
+  private ensureToolCallStarted(toolCallId: string, toolName: string, args: unknown): boolean {
+    if (this.settledToolCallIds.has(toolCallId)) return false
+    if (this.currentToolCalls.has(toolCallId)) return true
+
+    this.currentToolCalls.set(toolCallId, 'in_progress')
+    const locations = toToolCallLocations(toolName, args, this.cwd)
+
+    if (isBashTool(toolName)) {
+      this.emitBashToolCall({
+        sessionUpdate: 'tool_call',
+        toolCallId,
+        toolName,
+        args,
+        status: 'in_progress',
+        locations,
+        includeTerminal: true
+      })
+      return true
+    }
+
+    if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
+    this.emit({
+      sessionUpdate: 'tool_call',
+      toolCallId,
+      title: toolName,
+      kind: toToolKind(toolName),
+      status: 'in_progress',
+      ...(locations ? { locations } : {}),
+      ...(args === undefined ? {} : { rawInput: args })
+    })
+    return true
+  }
+
   private cleanupToolCall(toolCallId: string): void {
+    this.settledToolCallIds.add(toolCallId)
     this.currentToolCalls.delete(toolCallId)
     this.fileSnapshots.delete(toolCallId)
     this.fileMutationToolCallIds.delete(toolCallId)
@@ -623,6 +779,7 @@ export class PiAcpSession {
   }
 
   private startTurn(t: QueuedTurn): void {
+    this.settledToolCallIds.clear()
     this.cancelRequested = false
     this.agentRunObserved = false
     this.lastDoneReason = null
@@ -999,6 +1156,24 @@ export class PiAcpSession {
     if (PI_TURN_BOUND_EVENT_TYPES.has(type) && suppressUnownedPiOutput) return
 
     switch (type) {
+      case 'session_info_changed': {
+        const name = ev.name
+        if (name !== undefined && typeof name !== 'string') break
+        void this.syncSessionInfo(name).catch(() => {})
+        break
+      }
+
+      case 'thinking_level_changed': {
+        const level = ev.level
+        if (typeof level !== 'string' || !isThinkingLevel(level)) break
+        if (this.configurationMutationDepth > 0) {
+          this.deferredThinkingLevel = level
+          break
+        }
+        void this.syncSessionConfiguration(undefined, level).catch(() => {})
+        break
+      }
+
       case 'message_update': {
         const ame = (ev as any).assistantMessageEvent
 
@@ -1235,6 +1410,7 @@ export class PiAcpSession {
       case 'tool_execution_update': {
         const toolCallId = String((ev as any).toolCallId ?? '')
         if (!toolCallId) break
+        if (!this.ensureToolCallStarted(toolCallId, String((ev as any).toolName ?? 'tool'), (ev as any).args)) break
 
         const partial = (ev as any).partialResult
         if (this.bashToolCallIds.has(toolCallId)) {
@@ -1258,6 +1434,9 @@ export class PiAcpSession {
       case 'tool_execution_end': {
         const toolCallId = String((ev as any).toolCallId ?? '')
         if (!toolCallId) break
+
+        const toolName = String(ev.toolName ?? 'tool')
+        if (!this.ensureToolCallStarted(toolCallId, toolName, (ev as any).args)) break
 
         const result = (ev as any).result
         const isError = Boolean((ev as any).isError)

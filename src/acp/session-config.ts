@@ -254,15 +254,24 @@ async function getModelState(
   }
 }
 
+/**
+ * Narrow publication sink. PiAcpSession implements it and serializes every
+ * update behind one delivery queue, so mutation publications and event-driven
+ * syncs share a single total order instead of racing on the raw connection.
+ */
+export type SessionUpdateSink = {
+  sendSessionUpdate(params: Parameters<AcpClient['sessionUpdate']>[0]): Promise<void>
+}
+
 export async function emitConfigOptionsUpdate(
-  conn: AcpClient,
+  sink: SessionUpdateSink,
   sessionId: string,
   proc: PiRpcProcess,
   pre?: { state?: any | null }
 ): Promise<SessionConfigOption[]> {
   const { configOptions } = await getSessionConfiguration(proc, pre)
 
-  await conn.sessionUpdate({
+  await sink.sendSessionUpdate({
     sessionId,
     update: {
       sessionUpdate: 'config_option_update',

@@ -1,7 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
-import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, asAgentConn, fakeSessionConfigSync } from '../helpers/fakes.js'
+
+// Isolated workspace: repository-local .pi settings/commands must not leak in.
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-config-mutations-'))
 
 class FakeSessions {
   constructor(private readonly session: any) {}
@@ -23,6 +29,8 @@ class FakeSessions {
 
 function makeAgent(session: any) {
   const conn = new FakeAgentSideConnection()
+  // Mutation publications flow through the session's ordered queue.
+  session.updateSink = conn
   const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
   ;(agent as any).sessions = new FakeSessions(session) as any
   return { agent, conn }
@@ -32,7 +40,8 @@ test('setSessionConfigOption: fails closed when thinking-level support cannot be
   const thinkingLevels: string[] = []
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -64,7 +73,8 @@ test('setSessionConfigOption: rejects when the post-write probe fails after set_
   const thinkingLevels: string[] = []
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -96,7 +106,8 @@ test('setSessionConfigOption: rejects when the post-write probe fails after set_
 test('setSessionConfigOption: rejects when pi clamps the requested thinking level', async () => {
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -124,7 +135,8 @@ test('setSessionConfigOption: rejects when pi clamps the requested thinking leve
 test('setSessionMode: rejects clamped writes through the same verified path', async () => {
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -147,7 +159,8 @@ test('setSessionMode: rejects clamped writes through the same verified path', as
 test('setSessionConfigOption: rejects when pi does not apply the requested model', async () => {
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return {
@@ -193,7 +206,8 @@ test('setSessionConfigOption: serializes concurrent mutations (write then verify
 
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -238,7 +252,8 @@ test('setSessionConfigOption: serializes concurrent mutations (write then verify
 test('newSession: unknown model state advertises only the conservative off level with a valid currentValue', async () => {
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -254,7 +269,7 @@ test('newSession: unknown model state advertises only the conservative off level
   // Local seam: swallow deferred notifications instead of patching timers.
   ;(agent as any).scheduleDeferred = () => {}
 
-  const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+  const result = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] } as any)
   const thought = result.configOptions.find(option => option.id === 'thought_level') as any
   assert.deepEqual(
     thought?.options.map((o: any) => o.value),
@@ -268,7 +283,8 @@ test('newSession: unknown model state advertises only the conservative off level
 test('newSession: non-reasoning models advertise only off with a valid currentValue', async () => {
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'plain', name: 'Plain' }] }
@@ -283,7 +299,7 @@ test('newSession: non-reasoning models advertise only off with a valid currentVa
   const { agent } = makeAgent(session)
   ;(agent as any).scheduleDeferred = () => {}
 
-  const result = await agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+  const result = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] } as any)
   const thought = result.configOptions.find(option => option.id === 'thought_level') as any
   assert.deepEqual(
     thought?.options.map((o: any) => o.value),
@@ -307,7 +323,8 @@ test('config mutations serialize publication: a second write waits for the first
 
   const session = {
     sessionId: 's1',
-    cwd: process.cwd(),
+    cwd: TEST_CWD,
+    ...fakeSessionConfigSync(),
     proc: {
       async getAvailableModels() {
         return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
