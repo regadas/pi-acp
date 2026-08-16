@@ -4,9 +4,9 @@
 
 It translates ACP JSON-RPC 2.0 messages over stdio into commands for `pi --mode rpc`. It then streams pi events back to the client.
 
-This repository is maintained by [Filipe Regadas](https://github.com/regadas). It began as a fork of [svkozak/pi-acp](https://github.com/svkozak/pi-acp) and retains that project's Git history and MIT attribution.
+`pi-acp` is an independent fork of [svkozak/pi-acp](https://github.com/svkozak/pi-acp). It retains the original project's Git history and MIT attribution.
 
-This project is independent of the original project and the unscoped `pi-acp` npm package. A future release will use the package name `@regadas/pi-acp`. The package is not published yet.
+The project is separate from the original repository and the unscoped `pi-acp` npm package. Future releases will use the scoped package name `@regadas/pi-acp`. The package is not published yet.
 
 ## Status
 
