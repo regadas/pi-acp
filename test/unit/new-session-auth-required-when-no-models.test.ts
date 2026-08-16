@@ -34,7 +34,7 @@ test('PiAcpAgent: newSession throws AUTH_REQUIRED when pi reports zero available
   }
 
   const sessions = new FakeSessions(session)
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = sessions as any
 
   let threw = false

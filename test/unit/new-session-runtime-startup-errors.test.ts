@@ -56,7 +56,7 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
   const sessions = new FakeSessions(session)
   const store = new SessionStore(sessionMapPath)
   store.upsert({ sessionId: 's-auth', cwd: process.cwd(), sessionFile })
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = sessions as any
   ;(agent as any).store = store as any
 
@@ -87,7 +87,7 @@ test('PiAcpAgent: newSession returns Internal error on non-auth model probe fail
   }
 
   const sessions = new FakeSessions(session)
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = sessions as any
 
   await assert.rejects(
@@ -96,4 +96,48 @@ test('PiAcpAgent: newSession returns Internal error on non-auth model probe fail
   )
 
   assert.deepEqual(sessions.closeCalls, ['s-internal'])
+})
+
+test('PiAcpAgent: failed-session cleanup unlinks only the trusted store path, never a pi-reported one', async () => {
+  const conn = new FakeAgentSideConnection()
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-runtime-cleanup-'))
+  const sessionsDir = join(root, 'sessions')
+  const trustedSessionFile = join(sessionsDir, 'trusted.jsonl')
+  const untrustedSessionFile = join(sessionsDir, 'untrusted.jsonl')
+  const sessionMapPath = join(root, 'session-map.json')
+
+  mkdirSync(sessionsDir, { recursive: true })
+  writeFileSync(trustedSessionFile, '{}\n', 'utf-8')
+  writeFileSync(untrustedSessionFile, '{}\n', 'utf-8')
+
+  const session = {
+    sessionId: 's-cleanup',
+    cwd: process.cwd(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [] }
+      },
+      async getState() {
+        // A later, unverified pi response must never decide what is deleted.
+        return { thinkingLevel: 'medium', model: null, sessionFile: untrustedSessionFile }
+      }
+    }
+  }
+
+  const sessions = new FakeSessions(session)
+  const store = new SessionStore(sessionMapPath)
+  store.upsert({ sessionId: 's-cleanup', cwd: process.cwd(), sessionFile: trustedSessionFile })
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = sessions as any
+  ;(agent as any).store = store as any
+
+  await assert.rejects(
+    () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),
+    (e: any) => e?.code === -32000
+  )
+
+  assert.deepEqual(sessions.closeCalls, ['s-cleanup'])
+  assert.equal(existsSync(trustedSessionFile), false, 'the store-mapped session file is cleaned up')
+  assert.equal(existsSync(untrustedSessionFile), true, 'a pi-reported path is never unlinked')
+  assert.equal(store.get('s-cleanup'), null)
 })

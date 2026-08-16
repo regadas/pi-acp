@@ -28,7 +28,7 @@ import {
 } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
 import { getAuthMethods } from './auth.js'
-import type { PiAcpSession } from './session.js'
+import type { CommandContext, PiAcpSession } from './session.js'
 import { SessionManager } from './session-manager.js'
 import {
   MODEL_CONFIG_ID,
@@ -63,6 +63,7 @@ import {
   isBashTool
 } from './translate/bash.js'
 import { promptToPiMessage } from './translate/prompt.js'
+import { toToolKind } from './translate/tool-calls.js'
 import { loadSlashCommands, parseCommandArgs, toAvailableCommands, type FileSlashCommand } from './slash-commands.js'
 import { getAgentDir, getEnableSkillCommands, getQuietStartup } from './pi-settings.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
@@ -73,12 +74,6 @@ import { existsSync, readFileSync, realpathSync, readdirSync, statSync, unlinkSy
 import { homedir } from 'node:os'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 import { spawnSync } from 'node:child_process'
-
-function historyToolKind(toolName: string): 'read' | 'edit' | 'other' {
-  if (toolName === 'read') return 'read'
-  if (toolName === 'write' || toolName === 'edit') return 'edit'
-  return 'other'
-}
 
 /**
  * pi has no MCP support (an extension would be required to bridge MCP
@@ -157,6 +152,8 @@ function builtinAvailableCommands(): AvailableCommand[] {
 }
 
 const BUILTIN_COMMAND_NAMES = new Set(builtinAvailableCommands().map(command => command.name))
+const AUTOCOMPACT_ON_ALIASES = new Set(['on', 'true', 'enable', 'enabled'])
+const AUTOCOMPACT_OFF_ALIASES = new Set(['off', 'false', 'disable', 'disabled'])
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
   // Preserve order, de-dupe by name (first wins).
@@ -213,18 +210,27 @@ export class PiAcpAgent implements ACPAgent {
     this.sessions.disposeAll()
   }
 
-  constructor(conn: AcpClient, _config?: unknown) {
-    this.conn = conn
-    void _config
+  /**
+   * Final-shutdown variant of {@link dispose}: also waits (bounded) for the pi
+   * children to terminate so the adapter cannot exit while a child is still
+   * being escalated from SIGTERM to SIGKILL. Idempotent, like `dispose`.
+   */
+  async disposeAndWait(timeoutMs: number): Promise<void> {
+    this.disposed = true
+    await this.sessions.disposeAllAndWait(timeoutMs)
   }
 
-  private cleanupFailedNewSession(sessionId: string, state?: any | null): void {
+  constructor(conn: AcpClient) {
+    this.conn = conn
+  }
+
+  private cleanupFailedNewSession(sessionId: string): void {
     this.sessions.close(sessionId)
 
-    const sessionFile =
-      typeof state?.sessionFile === 'string' && state.sessionFile.trim()
-        ? state.sessionFile
-        : this.store.get(sessionId)?.sessionFile
+    // Only the store mapping SessionManager wrote from pi's authoritative
+    // startup state may be unlinked. A path read from a later, unverified
+    // get_state response must never decide which file this deletes.
+    const sessionFile = this.store.get(sessionId)?.sessionFile
 
     if (typeof sessionFile === 'string' && sessionFile.trim()) {
       try {
@@ -256,6 +262,18 @@ export class PiAcpAgent implements ACPAgent {
       cwd: piSession.cwd,
       sessionFile: piSession.sessionFile
     }
+  }
+
+  private resolveStoredSessionCwd(sessionId: string, requestedCwd: string): string {
+    const stored = this.findStoredSession(sessionId)
+    if (!stored) throw RequestError.resourceNotFound(sessionId)
+    if (!sessionCwdsEquivalent(stored.cwd, requestedCwd)) {
+      throw RequestError.invalidParams(
+        {},
+        `cwd does not match the session's recorded cwd (${stored.cwd}): ${requestedCwd}`
+      )
+    }
+    return stored.cwd
   }
 
   private bumpCancellationEpoch(sessionId: string): void {
@@ -389,10 +407,14 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     if (session) {
-      await session.shutdown()
-      // Direct adapter commands settle when process disposal rejects their
-      // pending RPC; waiting for them before disposal would deadlock.
+      // Start turn shutdown (abort + settle), then dispose without waiting for
+      // it: session updates (including load replay) share one client delivery
+      // chain, and a client that stalls one delivery must not keep the pi
+      // subprocess alive. Adapter commands and in-flight RPCs settle when
+      // disposal rejects them, so the settlement wait comes after disposal.
+      const shutdown = session.shutdown()
       this.sessions.close(sessionId)
+      await shutdown
     }
 
     await this.waitForActivePrompts(sessionId)
@@ -416,9 +438,11 @@ export class PiAcpAgent implements ACPAgent {
 
       const cwd = opts?.cwd ?? stored.cwd
 
+      // Spawned through the session manager so the child is owned (and waited
+      // for at shutdown) even if this restore disposes it below.
       let proc: PiRpcProcess
       try {
-        proc = await PiRpcProcess.spawn({
+        proc = await this.sessions.spawnOwned({
           cwd,
           sessionPath: stored.sessionFile,
           piCommand: process.env.PI_ACP_PI_COMMAND
@@ -634,12 +658,12 @@ export class PiAcpAgent implements ACPAgent {
     const availableModelsAuthErr = maybeAuthRequiredError(availableModelsErr, this.authMethods)
 
     if (availableModelsAuthErr) {
-      this.cleanupFailedNewSession(session.sessionId, state)
+      this.cleanupFailedNewSession(session.sessionId)
       throw availableModelsAuthErr
     }
 
     if (availableModelsErr) {
-      this.cleanupFailedNewSession(session.sessionId, state)
+      this.cleanupFailedNewSession(session.sessionId)
       throw RequestError.internalError({}, String((availableModelsErr as Error)?.message ?? availableModelsErr))
     }
 
@@ -647,7 +671,7 @@ export class PiAcpAgent implements ACPAgent {
     const rawModelsCount = Array.isArray(availableModels?.models) ? availableModels.models.length : 0
 
     if (rawModelsCount === 0) {
-      this.cleanupFailedNewSession(session.sessionId, state)
+      this.cleanupFailedNewSession(session.sessionId)
       throw RequestError.authRequired(
         { authMethods: this.authMethods },
         'Configure an API key or log in with an OAuth provider.'
@@ -656,7 +680,7 @@ export class PiAcpAgent implements ACPAgent {
 
     if (stateErr) {
       const authError = maybeAuthRequiredError(stateErr, this.authMethods)
-      this.cleanupFailedNewSession(session.sessionId, state)
+      this.cleanupFailedNewSession(session.sessionId)
       if (authError) throw authError
       throw RequestError.internalError({}, String((stateErr as Error)?.message ?? stateErr))
     }
@@ -678,7 +702,6 @@ export class PiAcpAgent implements ACPAgent {
         : ''
       : buildStartupInfo({
           cwd: params.cwd,
-          fileCommands,
           updateNotice
         })
 
@@ -729,21 +752,12 @@ export class PiAcpAgent implements ACPAgent {
     const cancellationEpoch = this.cancellationEpochs.get(params.sessionId) ?? 0
 
     return this.trackPrompt(params.sessionId, async () => {
-      let finishAdapterPromptTurn: (() => Promise<void>) | undefined
-
       try {
         if (this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)) {
           return { stopReason: 'cancelled' }
         }
 
-        const response = await this.runPrompt(
-          params,
-          cancellationEpoch,
-          finish => {
-            finishAdapterPromptTurn = finish
-          },
-          signal
-        )
+        const response = await this.runPrompt(params, cancellationEpoch, signal)
         return this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)
           ? { stopReason: 'cancelled' }
           : response
@@ -763,8 +777,6 @@ export class PiAcpAgent implements ACPAgent {
           }
         }
         throw error
-      } finally {
-        await finishAdapterPromptTurn?.()
       }
     })
   }
@@ -772,7 +784,6 @@ export class PiAcpAgent implements ACPAgent {
   private async runPrompt(
     params: PromptRequest,
     cancellationEpoch: number,
-    registerAdapterPromptTurn: (finish: () => Promise<void>) => void,
     signal?: AbortSignal
   ): Promise<PromptResponse> {
     const session = await this.restoreSession(params.sessionId)
@@ -794,431 +805,15 @@ export class PiAcpAgent implements ACPAgent {
       const cmd = space === -1 ? trimmed.slice(1) : trimmed.slice(1, space)
       const argsString = space === -1 ? '' : trimmed.slice(space + 1)
       const args = parseCommandArgs(argsString)
-      if (BUILTIN_COMMAND_NAMES.has(cmd)) registerAdapterPromptTurn(session.beginAdapterPromptTurn())
 
-      if (cmd === 'compact') {
-        const customInstructions = args.join(' ').trim() || undefined
-        const res = await session.proc.compact(customInstructions)
-
-        const r: any = res && typeof res === 'object' ? (res as any) : null
-        const tokensBefore = typeof r?.tokensBefore === 'number' ? r.tokensBefore : null
-        const summary = typeof r?.summary === 'string' ? r.summary : null
-
-        const headerLines = [
-          `Compaction completed.${customInstructions ? ' (custom instructions applied)' : ''}`,
-          tokensBefore !== null ? `Tokens before: ${tokensBefore}` : null
-        ].filter(Boolean)
-
-        const text = headerLines.join('\n') + (summary ? `\n\n${summary}` : '')
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
-      }
-
-      if (cmd === 'session') {
-        const stats = (await session.proc.getSessionStats()) as any
-
-        const lines: string[] = []
-        if (stats?.sessionId) lines.push(`Session: ${stats.sessionId}`)
-        if (stats?.sessionFile) lines.push(`Session file: ${stats.sessionFile}`)
-        if (typeof stats?.totalMessages === 'number') lines.push(`Messages: ${stats.totalMessages}`)
-
-        if (typeof stats?.cost === 'number') lines.push(`Cost: ${stats.cost}`)
-
-        const t = stats?.tokens
-        if (t && typeof t === 'object') {
-          const parts: string[] = []
-          if (typeof t.input === 'number') parts.push(`in ${t.input}`)
-          if (typeof t.output === 'number') parts.push(`out ${t.output}`)
-          if (typeof t.cacheRead === 'number') parts.push(`cache read ${t.cacheRead}`)
-          if (typeof t.cacheWrite === 'number') parts.push(`cache write ${t.cacheWrite}`)
-          if (typeof t.total === 'number') parts.push(`total ${t.total}`)
-          if (parts.length) lines.push(`Tokens: ${parts.join(', ')}`)
-        }
-
-        // Fallback if stats shape changes.
-        const text = lines.length ? lines.join('\n') : `Session stats:\n${JSON.stringify(stats, null, 2)}`
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
-      }
-
-      if (cmd === 'name') {
-        const name = args.join(' ').trim()
-        if (!name) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: 'Usage: /name <name>' }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        try {
-          await session.proc.setSessionName(name)
-        } catch (e: any) {
-          const msg = String(e?.message ?? e)
-          const hint = /set_session_name/i.test(msg)
-            ? ' This requires a newer pi version that supports `set_session_name` in RPC mode.'
-            : ''
-
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Failed to set session name: ${msg}${hint}` }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        await session.syncSessionInfo(name)
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: `Session name set: ${name}` }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
-      }
-
-      if (cmd === 'steering') {
-        const modeRaw = String(args[0] ?? '').toLowerCase()
-        const state = (await session.proc.getState()) as any
-        const current = String(state?.steeringMode ?? '')
-
-        // If no arg, just report current.
-        if (!modeRaw) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: `Steering mode: ${current || 'unknown'}`
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        if (modeRaw !== 'all' && modeRaw !== 'one-at-a-time') {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: 'Usage: /steering all | /steering one-at-a-time'
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        await session.proc.setSteeringMode(modeRaw as 'all' | 'one-at-a-time')
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: `Steering mode set to: ${modeRaw}` }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
-      }
-
-      if (cmd === 'follow-up') {
-        const modeRaw = String(args[0] ?? '').toLowerCase()
-        const state = (await session.proc.getState()) as any
-        const current = String(state?.followUpMode ?? '')
-
-        // If no arg, just report current.
-        if (!modeRaw) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: `Follow-up mode: ${current || 'unknown'}`
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        if (modeRaw !== 'all' && modeRaw !== 'one-at-a-time') {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: 'Usage: /follow-up all | /follow-up one-at-a-time'
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        await session.proc.setFollowUpMode(modeRaw as 'all' | 'one-at-a-time')
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: `Follow-up mode set to: ${modeRaw}` }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
-      }
-
-      if (cmd === 'changelog') {
-        // Read pi's installed CHANGELOG.md. Adapter-side, no model call.
-        const findChangelog = (): string | null => {
-          // 1) Locate the installed pi package by resolving the `pi` executable.
-          // On Node installs, `pi` typically resolves to .../@earendil-works/pi-coding-agent/dist/cli.js
-          try {
-            const whichCmd = process.platform === 'win32' ? 'where' : 'which'
-            const which = spawnSync(whichCmd, ['pi'], { encoding: 'utf-8' })
-            const piPath = String(which.stdout ?? '')
-              .split(/\r?\n/)[0]
-              ?.trim()
-
-            if (piPath) {
-              const resolved = realpathSync(piPath)
-              const pkgRoot = dirname(dirname(resolved))
-              const p = join(pkgRoot, 'CHANGELOG.md')
-              if (existsSync(p)) return p
-            }
-          } catch {
-            // ignore
-          }
-
-          // 2) Fallback: ask npm where global modules live.
-          try {
-            const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf-8' })
-            const root = String(npmRoot.stdout ?? '').trim()
-            if (root) {
-              const p = join(root, '@earendil-works', 'pi-coding-agent', 'CHANGELOG.md')
-              if (existsSync(p)) return p
-            }
-          } catch {
-            // ignore
-          }
-
-          return null
-        }
-
-        const changelogPath = findChangelog()
-        if (!changelogPath) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: "Changelog not found (couldn't locate pi installation)." }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        let text = ''
-        try {
-          text = readFileSync(changelogPath, 'utf-8')
-        } catch (e: any) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: { type: 'text', text: `Failed to read changelog: ${String(e?.message ?? e)}` }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        // Keep it reasonably sized in chat.
-        const maxChars = 20_000
-        if (text.length > maxChars) text = text.slice(0, maxChars) + '\n\n...(truncated)...'
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
-      }
-
-      if (cmd === 'export') {
-        // For now we always export into the session cwd and do not accept a user-provided path.
-        // IMPORTANT: pi's export_html reads the session JSONL file. If it doesn't exist yet
-        // (no messages) or is empty, pi throws and RPC mode emits an uncorrelated parse error
-        // (no id), which would otherwise hang our request. So we guard here.
-        const state = (await session.proc.getState()) as any
-        const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-        const messageCount = typeof state?.messageCount === 'number' ? state.messageCount : 0
-
-        if (!sessionFile || messageCount === 0 || !existsSync(sessionFile)) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: 'Nothing to export yet (no session messages). Send a prompt first.'
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        try {
-          const raw = readFileSync(sessionFile, 'utf-8')
-          if (raw.trim().length === 0) {
-            await session.sendSessionUpdate({
-              sessionId: session.sessionId,
-              update: {
-                sessionUpdate: 'agent_message_chunk',
-                content: {
-                  type: 'text',
-                  text: 'Nothing to export yet (empty session file). Send a prompt first.'
-                }
-              }
-            })
-            return { stopReason: 'end_turn' }
-          }
-        } catch {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: "Couldn't read session file for export. Try sending a prompt first."
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        const safeSessionId = session.sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')
-        const outputPath = join(session.cwd, `pi-session-${safeSessionId}.html`)
-
-        let resultPath = ''
-        try {
-          const result = await session.proc.exportHtml(outputPath)
-          resultPath = result.path
-        } catch (e: any) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: `Export failed: ${String(e?.message ?? e)}`
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        if (!resultPath) {
-          await session.sendSessionUpdate({
-            sessionId: session.sessionId,
-            update: {
-              sessionUpdate: 'agent_message_chunk',
-              content: {
-                type: 'text',
-                text: 'Export failed: no output path returned by pi.'
-              }
-            }
-          })
-          return { stopReason: 'end_turn' }
-        }
-
-        const uri = pathToFileURL(resultPath).href
-
-        // Emit a short prefix + a resource link. Many clients concatenate chunks into a single
-        // assistant message, so this avoids the "link + duplicate plain text" look.
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: {
-              type: 'text',
-              text: 'Session exported: '
-            }
-          }
-        })
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: {
-              type: 'resource_link',
-              name: `pi-session-${safeSessionId}.html`,
-              uri,
-              mimeType: 'text/html',
-              title: 'Session exported'
-            }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
-      }
-
-      if (cmd === 'autocompact') {
-        const mode = (args[0] ?? 'toggle').toLowerCase()
-        let enabled: boolean | null = null
-        if (mode === 'on' || mode === 'true' || mode === 'enable' || mode === 'enabled') enabled = true
-        else if (mode === 'off' || mode === 'false' || mode === 'disable' || mode === 'disabled') enabled = false
-
-        if (enabled === null) {
-          // toggle: read current state and invert.
-          const state = (await session.proc.getState()) as any
-          const current = Boolean(state?.autoCompactionEnabled)
-          enabled = !current
-        }
-
-        await session.proc.setAutoCompaction(enabled)
-
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: {
-              type: 'text',
-              text: `Auto-compaction ${enabled ? 'enabled' : 'disabled'}.`
-            }
-          }
-        })
-
-        return { stopReason: 'end_turn' }
+      if (BUILTIN_COMMAND_NAMES.has(cmd)) {
+        // Adapter-handled commands share the session FIFO with ordinary
+        // prompts: they wait for an active turn and hold later prompts back.
+        // pi cannot abort an in-flight manual RPC, so a cancel fails closed by
+        // quarantining the channel; the command then settles as cancelled and
+        // the next request restores the session on a fresh pi subprocess.
+        const response = await session.runCommand(ctx => this.runBuiltinCommand(session, cmd, args, ctx))
+        return response ?? { stopReason: 'cancelled' }
       }
     }
 
@@ -1226,6 +821,479 @@ export class PiAcpAgent implements ACPAgent {
     // successful turns resolve with a stable ACP stop reason.
     const stopReason: StopReason = await session.prompt(message, images)
     return { stopReason }
+  }
+
+  /**
+   * Adapter-handled builtin slash commands (headless-friendly subset). Always
+   * invoked through `session.runCommand`, so it is already serialized with the
+   * session's prompt FIFO and settles as cancelled on `session/cancel`.
+   *
+   * Every publication goes through `ctx.sendSessionUpdate`, which drops
+   * updates once the command is cancelled: cancellation quarantines the pi
+   * channel, so an in-flight RPC rejects with an induced error that must never
+   * surface as a command failure (or a late success).
+   */
+  private async runBuiltinCommand(
+    session: PiAcpSession,
+    cmd: string,
+    args: string[],
+    ctx: CommandContext
+  ): Promise<PromptResponse> {
+    if (cmd === 'compact') {
+      const customInstructions = args.join(' ').trim() || undefined
+      const res = await session.proc.compact(customInstructions)
+
+      const r: any = res && typeof res === 'object' ? (res as any) : null
+      const tokensBefore = typeof r?.tokensBefore === 'number' ? r.tokensBefore : null
+      const summary = typeof r?.summary === 'string' ? r.summary : null
+
+      const headerLines = [
+        `Compaction completed.${customInstructions ? ' (custom instructions applied)' : ''}`,
+        tokensBefore !== null ? `Tokens before: ${tokensBefore}` : null
+      ].filter(Boolean)
+
+      const text = headerLines.join('\n') + (summary ? `\n\n${summary}` : '')
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    if (cmd === 'session') {
+      const stats = (await session.proc.getSessionStats()) as any
+
+      const lines: string[] = []
+      if (stats?.sessionId) lines.push(`Session: ${stats.sessionId}`)
+      if (stats?.sessionFile) lines.push(`Session file: ${stats.sessionFile}`)
+      if (typeof stats?.totalMessages === 'number') lines.push(`Messages: ${stats.totalMessages}`)
+
+      if (typeof stats?.cost === 'number') lines.push(`Cost: ${stats.cost}`)
+
+      const t = stats?.tokens
+      if (t && typeof t === 'object') {
+        const parts: string[] = []
+        if (typeof t.input === 'number') parts.push(`in ${t.input}`)
+        if (typeof t.output === 'number') parts.push(`out ${t.output}`)
+        if (typeof t.cacheRead === 'number') parts.push(`cache read ${t.cacheRead}`)
+        if (typeof t.cacheWrite === 'number') parts.push(`cache write ${t.cacheWrite}`)
+        if (typeof t.total === 'number') parts.push(`total ${t.total}`)
+        if (parts.length) lines.push(`Tokens: ${parts.join(', ')}`)
+      }
+
+      // Fallback if stats shape changes.
+      const text = lines.length ? lines.join('\n') : `Session stats:\n${JSON.stringify(stats, null, 2)}`
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    if (cmd === 'name') {
+      const name = args.join(' ').trim()
+      if (!name) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Usage: /name <name>' }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      try {
+        await session.proc.setSessionName(name)
+      } catch (e: any) {
+        const msg = String(e?.message ?? e)
+        const hint = /set_session_name/i.test(msg)
+          ? ' This requires a newer pi version that supports `set_session_name` in RPC mode.'
+          : ''
+
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `Failed to set session name: ${msg}${hint}` }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      // The title publication bypasses the command sink, so a cancelled
+      // command must not rename the session on the client either. The predicate
+      // is re-checked inside the serialized publication queue, where this can
+      // wait behind unrelated session-info work.
+      if (ctx.cancelled()) return { stopReason: 'end_turn' }
+      await session.syncSessionInfo(name, ctx.cancelled)
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `Session name set: ${name}` }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    if (cmd === 'steering') {
+      const modeRaw = String(args[0] ?? '').toLowerCase()
+      const state = (await session.proc.getState()) as any
+      const current = String(state?.steeringMode ?? '')
+
+      // If no arg, just report current.
+      if (!modeRaw) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Steering mode: ${current || 'unknown'}`
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      if (modeRaw !== 'all' && modeRaw !== 'one-at-a-time') {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Usage: /steering all | /steering one-at-a-time'
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      // Cancellation landed while pi's state was being read: settle as
+      // cancelled instead of applying a mutation nobody is waiting for.
+      if (ctx.cancelled()) return { stopReason: 'end_turn' }
+      await session.proc.setSteeringMode(modeRaw as 'all' | 'one-at-a-time')
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `Steering mode set to: ${modeRaw}` }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    if (cmd === 'follow-up') {
+      const modeRaw = String(args[0] ?? '').toLowerCase()
+      const state = (await session.proc.getState()) as any
+      const current = String(state?.followUpMode ?? '')
+
+      // If no arg, just report current.
+      if (!modeRaw) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Follow-up mode: ${current || 'unknown'}`
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      if (modeRaw !== 'all' && modeRaw !== 'one-at-a-time') {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Usage: /follow-up all | /follow-up one-at-a-time'
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      if (ctx.cancelled()) return { stopReason: 'end_turn' }
+      await session.proc.setFollowUpMode(modeRaw as 'all' | 'one-at-a-time')
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `Follow-up mode set to: ${modeRaw}` }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    if (cmd === 'changelog') {
+      // Read pi's installed CHANGELOG.md. Adapter-side, no model call.
+      const findChangelog = (): string | null => {
+        // 1) Locate the installed pi package by resolving the `pi` executable.
+        // On Node installs, `pi` typically resolves to .../@earendil-works/pi-coding-agent/dist/cli.js
+        try {
+          const whichCmd = process.platform === 'win32' ? 'where' : 'which'
+          const which = spawnSync(whichCmd, ['pi'], { encoding: 'utf-8' })
+          const piPath = String(which.stdout ?? '')
+            .split(/\r?\n/)[0]
+            ?.trim()
+
+          if (piPath) {
+            const resolved = realpathSync(piPath)
+            const pkgRoot = dirname(dirname(resolved))
+            const p = join(pkgRoot, 'CHANGELOG.md')
+            if (existsSync(p)) return p
+          }
+        } catch {
+          // ignore
+        }
+
+        // 2) Fallback: ask npm where global modules live.
+        try {
+          const npmRoot = spawnSync('npm', ['root', '-g'], { encoding: 'utf-8' })
+          const root = String(npmRoot.stdout ?? '').trim()
+          if (root) {
+            const p = join(root, '@earendil-works', 'pi-coding-agent', 'CHANGELOG.md')
+            if (existsSync(p)) return p
+          }
+        } catch {
+          // ignore
+        }
+
+        return null
+      }
+
+      const changelogPath = findChangelog()
+      if (!changelogPath) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: "Changelog not found (couldn't locate pi installation)." }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      let text = ''
+      try {
+        text = readFileSync(changelogPath, 'utf-8')
+      } catch (e: any) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `Failed to read changelog: ${String(e?.message ?? e)}` }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      // Keep it reasonably sized in chat.
+      const maxChars = 20_000
+      if (text.length > maxChars) text = text.slice(0, maxChars) + '\n\n...(truncated)...'
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    if (cmd === 'export') {
+      // For now we always export into the session cwd and do not accept a user-provided path.
+      // IMPORTANT: pi's export_html reads the session JSONL file. If it doesn't exist yet
+      // (no messages) or is empty, pi throws and RPC mode emits an uncorrelated parse error
+      // (no id), which would otherwise hang our request. So we guard here.
+      const state = (await session.proc.getState()) as any
+      const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
+      const messageCount = typeof state?.messageCount === 'number' ? state.messageCount : 0
+
+      if (!sessionFile || messageCount === 0 || !existsSync(sessionFile)) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Nothing to export yet (no session messages). Send a prompt first.'
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      try {
+        const raw = readFileSync(sessionFile, 'utf-8')
+        if (raw.trim().length === 0) {
+          await ctx.sendSessionUpdate({
+            sessionId: session.sessionId,
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: {
+                type: 'text',
+                text: 'Nothing to export yet (empty session file). Send a prompt first.'
+              }
+            }
+          })
+          return { stopReason: 'end_turn' }
+        }
+      } catch {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: "Couldn't read session file for export. Try sending a prompt first."
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      const safeSessionId = session.sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')
+      const outputPath = join(session.cwd, `pi-session-${safeSessionId}.html`)
+
+      // Cancellation landed during the pre-export probes: do not write an
+      // export file for a command that already settled as cancelled.
+      if (ctx.cancelled()) return { stopReason: 'end_turn' }
+
+      let resultPath = ''
+      try {
+        const result = await session.proc.exportHtml(outputPath)
+        resultPath = result.path
+      } catch (e: any) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Export failed: ${String(e?.message ?? e)}`
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      if (!resultPath) {
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: 'Export failed: no output path returned by pi.'
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      const uri = pathToFileURL(resultPath).href
+
+      // Emit a short prefix + a resource link. Many clients concatenate chunks into a single
+      // assistant message, so this avoids the "link + duplicate plain text" look.
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: 'Session exported: '
+          }
+        }
+      })
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'resource_link',
+            name: `pi-session-${safeSessionId}.html`,
+            uri,
+            mimeType: 'text/html',
+            title: 'Session exported'
+          }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    if (cmd === 'autocompact') {
+      const mode = (args[0] ?? 'toggle').toLowerCase()
+      let enabled: boolean
+
+      if (AUTOCOMPACT_ON_ALIASES.has(mode)) {
+        enabled = true
+      } else if (AUTOCOMPACT_OFF_ALIASES.has(mode)) {
+        enabled = false
+      } else if (mode === 'toggle') {
+        const state = (await session.proc.getState()) as any
+        enabled = !state?.autoCompactionEnabled
+      } else {
+        // An unrecognized argument is a typo, not a toggle: report usage
+        // instead of silently flipping the setting.
+        await ctx.sendSessionUpdate({
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: {
+              type: 'text',
+              text: `Unknown argument: ${args[0]}. Usage: /autocompact on | off | toggle`
+            }
+          }
+        })
+        return { stopReason: 'end_turn' }
+      }
+
+      if (ctx.cancelled()) return { stopReason: 'end_turn' }
+      await session.proc.setAutoCompaction(enabled)
+
+      await ctx.sendSessionUpdate({
+        sessionId: session.sessionId,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: `Auto-compaction ${enabled ? 'enabled' : 'disabled'}.`
+          }
+        }
+      })
+
+      return { stopReason: 'end_turn' }
+    }
+
+    // Callers gate on BUILTIN_COMMAND_NAMES, so this is unreachable.
+    throw RequestError.internalError({ command: cmd }, `Unhandled builtin command: /${cmd}`)
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -1276,14 +1344,20 @@ export class PiAcpAgent implements ACPAgent {
     return { sessions, nextCursor, _meta: {} }
   }
 
+  /**
+   * Deliver one replayed history update through the session's ordered update
+   * queue, so replay and concurrent live updates share a single total order
+   * instead of racing on the raw connection. Delivery failures still reject,
+   * and the load generation is re-checked on both sides of the send.
+   */
   private async sendLoadUpdate(
-    sessionId: string,
+    session: PiAcpSession,
     generation: number,
     update: Parameters<AcpClient['sessionUpdate']>[0]
   ): Promise<void> {
-    this.assertLoadActive(sessionId, generation)
-    await this.conn.sessionUpdate(update)
-    this.assertLoadActive(sessionId, generation)
+    this.assertLoadActive(session.sessionId, generation)
+    await session.sendSessionUpdate(update)
+    this.assertLoadActive(session.sessionId, generation)
   }
 
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
@@ -1291,20 +1365,9 @@ export class PiAcpAgent implements ACPAgent {
     assertNoMcpServers(params.mcpServers)
     assertNoAdditionalDirectories(params.additionalDirectories)
 
-    const stored = this.findStoredSession(params.sessionId)
-    if (!stored) {
-      throw RequestError.resourceNotFound(params.sessionId)
-    }
-    if (!sessionCwdsEquivalent(stored.cwd, params.cwd)) {
-      throw RequestError.invalidParams(
-        {},
-        `cwd does not match the session's recorded cwd (${stored.cwd}): ${params.cwd}`
-      )
-    }
-
     // The request only had to name an equivalent directory; the recorded cwd
     // stays authoritative so an alias cannot rebind the session's workspace.
-    const cwd = stored.cwd
+    const cwd = this.resolveStoredSessionCwd(params.sessionId, params.cwd)
 
     this.bumpCancellationEpoch(params.sessionId)
     const generation = this.bumpLoadGeneration(params.sessionId)
@@ -1395,7 +1458,7 @@ export class PiAcpAgent implements ACPAgent {
 
           if (role === 'user') {
             for (const block of translateUserContent(m?.content)) {
-              await this.sendLoadUpdate(params.sessionId, generation, {
+              await this.sendLoadUpdate(session, generation, {
                 sessionId: session.sessionId,
                 update: {
                   sessionUpdate: 'user_message_chunk',
@@ -1412,7 +1475,7 @@ export class PiAcpAgent implements ACPAgent {
           if (role === 'assistant') {
             for (const block of translateAssistantContent(m?.content)) {
               if (block.kind === 'text') {
-                await this.sendLoadUpdate(params.sessionId, generation, {
+                await this.sendLoadUpdate(session, generation, {
                   sessionId: session.sessionId,
                   update: {
                     sessionUpdate: 'agent_message_chunk',
@@ -1423,7 +1486,7 @@ export class PiAcpAgent implements ACPAgent {
               }
 
               if (block.kind === 'thinking') {
-                await this.sendLoadUpdate(params.sessionId, generation, {
+                await this.sendLoadUpdate(session, generation, {
                   sessionId: session.sessionId,
                   update: {
                     sessionUpdate: 'agent_thought_chunk',
@@ -1438,13 +1501,13 @@ export class PiAcpAgent implements ACPAgent {
               replayedToolCallIds.add(block.toolCallId)
               const isBash = isBashTool(block.toolName)
               openToolCalls.set(block.toolCallId, { isBash })
-              await this.sendLoadUpdate(params.sessionId, generation, {
+              await this.sendLoadUpdate(session, generation, {
                 sessionId: session.sessionId,
                 update: {
                   sessionUpdate: 'tool_call',
                   toolCallId: block.toolCallId,
                   title: isBash ? (bashCommand(block.rawInput) ?? block.toolName) : block.toolName,
-                  kind: isBash ? 'execute' : historyToolKind(block.toolName),
+                  kind: isBash ? 'execute' : toToolKind(block.toolName),
                   status: 'pending',
                   rawInput: block.rawInput,
                   ...(isBash && this.supportsTerminalOutputMeta
@@ -1462,7 +1525,7 @@ export class PiAcpAgent implements ACPAgent {
           if (role === 'custom') {
             if (m?.display !== true) continue
             for (const block of translateCustomMessageContent(m?.content)) {
-              await this.sendLoadUpdate(params.sessionId, generation, {
+              await this.sendLoadUpdate(session, generation, {
                 sessionId: session.sessionId,
                 update: {
                   sessionUpdate: 'agent_message_chunk',
@@ -1486,7 +1549,7 @@ export class PiAcpAgent implements ACPAgent {
 
             if (isBashTool(toolName)) {
               if (!alreadyReplayed) {
-                await this.sendLoadUpdate(params.sessionId, generation, {
+                await this.sendLoadUpdate(session, generation, {
                   sessionId: session.sessionId,
                   update: {
                     sessionUpdate: 'tool_call',
@@ -1513,7 +1576,7 @@ export class PiAcpAgent implements ACPAgent {
                 content: { type: 'image', data: image.data, mimeType: image.mimeType }
               }))
               const genericContent = bashOrderedContent(m)
-              await this.sendLoadUpdate(params.sessionId, generation, {
+              await this.sendLoadUpdate(session, generation, {
                 sessionId: session.sessionId,
                 update: {
                   sessionUpdate: 'tool_call_update',
@@ -1539,13 +1602,13 @@ export class PiAcpAgent implements ACPAgent {
               // No assistant toolCall block preceded this result (e.g. older
               // session data). Synthesize the initial call so the terminal
               // status transition stays monotonic.
-              await this.sendLoadUpdate(params.sessionId, generation, {
+              await this.sendLoadUpdate(session, generation, {
                 sessionId: session.sessionId,
                 update: {
                   sessionUpdate: 'tool_call',
                   toolCallId,
                   title: toolName,
-                  kind: historyToolKind(toolName),
+                  kind: toToolKind(toolName),
                   status: 'in_progress',
                   rawInput: null
                 }
@@ -1553,7 +1616,7 @@ export class PiAcpAgent implements ACPAgent {
             }
 
             const content: ToolCallContent[] = toolResultToolCallContent(m)
-            await this.sendLoadUpdate(params.sessionId, generation, {
+            await this.sendLoadUpdate(session, generation, {
               sessionId: session.sessionId,
               update: {
                 sessionUpdate: 'tool_call_update',
@@ -1575,7 +1638,7 @@ export class PiAcpAgent implements ACPAgent {
             const exitCode = bashExitCode(m, cancelled)
             const failed = cancelled || exitCode !== 0
 
-            await this.sendLoadUpdate(params.sessionId, generation, {
+            await this.sendLoadUpdate(session, generation, {
               sessionId: session.sessionId,
               update: {
                 sessionUpdate: 'tool_call',
@@ -1592,7 +1655,7 @@ export class PiAcpAgent implements ACPAgent {
               }
             })
 
-            await this.sendLoadUpdate(params.sessionId, generation, {
+            await this.sendLoadUpdate(session, generation, {
               sessionId: session.sessionId,
               update: {
                 sessionUpdate: 'tool_call_update',
@@ -1628,7 +1691,7 @@ export class PiAcpAgent implements ACPAgent {
             }
           }
           const terminalSettlement = metadata.isBash && this.supportsTerminalOutputMeta
-          await this.sendLoadUpdate(params.sessionId, generation, {
+          await this.sendLoadUpdate(session, generation, {
             sessionId: session.sessionId,
             update: {
               sessionUpdate: 'tool_call_update',
@@ -1678,23 +1741,9 @@ export class PiAcpAgent implements ACPAgent {
     assertNoMcpServers(params.mcpServers)
     assertNoAdditionalDirectories(params.additionalDirectories)
 
-    const stored = this.findStoredSession(params.sessionId)
-    if (!stored) {
-      throw RequestError.resourceNotFound(params.sessionId)
-    }
-
-    // ACP allows resuming only under the session's recorded cwd; pi session
-    // files are bound to the cwd they were created in.
-    if (!sessionCwdsEquivalent(stored.cwd, params.cwd)) {
-      throw RequestError.invalidParams(
-        {},
-        `cwd does not match the session's recorded cwd (${stored.cwd}): ${params.cwd}`
-      )
-    }
-
     // The recorded cwd stays authoritative: an equivalent alias in the request
     // must not rebind where this session's pi subprocess runs or reads from.
-    const cwd = stored.cwd
+    const cwd = this.resolveStoredSessionCwd(params.sessionId, params.cwd)
 
     const session = await this.restoreSessionAwaitingLoads(params.sessionId, {
       cwd,
@@ -1977,13 +2026,7 @@ function computeUpdateNotice(): string | null {
   }
 }
 
-function buildStartupInfo(opts: {
-  cwd: string
-  fileCommands: ReturnType<typeof loadSlashCommands>
-  updateNotice: string | null
-}): string {
-  void opts.fileCommands
-
+function buildStartupInfo(opts: { cwd: string; updateNotice: string | null }): string {
   const md: string[] = []
 
   // pi version header
@@ -2040,8 +2083,25 @@ function buildStartupInfo(opts: {
         }
       }
 
-      // Recursive SKILL.md under subdirectories
-      const stack: string[] = [root]
+      // Recursive SKILL.md under subdirectories. Symlinked skill directories
+      // are common (a link into a checkout), so they are followed; recursion
+      // is keyed by resolved identity instead, because a link cycle would
+      // otherwise walk forever and hang session/new.
+      const stack: string[] = []
+      const visited = new Set<string>()
+      const pushDir = (dir: string) => {
+        let resolved: string
+        try {
+          resolved = realpathSync(dir)
+        } catch {
+          return
+        }
+        if (visited.has(resolved)) return
+        visited.add(resolved)
+        stack.push(dir)
+      }
+
+      pushDir(root)
       while (stack.length) {
         const dir = stack.pop()!
         let entries: string[] = []
@@ -2057,12 +2117,14 @@ function buildStartupInfo(opts: {
           const p = join(dir, name)
           let st
           try {
+            // stat, not lstat: a symlinked SKILL.md or skill directory is
+            // still a skill, and the visited set makes following links safe.
             st = statSync(p)
           } catch {
             continue
           }
           if (st.isDirectory()) {
-            stack.push(p)
+            pushDir(p)
           } else if (st.isFile() && name === 'SKILL.md') {
             skillsItems.push(p)
           }

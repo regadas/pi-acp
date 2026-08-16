@@ -142,10 +142,9 @@ Loaded from:
 - `/export` – export the current session to HTML in the session `cwd`
 - `/session` – show session stats (tokens/messages/cost/session file)
 - `/name <name>` – set session display name
-- `/queue all|one-at-a-time` – set pi queue mode (unstable feature)
 - `/changelog` – print the installed pi changelog (best-effort)
 - `/steering` - maps to `pi` Steering Mode, get/set
-- `/follow-up` - pats to `pi` Follow-up Mode, get/set
+- `/follow-up` - maps to `pi` Follow-up Mode, get/set
 
 Other built-in commands:
 
@@ -195,7 +194,7 @@ Project layout:
 - Additional workspace directories are not supported: the `sessionCapabilities.additionalDirectories` capability is not advertised, and `session/new`, `session/load`, and `session/resume` requests carrying a non-empty `additionalDirectories` list are rejected with `invalid params` instead of silently dropping the extra roots. The session's `cwd` remains the only workspace root.
 - Pi session files do not coordinate concurrent writers: each pi process keeps its own in-memory view while appending to the shared history. `pi-acp` inherits this constraint, so simultaneously operating on the same persisted session from multiple `pi-acp` or pi processes is unsupported. Atomic adapter mapping records prevent cross-process map updates from being lost, but they are not a session-ownership lease; keep one active writer per persisted session to prevent divergent or damaged history.
 - Assistant text streams as `agent_message_chunk`; extended thinking streams separately as `agent_thought_chunk`.
-- Prompt queueing is a local FIFO in the adapter (one pi prompt at a time, like pi's `one-at-a-time`). Because pi extensions can start their own runs, dispatch waits for observed out-of-band pi activity to settle and fails closed if that admission wait expires. Every prompt also carries pi's non-interrupting `streamingBehavior: 'followUp'` so an unobserved dispatch race is queued by pi instead of rejected; pi output remains unowned until the prompt's response or queued user-message boundary. Ambiguous nested run lifecycles are quarantined rather than attributed to the wrong ACP turn. If an extension command starts and finishes a run before pi acknowledges the command prompt, that run's turn-bound stream is suppressed because Pi RPC exposes no correlation ID.
+- Prompt queueing is a local FIFO in the adapter (one pi prompt at a time, like pi's `one-at-a-time`). Because pi extensions can start their own runs, dispatch waits for observed out-of-band pi activity to settle and fails closed if that admission wait expires. Every prompt also carries pi's non-interrupting `streamingBehavior: 'followUp'` so an unobserved dispatch race is queued by pi instead of rejected; pi output remains unowned until the prompt's response or queued user-message boundary. Ambiguous nested run lifecycles are quarantined rather than attributed to the wrong ACP turn. If an extension command starts and finishes a run before pi acknowledges the command prompt, that run's turn-bound stream is suppressed because Pi RPC exposes no correlation ID. Adapter-handled built-in commands (`/compact`, `/name`, ...) share the same FIFO: they wait for an active prompt and hold later prompts back while they run. pi's `abort` stops an agent run but cannot cancel an in-flight manual RPC (compaction, export, ...), so `session/cancel` fails closed instead: a command still waiting on pi has its channel quarantined, the request settles as `cancelled` with no partial result reported, and the next request restores the session on a fresh pi subprocess. A command with no pi work in flight is settled locally and leaves the subprocess untouched.
 - ~~ACP clients don't yet suport session history, but ACP sessions from `pi-acp` can be `/resume`d in pi directly~~
 
 ## License

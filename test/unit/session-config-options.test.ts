@@ -56,7 +56,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
       sendStartupInfoIfPending() {}
     }
 
-    const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+    const agent = new PiAcpAgent(asAgentConn(conn))
     ;(agent as any).sessions = new FakeSessions(session) as any
     // Local seam: swallow deferred notifications instead of patching timers.
     ;(agent as any).scheduleDeferred = () => {}
@@ -134,7 +134,7 @@ test('PiAcpAgent: setSessionConfigOption maps model changes to pi and emits conf
     }
   }
 
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = new FakeSessions(session) as any
 
   const result = await agent.setSessionConfigOption({
@@ -184,7 +184,7 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
     }
   }
 
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = new FakeSessions(session) as any
 
   const result = await agent.setSessionConfigOption({
@@ -229,7 +229,7 @@ test('PiAcpAgent: setSessionConfigOption rejects thinking levels the current mod
     }
   }
 
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = new FakeSessions(session) as any
 
   await assert.rejects(
@@ -272,7 +272,7 @@ test('PiAcpAgent: setSessionConfigOption accepts max on a Kimi-like max-only mod
     }
   }
 
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = new FakeSessions(session) as any
 
   const result = await agent.setSessionConfigOption({ sessionId: 's1', configId: 'thought_level', value: 'max' } as any)
@@ -320,7 +320,7 @@ test('PiAcpAgent: model switch refreshes advertised thinking levels for the new 
     }
   }
 
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = new FakeSessions(session) as any
 
   const result = await agent.setSessionConfigOption({ sessionId: 's1', configId: 'model', value: 'test/deep' } as any)

@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
-import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn, lastAgentMessageText } from '../helpers/fakes.js'
 
 class FakeSessions {
   constructor(private readonly session: any) {}
@@ -39,9 +39,7 @@ test('PiAcpAgent: /steering reports current steeringMode', async () => {
   } as any)
 
   assert.equal(res.stopReason, 'end_turn')
-  const last = conn.updates.at(-1)
-  assert.equal(last?.update?.sessionUpdate, 'agent_message_chunk')
-  assert.match((last as any).update.content.text, /Steering mode: all/)
+  assert.match(lastAgentMessageText(conn), /Steering mode: all/)
 })
 
 test('PiAcpAgent: /steering sets steering mode', async () => {
@@ -63,8 +61,7 @@ test('PiAcpAgent: /steering sets steering mode', async () => {
 
   assert.equal(res.stopReason, 'end_turn')
   assert.equal(setTo, 'one-at-a-time')
-  const last = conn.updates.at(-1)
-  assert.match((last as any).update.content.text, /Steering mode set to: one-at-a-time/)
+  assert.match(lastAgentMessageText(conn), /Steering mode set to: one-at-a-time/)
 })
 
 test('PiAcpAgent: /steering rejects invalid value', async () => {
@@ -86,8 +83,7 @@ test('PiAcpAgent: /steering rejects invalid value', async () => {
 
   assert.equal(res.stopReason, 'end_turn')
   assert.equal(called, false)
-  const last = conn.updates.at(-1)
-  assert.match((last as any).update.content.text, /Usage: \/steering/)
+  assert.match(lastAgentMessageText(conn), /Usage: \/steering/)
 })
 
 test('PiAcpAgent: /follow-up reports current followUpMode', async () => {
@@ -104,8 +100,7 @@ test('PiAcpAgent: /follow-up reports current followUpMode', async () => {
   } as any)
 
   assert.equal(res.stopReason, 'end_turn')
-  const last = conn.updates.at(-1)
-  assert.match((last as any).update.content.text, /Follow-up mode: one-at-a-time/)
+  assert.match(lastAgentMessageText(conn), /Follow-up mode: one-at-a-time/)
 })
 
 test('PiAcpAgent: /follow-up sets follow-up mode', async () => {
@@ -127,8 +122,7 @@ test('PiAcpAgent: /follow-up sets follow-up mode', async () => {
 
   assert.equal(res.stopReason, 'end_turn')
   assert.equal(setTo, 'all')
-  const last = conn.updates.at(-1)
-  assert.match((last as any).update.content.text, /Follow-up mode set to: all/)
+  assert.match(lastAgentMessageText(conn), /Follow-up mode set to: all/)
 })
 
 test('PiAcpAgent: /follow-up rejects invalid value', async () => {
@@ -150,6 +144,5 @@ test('PiAcpAgent: /follow-up rejects invalid value', async () => {
 
   assert.equal(res.stopReason, 'end_turn')
   assert.equal(called, false)
-  const last = conn.updates.at(-1)
-  assert.match((last as any).update.content.text, /Usage: \/follow-up/)
+  assert.match(lastAgentMessageText(conn), /Usage: \/follow-up/)
 })

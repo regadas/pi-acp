@@ -57,11 +57,42 @@ type PendingTurn = {
   matchingPromptMessagesToSkip: number
 }
 
-type QueuedTurn = {
+type QueuedPrompt = {
+  kind: 'prompt'
   message: string
   images: unknown[]
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+}
+
+/** The adapter-handled slash command currently holding the session FIFO. */
+type ActiveCommand = { cancelled: boolean }
+
+/**
+ * An adapter-handled slash command waiting for its place in the session FIFO.
+ * `admit(false)` releases the caller without running it (cancel/shutdown);
+ * `fail` propagates a hard failure of the work ahead of it.
+ */
+type QueuedCommand = {
+  kind: 'command'
+  command: ActiveCommand
+  admit: (admitted: boolean) => void
+  fail: (err: unknown) => void
+}
+
+type QueuedWork = QueuedPrompt | QueuedCommand
+
+/**
+ * The running adapter command's live view of its own cancellation. Command
+ * work must publish through {@link CommandContext.sendSessionUpdate} and
+ * re-check {@link CommandContext.cancelled} after each async boundary, so a
+ * cancellation-induced RPC rejection is never reported to the client as a
+ * command failure (and a result computed before cancellation is not published
+ * as a late success).
+ */
+export type CommandContext = {
+  cancelled(): boolean
+  sendSessionUpdate(params: Parameters<AcpClient['sessionUpdate']>[0]): Promise<void>
 }
 
 type PendingCustomMessage = {
@@ -122,7 +153,6 @@ function customMessageIdentity(message: unknown, blocks: TranslatedUserBlock[]):
 export class PiAcpSession {
   readonly sessionId: string
   readonly cwd: string
-  readonly mcpServers: McpServer[]
 
   private startupInfo: string | null = null
   private startupInfoSent = false
@@ -155,7 +185,10 @@ export class PiAcpSession {
 
   // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
-  private readonly turnQueue: QueuedTurn[] = []
+  // Adapter-handled command currently holding the FIFO. A prompt turn and a
+  // command are mutually exclusive: both are admitted through the same queue.
+  private activeCommand: ActiveCommand | null = null
+  private readonly turnQueue: QueuedWork[] = []
   // Track tool call statuses and ensure they are monotonic (pending -> in_progress -> completed).
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
@@ -240,7 +273,6 @@ export class PiAcpSession {
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
-    this.mcpServers = opts.mcpServers
     this.proc = opts.proc
     this.conn = opts.conn
     this.fileCommands = opts.fileCommands ?? []
@@ -385,33 +417,17 @@ export class PiAcpSession {
     const expandedMessage = expandSlashCommand(message, this.fileCommands)
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedTurn = { message: expandedMessage, images, resolve, reject }
+      const queued: QueuedPrompt = { kind: 'prompt', message: expandedMessage, images, resolve, reject }
 
-      // If a turn is already running, enqueue.
-      if (this.pendingTurn) {
+      // If a turn or adapter command is running (or work is already waiting
+      // behind it), enqueue so every prompt path stays FIFO.
+      if (this.isBusy() || this.turnQueue.length) {
         this.turnQueue.push(queued)
-
-        // Best-effort: notify client that a prompt was queued.
-        // This doesn't work in Zed yet, needs to be revisited
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: `Queued message (position ${this.turnQueue.length}).`
-          }
-        })
-
-        // Also publish queue depth via session info metadata.
-        // This also not visible in the client
-        this.emit({
-          sessionUpdate: 'session_info_update',
-          _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
-        })
-
+        this.emitQueuedNotice()
         return
       }
 
-      // No turn is running; start immediately.
+      // Nothing is running; start immediately.
       this.startTurn(queued)
     })
 
@@ -425,8 +441,101 @@ export class PiAcpSession {
     return turnPromise
   }
 
+  /**
+   * Run adapter-handled slash command work inside the session FIFO: it waits
+   * for an active prompt (or earlier command), keeps later prompts queued
+   * while it runs, and `cancel()` settles it promptly. Resolves `null` when
+   * the command was cancelled before or during execution.
+   */
+  async runCommand<T>(run: (ctx: CommandContext) => Promise<T>): Promise<T | null> {
+    if (this.isClosing()) return null
+
+    const command: ActiveCommand = { cancelled: false }
+    if (!(await this.admitCommand(command))) return null
+
+    // Cancellation can land between admission and this resumption. Release the
+    // held FIFO slot without opening an adapter turn: a command that never runs
+    // must not flush the deferred startup banner or buffered custom messages.
+    if (command.cancelled) {
+      this.releaseCommandSlot()
+      return null
+    }
+
+    const ctx: CommandContext = {
+      cancelled: () => command.cancelled,
+      sendSessionUpdate: params => (command.cancelled ? Promise.resolve() : this.sendSessionUpdate(params))
+    }
+
+    const finishAdapterPromptTurn = this.beginAdapterPromptTurn()
+    try {
+      const result = await run(ctx)
+      return command.cancelled ? null : result
+    } catch (error) {
+      // A cancelled command's RPC rejects because cancellation quarantined the
+      // channel; report the cancellation rather than that induced failure.
+      if (command.cancelled) return null
+      throw error
+    } finally {
+      await finishAdapterPromptTurn()
+      this.releaseCommandSlot()
+    }
+  }
+
+  private releaseCommandSlot(): void {
+    this.activeCommand = null
+    this.startNextQueuedWork()
+  }
+
+  private admitCommand(command: ActiveCommand): Promise<boolean> {
+    // Claim the FIFO slot synchronously so a prompt arriving before this
+    // caller resumes cannot start ahead of the command.
+    if (!this.isBusy() && !this.turnQueue.length) {
+      this.activeCommand = command
+      return Promise.resolve(true)
+    }
+
+    return new Promise<boolean>((resolve, reject) => {
+      this.turnQueue.push({ kind: 'command', command, admit: resolve, fail: reject })
+      this.emitQueuedNotice()
+    })
+  }
+
+  private isBusy(): boolean {
+    return Boolean(this.pendingTurn || this.activeCommand)
+  }
+
+  private emitQueuedNotice(): void {
+    // Best-effort: notify client that work was queued.
+    // This doesn't work in Zed yet, needs to be revisited
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: {
+        type: 'text',
+        text: `Queued message (position ${this.turnQueue.length}).`
+      }
+    })
+
+    this.publishQueueState(true, this.turnQueue.length)
+  }
+
+  /** Publish queue depth via session info metadata. (Not visible in Zed yet.) */
+  private publishQueueState(running: boolean, queueDepth: number): void {
+    this.emit({
+      sessionUpdate: 'session_info_update',
+      _meta: { piAcp: { queueDepth, running } }
+    })
+  }
+
+  /** Settle drained queue entries that never got to run. */
+  private settleCancelledQueue(queued: QueuedWork[]): void {
+    for (const entry of queued) {
+      if (entry.kind === 'prompt') entry.resolve('cancelled')
+      else entry.admit(false)
+    }
+  }
+
   async cancel(): Promise<void> {
-    // Cancel current and clear any queued prompts.
+    // Cancel current and clear any queued work.
     this.cancelRequested = true
 
     const queued = this.turnQueue.splice(0, this.turnQueue.length)
@@ -435,10 +544,28 @@ export class PiAcpSession {
         sessionUpdate: 'agent_message_chunk',
         content: { type: 'text', text: 'Cleared queued prompts.' }
       })
-      this.emit({
-        sessionUpdate: 'session_info_update',
-        _meta: { piAcp: { queueDepth: 0, running: Boolean(this.pendingTurn) } }
-      })
+      this.publishQueueState(this.isBusy(), 0)
+    }
+
+    const activeCommand = this.activeCommand
+    if (activeCommand) {
+      activeCommand.cancelled = true
+
+      // Fail closed. pi's `abort` stops an agent run; it does not cancel the
+      // manual compaction/export RPC an adapter command is waiting on, so an
+      // aborted command would keep the ACP request and the FIFO held for the
+      // rest of its (multi-minute) request timeout. Quarantining the channel
+      // rejects that pending request now: the command settles as cancelled,
+      // the FIFO releases, and the agent evicts this unavailable session so a
+      // later request restores it on a fresh subprocess.
+      //
+      // With no pi work in flight there is nothing to tear down, and an abort
+      // would only interrupt unrelated autonomous pi work.
+      if (this.proc.hasPendingRequests()) this.dispose()
+
+      await this.flushEmits()
+      this.settleCancelledQueue(queued)
+      return
     }
 
     const activeTurn = this.pendingTurn
@@ -449,7 +576,7 @@ export class PiAcpSession {
       this.clearDeferredDispatch()
       this.completeTurn(activeTurn)
       await this.flushEmits()
-      for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
+      this.settleCancelledQueue(queued)
       return
     }
 
@@ -459,7 +586,7 @@ export class PiAcpSession {
       // starts in that window must not be interrupted by a late cancellation.
       if (queued.length) {
         await this.flushEmits()
-        for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
+        this.settleCancelledQueue(queued)
       }
       return
     }
@@ -478,7 +605,7 @@ export class PiAcpSession {
       // why the queue was cleared, even when abort itself fails.
       if (queued.length) {
         await this.flushEmits()
-        for (const turn of queued) turn.resolve('cancelled')
+        this.settleCancelledQueue(queued)
       }
     }
   }
@@ -500,6 +627,11 @@ export class PiAcpSession {
   private async runShutdown(): Promise<void> {
     this.cancelRequested = true
 
+    // An adapter command settles as cancelled when disposal rejects its
+    // pending RPC; marking it here keeps that invariant local to the session
+    // instead of depending on agent-level cancellation tracking.
+    if (this.activeCommand) this.activeCommand.cancelled = true
+
     // Drop any held dispatch before the first await so its admission timeout
     // cannot race shutdown settlement.
     this.clearDeferredDispatch()
@@ -520,8 +652,10 @@ export class PiAcpSession {
     // completeTurn resolves the active request only after this update chain.
     // Resolve drained queue entries afterward, then it is safe to await the
     // complete outstanding-turn set without deadlocking on those entries.
+    // An active adapter command is not awaited here: it settles when process
+    // disposal rejects its pending RPC.
     await this.flushEmits()
-    for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
+    this.settleCancelledQueue(queued)
 
     await Promise.all([...this.outstandingTurns])
     await this.flushEmits()
@@ -553,10 +687,16 @@ export class PiAcpSession {
     return this.enqueueUpdate(params.update)
   }
 
-  syncSessionInfo(name: string | undefined): Promise<void> {
+  /**
+   * Publish the session title through its serialized queue. Adapter commands
+   * pass `isCancelled` because this operation can wait behind unrelated work:
+   * the check is re-run inside the queued callback so a title cannot reach the
+   * client after its command was cancelled.
+   */
+  syncSessionInfo(name: string | undefined, isCancelled?: () => boolean): Promise<void> {
     const title = name ?? null
     const operation = this.sessionInfoSyncTail.then(async () => {
-      if (this.disposed) return
+      if (this.disposed || isCancelled?.()) return
       if (this.publishedTitle === title) return this.flushEmits()
 
       await this.enqueueUpdate({
@@ -766,7 +906,7 @@ export class PiAcpSession {
     this.bashOutputSnapshots.delete(toolCallId)
   }
 
-  private startTurn(t: QueuedTurn): void {
+  private startTurn(t: QueuedPrompt): void {
     this.settledToolCallIds.clear()
     this.cancelRequested = false
     this.agentRunObserved = false
@@ -971,7 +1111,7 @@ export class PiAcpSession {
       // a newcomer start and then get overwritten by startNextQueuedTurn().
       this.pendingTurn = null
       turn.resolve(reason)
-      this.startNextQueuedTurn()
+      this.startNextQueuedWork()
     })
   }
 
@@ -993,29 +1133,36 @@ export class PiAcpSession {
       // blocked. Capture and flush them after closing the queue, before settling
       // either the failed request or any drained queued requests.
       void this.flushEmits().finally(() => {
+        const failQueued = (error: unknown) => {
+          for (const entry of queued) {
+            if (entry.kind === 'prompt') entry.reject(error)
+            else entry.fail(error)
+          }
+        }
+
         if (cancelled) {
           // ACP cancellation semantics dominate all underlying failures,
           // including auth-looking stderr from a process being torn down.
           turn.resolve('cancelled')
-          for (const queuedTurn of queued) queuedTurn.resolve('cancelled')
+          this.settleCancelledQueue(queued)
         } else {
           const authErr = maybeAuthRequiredError(err, this.authMethods)
           if (authErr) {
             turn.reject(authErr)
-            for (const queuedTurn of queued) queuedTurn.reject(authErr)
+            failQueued(authErr)
           } else {
             // Non-auth, non-cancel failures must reject the ACP request rather
             // than masquerade as a successful end_turn.
             const rpcError = toRequestError(err)
             turn.reject(rpcError)
-            for (const queuedTurn of queued) queuedTurn.reject(rpcError)
+            failQueued(rpcError)
           }
         }
 
         // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
         // new prompt can start after the atomic queue close above; in that case
         // its own running metadata is authoritative and must not be overwritten.
-        if (!this.pendingTurn) {
+        if (!this.isBusy()) {
           this.emit({
             sessionUpdate: 'session_info_update',
             _meta: { piAcp: { queueDepth: 0, running: false } }
@@ -1033,32 +1180,68 @@ export class PiAcpSession {
     return this.closing || this.disposed
   }
 
-  private startNextQueuedTurn(): void {
+  /**
+   * Hand the FIFO to the next queued prompt or command, or publish the
+   * terminal idle queue metadata when nothing is left to run -- including on
+   * the closing/quarantined path. Settled work always publishes it: an
+   * admitted command already published `running: true` via
+   * {@link emitQueuedNotice}, so staying silent here would leave that as the
+   * client's last snapshot.
+   */
+  private startNextQueuedWork(): void {
+    if (this.isBusy()) return
+
     if (this.isClosing()) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
+      // Cancel-quarantine and shutdown settle here too. Publish the terminal
+      // snapshot before the drained requests resolve so a client's last queue
+      // metadata is never a stale `running: true`.
+      this.publishQueueState(false, 0)
       if (queued.length) {
-        void this.flushEmits().finally(() => {
-          for (const turn of queued) turn.resolve('cancelled')
-        })
+        void this.flushEmits().finally(() => this.settleCancelledQueue(queued))
       }
       return
     }
 
     const next = this.turnQueue.shift()
-    if (next) {
-      // The queued turn's own `session/prompt` request is still in flight, so
-      // this chunk is delivered in-turn for that prompt.
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
-      })
-      this.startTurn(next)
-    } else {
-      this.emit({
-        sessionUpdate: 'session_info_update',
-        _meta: { piAcp: { queueDepth: 0, running: false } }
-      })
+    if (!next) {
+      this.publishQueueState(false, 0)
+      return
     }
+
+    if (next.kind === 'command') {
+      // Claim the slot synchronously: the awaiting caller only resumes in a
+      // later microtask and must not race a prompt arriving before then.
+      this.activeCommand = next.command
+      next.admit(true)
+      return
+    }
+
+    // The queued turn's own `session/prompt` request is still in flight, so
+    // this chunk is delivered in-turn for that prompt.
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: `Starting queued message. (${this.turnQueue.length} remaining)` }
+    })
+    this.startTurn(next)
+  }
+
+  /**
+   * Whether `turn` owns pi's current run, i.e. whether turn-bound events,
+   * custom messages, and extension UI requests belong to that ACP prompt.
+   *
+   * A dispatched-but-not-yet-accepted prompt owns the run only while pi is not
+   * observably busy with autonomous work. Once accepted, `piRunOwned` is the
+   * only proof: an accepted prompt queued as a follow-up (`promptQueued`) does
+   * not own pi's run until its own user message enters it.
+   */
+  private turnOwnsPiRun(turn: PendingTurn | null): boolean {
+    return Boolean(
+      turn &&
+      !turn.completionStarted &&
+      !this.lifecycleAmbiguity &&
+      (turn.piRunOwned || (turn.promptDispatched && !turn.promptAccepted && !this.piBusyOutOfBand))
+    )
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
@@ -1124,12 +1307,7 @@ export class PiAcpSession {
       }
     }
 
-    const ownsPiTurn = Boolean(
-      turn &&
-      !turn.completionStarted &&
-      !this.lifecycleAmbiguity &&
-      (turn.piRunOwned || (turn.promptDispatched && !turn.promptAccepted && !this.piBusyOutOfBand))
-    )
+    const ownsPiTurn = this.turnOwnsPiRun(turn)
 
     // Pi extensions may run autonomously. Until an accepted prompt owns pi's
     // run, turn-bound output must not escape, mutate its result, or race a turn
@@ -1302,15 +1480,8 @@ export class PiAcpSession {
           sequence: ++this.customMessageSequence
         }
         const activeTurn = this.pendingTurn
-        const forwardedTurnActive = Boolean(
-          activeTurn &&
-          !activeTurn.completionStarted &&
-          !this.lifecycleAmbiguity &&
-          (activeTurn.piRunOwned ||
-            (activeTurn.promptDispatched && !activeTurn.promptAccepted && !this.piBusyOutOfBand))
-        )
 
-        if (forwardedTurnActive || this.activeAdapterPromptTurns > 0) {
+        if (this.turnOwnsPiRun(activeTurn) || this.activeAdapterPromptTurns > 0) {
           this.emitCustomMessageBlocks(blocks)
         } else {
           this.pendingCustomMessages.push(pendingMessage)
@@ -1710,12 +1881,7 @@ export class PiAcpSession {
     }
 
     const activeTurn = this.pendingTurn
-    const belongsToPrompt = Boolean(
-      activeTurn &&
-      !activeTurn.completionStarted &&
-      !this.lifecycleAmbiguity &&
-      (activeTurn.piRunOwned || (activeTurn.promptDispatched && !this.piBusyOutOfBand))
-    )
+    const belongsToPrompt = this.turnOwnsPiRun(activeTurn)
     if (!belongsToPrompt && (this.piBusyOutOfBand || Boolean(activeTurn) || Boolean(this.lifecycleAmbiguity))) {
       // ACP permission requests and visible UI updates are turn-bound. An
       // observed autonomous extension run has no client request to attach

@@ -55,10 +55,7 @@ test('PiAcpAgent: resumeSession restores a session without replaying history', a
     return {
       onEvent: () => () => {},
       onTermination: () => () => {},
-      getMessages: async () => {
-        historyReplayCalls += 1
-        return { messages: [] }
-      },
+      whenTerminated: async () => {},
       getTree: async () => {
         historyReplayCalls += 1
         return { tree: [], leafId: null }
@@ -241,6 +238,7 @@ test('PiAcpAgent: an equivalent alias cwd resumes under the recorded cwd', async
     return {
       onEvent: () => () => {},
       onTermination: () => () => {},
+      whenTerminated: async () => {},
       getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }),
       getState: async () => ({
         thinkingLevel: 'medium',

@@ -177,6 +177,7 @@ test('PiAcpAgent: load replay keeps interleaved generic bash content in source o
     ({
       onEvent: () => () => {},
       onTermination: () => () => {},
+      whenTerminated: async () => {},
       getTree: async (beforeResponseResolve?: () => void) => {
         beforeResponseResolve?.()
         return tree

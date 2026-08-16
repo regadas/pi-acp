@@ -16,7 +16,7 @@ function isMcpRejection(e: unknown): boolean {
 
 test('PiAcpAgent: newSession rejects non-empty mcpServers before creating any session', async () => {
   const createCalls: unknown[] = []
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
   ;(agent as any).sessions = {
     async create(params: unknown) {
       createCalls.push(params)
@@ -29,7 +29,7 @@ test('PiAcpAgent: newSession rejects non-empty mcpServers before creating any se
 })
 
 test('PiAcpAgent: loadSession rejects non-empty mcpServers before any session lookup or restore', async () => {
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
 
   // An unknown sessionId would raise resourceNotFound; invalidParams proves
   // the MCP validation runs before any side effect or lookup.
@@ -44,7 +44,7 @@ test('PiAcpAgent: loadSession rejects non-empty mcpServers before any session lo
 })
 
 test('PiAcpAgent: resumeSession rejects non-empty mcpServers before any session lookup or restore', async () => {
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
 
   await assert.rejects(
     agent.resumeSession({
@@ -59,7 +59,7 @@ test('PiAcpAgent: resumeSession rejects non-empty mcpServers before any session 
 test('PiAcpAgent: empty mcpServers pass validation without reaching startup work', async () => {
   const sentinel = new Error('validation passed')
   let createCalls = 0
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
   ;(agent as any).sessions = {
     async create() {
       createCalls += 1

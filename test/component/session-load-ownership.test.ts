@@ -12,6 +12,8 @@ import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 // Isolated workspace: repository-local .pi settings/commands must not leak in.
 const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-load-ownership-cwd-'))
 
+const tick = () => new Promise(resolve => setImmediate(resolve))
+
 function deferred<T = void>() {
   let resolve!: (value: T) => void
   let reject!: (reason?: unknown) => void
@@ -35,10 +37,12 @@ type LoadOwnershipProcOptions = {
 }
 
 class MockProc {
+  disposed = false
   disposeCount = 0
   readonly thinkingLevels: string[] = []
   private readonly getTreeImpl: NonNullable<LoadOwnershipProcOptions['getTree']>
   private thinkingLevel = 'medium'
+  private eventHandlers: Array<(ev: any) => void> = []
 
   constructor(opts?: LoadOwnershipProcOptions) {
     this.getTreeImpl =
@@ -49,21 +53,30 @@ class MockProc {
       })
   }
 
-  onEvent() {
-    return () => {}
+  /** Deliver a live pi event to the installed session, like the real channel. */
+  emit(ev: unknown): void {
+    for (const handler of this.eventHandlers) handler(ev)
+  }
+
+  onEvent(handler: (ev: any) => void) {
+    this.eventHandlers.push(handler)
+    return () => {
+      this.eventHandlers = this.eventHandlers.filter(entry => entry !== handler)
+    }
   }
   onTermination() {
     return () => {}
   }
+  async whenTerminated() {}
   async abort() {}
+  // Idempotent, like PiRpcProcess.dispose().
   dispose() {
+    if (this.disposed) return
+    this.disposed = true
     this.disposeCount += 1
   }
   getTree(beforeResponseResolve?: () => void) {
     return this.getTreeImpl(beforeResponseResolve)
-  }
-  async getMessages() {
-    throw new Error('get_messages must not be used for session/load replay')
   }
   async getAvailableModels() {
     return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -221,6 +234,82 @@ test('setSessionConfigOption waits for an active load and recovers after that lo
     assert.equal(manager.maybeGet('s1')?.proc, retryProc as any)
     assert.equal(loadProc.disposeCount, 1)
   })
+})
+
+test('session/load replay and concurrent live updates share one delivery order', async () => {
+  // A freshly restored pi child can emit autonomous output while session/load
+  // is still replaying history. Both paths must go through the session's
+  // single ordered delivery queue: replay must never jump ahead of a live
+  // update that was already queued.
+  const gate = deferred()
+  const conn = new FakeAgentSideConnection()
+  const delivered: string[] = []
+  let gatedFirstDelivery = false
+
+  conn.sessionUpdate = async msg => {
+    const update = msg.update as { sessionUpdate: string; content?: { text?: unknown } }
+    const text = typeof update.content?.text === 'string' ? update.content.text : update.sessionUpdate
+
+    // Hold the very first delivery open so later updates must queue behind it.
+    if (!gatedFirstDelivery) {
+      gatedFirstDelivery = true
+      await gate.promise
+    }
+    delivered.push(text)
+  }
+
+  const treeStarted = deferred()
+  const releaseTree = deferred()
+  const proc = new MockProc({
+    getTree: async beforeResponseResolve => {
+      treeStarted.resolve()
+      await releaseTree.promise
+      beforeResponseResolve?.()
+      return {
+        tree: [
+          {
+            entry: {
+              id: 'e1',
+              parentId: null,
+              timestamp: '',
+              type: 'message',
+              message: { role: 'assistant', content: [{ type: 'text', text: 'replayed history' }] }
+            },
+            children: []
+          }
+        ],
+        leafId: 'e1'
+      }
+    }
+  })
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).store = new FakeStore()
+  ;(agent as any).scheduleDeferred = () => {}
+
+  await withMockSpawn([proc], async () => {
+    const load = agent.loadSession(loadParams)
+    await treeStarted.promise
+
+    // The session is installed and subscribed: an autonomous extension run
+    // streams while replay is still pending. The first emit occupies the
+    // gated delivery, the second queues behind it.
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'live one' } })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'live two' } })
+    await tick()
+
+    releaseTree.resolve()
+    await tick()
+    gate.resolve()
+    await load
+  })
+
+  const ordered = delivered.filter(text => ['live one', 'live two', 'replayed history'].includes(text))
+  assert.deepEqual(
+    ordered,
+    ['live one', 'live two', 'replayed history'],
+    'replay must be delivered through the same queue as live updates, never ahead of a queued one'
+  )
 })
 
 test('config restore retries when a load begins during the restore TOCTOU window', async () => {

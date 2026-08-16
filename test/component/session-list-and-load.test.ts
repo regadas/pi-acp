@@ -75,7 +75,7 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
     assert.equal(s?.cwd, TEST_CWD)
     assert.equal(s?.title, 'My Named Session')
 
-    // 2) load session: mock spawn to return fake proc with getMessages
+    // 2) load session: mock spawn to return a fake process with persisted history
     const originalSpawn = PiRpcProcess.spawn
     let eventHandler: ((event: Record<string, unknown>) => void) | undefined
     const preBoundarySnapshotMessage = {
@@ -187,6 +187,7 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
           }
         },
         onTermination: () => () => {},
+        whenTerminated: async () => {},
         getTree: async (beforeResponseResolve?: () => void) => {
           eventHandler?.({ type: 'message_end', message: { ...preBoundarySnapshotMessage } })
           eventHandler?.({ type: 'message_end', message: { ...repeatedMessage } })
@@ -201,9 +202,6 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
           eventHandler?.({ type: 'message_end', message: { ...timestampLessSnapshotMessage } })
 
           return treeData
-        },
-        getMessages: async () => {
-          throw new Error('get_messages must not be used for session/load replay')
         },
         getAvailableModels: async () => ({ models: [] }),
         getState: async () => ({

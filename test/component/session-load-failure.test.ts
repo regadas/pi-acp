@@ -29,6 +29,7 @@ type MockProcOptions = {
 }
 
 class MockProc {
+  disposed = false
   disposeCount = 0
   abortCount = 0
   private readonly getTreeImpl: NonNullable<MockProcOptions['getTree']>
@@ -48,17 +49,18 @@ class MockProc {
   onTermination() {
     return () => {}
   }
+  async whenTerminated() {}
   async abort() {
     this.abortCount += 1
   }
+  // Idempotent, like PiRpcProcess.dispose().
   dispose() {
+    if (this.disposed) return
+    this.disposed = true
     this.disposeCount += 1
   }
   getTree(beforeResponseResolve?: () => void) {
     return this.getTreeImpl(beforeResponseResolve)
-  }
-  async getMessages() {
-    throw new Error('get_messages must not be used for session/load replay')
   }
   async getAvailableModels() {
     return { models: [] }

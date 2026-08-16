@@ -9,7 +9,7 @@ test('PiAcpAgent: newSession returns a helpful Internal error when pi is not ins
 
   try {
     const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+    const agent = new PiAcpAgent(asAgentConn(conn))
 
     await assert.rejects(
       () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),

@@ -46,12 +46,10 @@ function mockSpawn(tree: unknown) {
     ({
       onEvent: () => () => {},
       onTermination: () => () => {},
+      whenTerminated: async () => {},
       getTree: async (beforeResponseResolve?: () => void) => {
         beforeResponseResolve?.()
         return tree
-      },
-      getMessages: async () => {
-        throw new Error('get_messages must not be used for session/load replay')
       },
       getAvailableModels: async () => ({ models: [] }),
       // Restore validation requires pi to report the requested session.

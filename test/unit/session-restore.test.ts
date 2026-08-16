@@ -16,6 +16,12 @@ class FakeSessions {
     return this.restoredSession?.sessionId === sessionId ? this.restoredSession : undefined
   }
 
+  // Restores spawn through the manager so every pi child is owned (and waited
+  // for at shutdown) even when the restore disposes it.
+  async spawnOwned(params: any) {
+    return PiRpcProcess.spawn(params)
+  }
+
   getOrCreate(sessionId: string, params: any) {
     if (!this.restoredSession) {
       this.restoredSession = this.buildSession(sessionId, params)
@@ -61,7 +67,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
   }
 
   try {
-    const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+    const agent = new PiAcpAgent(asAgentConn(conn))
     ;(agent as any).sessions = sessions as any
     ;(agent as any).store = {
       get(sessionId: string) {
@@ -166,7 +172,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
   }
 
   try {
-    const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+    const agent = new PiAcpAgent(asAgentConn(conn))
     ;(agent as any).sessions = sessions as any
     ;(agent as any).store = {
       get() {
@@ -233,7 +239,7 @@ test('PiAcpAgent: cancel ignores stale session IDs without spawning a restore pr
   }
 
   try {
-    const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+    const agent = new PiAcpAgent(asAgentConn(conn))
     ;(agent as any).sessions = new FakeSessions(() => {
       throw new Error('cancel should not restore a missing session')
     }) as any

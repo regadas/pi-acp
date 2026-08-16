@@ -31,7 +31,7 @@ function makeAgent(session: any) {
   const conn = new FakeAgentSideConnection()
   // Mutation publications flow through the session's ordered queue.
   session.updateSink = conn
-  const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+  const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).sessions = new FakeSessions(session) as any
   return { agent, conn }
 }

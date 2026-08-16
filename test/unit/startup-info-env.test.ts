@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpAgent, getCachedUpdateNoticeForTests, resetUpdateNoticeCacheForTests } from '../../src/acp/agent.js'
@@ -51,7 +51,7 @@ test('PiAcpAgent: quietStartup=true disables startup info generation/emission', 
       }
     }
 
-    const agent = new PiAcpAgent(asAgentConn(conn), {} as any)
+    const agent = new PiAcpAgent(asAgentConn(conn))
     ;(agent as any).sessions = new FakeSessions(session) as any
 
     // Local seam: capture deferred notifications (agent schedules available
@@ -141,6 +141,82 @@ test('PiAcpAgent: startup info uses PI_CODING_AGENT_DIR for every global pi reso
     assert.ok(startupInfo.includes(join(extensionsDir, 'override-extension.ts')))
     assert.match(startupInfo, /npm:override-package/)
     assert.ok(!startupInfo.includes(join(homedir(), '.pi', 'agent')), 'no hard-coded default agent path')
+  } finally {
+    resetUpdateNoticeCacheForTests()
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+    if (previousPiCommand === undefined) delete process.env.PI_ACP_PI_COMMAND
+    else process.env.PI_ACP_PI_COMMAND = previousPiCommand
+  }
+})
+
+test('PiAcpAgent: skill discovery follows symlinks and terminates on link cycles', async () => {
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+  const previousPiCommand = process.env.PI_ACP_PI_COMMAND
+  const agentDir = mkdtempSync(join(tmpdir(), 'pi-acp-startup-skills-'))
+  const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-startup-skills-cwd-'))
+  const externalRepo = mkdtempSync(join(tmpdir(), 'pi-acp-startup-skills-repo-'))
+  const skillsDir = join(agentDir, 'skills')
+  const realSkillDir = join(skillsDir, 'real-skill')
+  const linkedSkillDir = join(skillsDir, 'linked-skill')
+  mkdirSync(realSkillDir, { recursive: true })
+  mkdirSync(linkedSkillDir, { recursive: true })
+  writeFileSync(join(realSkillDir, 'SKILL.md'), '# Real skill\n', 'utf8')
+  // A symlinked skill file is still a skill.
+  symlinkSync(join(realSkillDir, 'SKILL.md'), join(linkedSkillDir, 'SKILL.md'))
+  // The common real-world layout: a skill directory symlinked into a checkout.
+  // It must be followed, otherwise the skill disappears from discovery.
+  writeFileSync(join(externalRepo, 'SKILL.md'), '# External skill\n', 'utf8')
+  const externalLink = join(skillsDir, 'external-skill')
+  symlinkSync(externalRepo, externalLink, 'dir')
+  // A directory symlink back to its own ancestor: following it naively would
+  // recurse forever and hang session/new.
+  symlinkSync(skillsDir, join(skillsDir, 'loop'), 'dir')
+  writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ quietStartup: false }), 'utf8')
+  const piStub = join(agentDir, 'pi-stub')
+  writeFileSync(piStub, '#!/bin/sh\nprintf "0.80.10\\n"\n', 'utf8')
+  chmodSync(piStub, 0o755)
+
+  process.env.PI_CODING_AGENT_DIR = agentDir
+  process.env.PI_ACP_PI_COMMAND = piStub
+  resetUpdateNoticeCacheForTests()
+  getCachedUpdateNoticeForTests(() => null)
+
+  const session = {
+    sessionId: 's-skills',
+    cwd,
+    ...fakeSessionConfigSync(),
+    proc: {
+      async getAvailableModels() {
+        return { models: [{ provider: 'test', id: 'model', name: 'Model' }] }
+      },
+      async getState() {
+        return { thinkingLevel: 'off', model: { provider: 'test', id: 'model', reasoning: false } }
+      }
+    },
+    setStartupInfo() {},
+    sendStartupInfoIfPending() {}
+  }
+
+  try {
+    const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+    ;(agent as any).sessions = new FakeSessions(session) as any
+    ;(agent as any).scheduleDeferred = () => {}
+
+    // A link cycle must not hang this call.
+    const response = await agent.newSession({ cwd, mcpServers: [] } as any)
+    const startupInfo = String(response._meta?.piAcp?.startupInfo ?? '')
+
+    assert.ok(startupInfo.includes(join(realSkillDir, 'SKILL.md')), 'the real skill is discovered')
+    assert.ok(startupInfo.includes(join(linkedSkillDir, 'SKILL.md')), 'a symlinked skill file is discovered')
+    assert.ok(
+      startupInfo.includes(join(externalLink, 'SKILL.md')),
+      'a skill directory symlinked into a checkout is followed'
+    )
+    assert.ok(
+      !startupInfo.includes(join(skillsDir, 'loop')),
+      'an already-visited directory is not re-entered through a link cycle'
+    )
   } finally {
     resetUpdateNoticeCacheForTests()
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR

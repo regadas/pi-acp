@@ -112,6 +112,48 @@ test('PiAcpSession: an out-of-band run defers dispatch; its settlement admits ex
   assert.equal(proc.prompts.length, 1)
 })
 
+test('PiAcpSession: an accepted prompt pi queued does not own foreign extension UI requests', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+
+  proc.beforePromptAccepted = message => {
+    // pi queued this prompt as a follow-up to work whose agent_start this
+    // session never observed, so the out-of-band gate is down: acceptance
+    // alone proves nothing and the queued user message is the only ownership
+    // proof.
+    proc.emit({ type: 'queue_update', steering: [], followUp: [`expanded:${message}`] })
+  }
+
+  const prompt = session.prompt('hello')
+  await tick()
+  assert.deepEqual(
+    proc.prompts.map(item => item.message),
+    ['hello']
+  )
+
+  proc.emit({ type: 'extension_ui_request', id: 'foreign-ui', method: 'confirm', title: 'Foreign?' })
+  await tick()
+  assert.equal(conn.permissionRequests.length, 0, 'foreign UI must not escape as an ACP permission request')
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'foreign-ui', cancelled: true }])
+  assert.equal(turnBoundUpdateCount(conn), 0, 'no turn-bound update belongs to the queued prompt yet')
+
+  proc.emit({
+    type: 'message_start',
+    message: { role: 'user', content: [{ type: 'text', text: 'expanded:hello' }] }
+  })
+  proc.emit({ type: 'extension_ui_request', id: 'owned-ui', method: 'confirm', title: 'Owned?' })
+  await tick()
+  assert.equal(conn.permissionRequests.length, 1, 'once the queued prompt owns the run, its UI reaches the client')
+  assert.deepEqual(proc.extensionUiResponses, [
+    { id: 'foreign-ui', cancelled: true },
+    { id: 'owned-ui', confirmed: false }
+  ])
+
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+})
+
 test('PiAcpSession: a foreign run buffered before prompt acceptance stays unowned until its queued user message', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
