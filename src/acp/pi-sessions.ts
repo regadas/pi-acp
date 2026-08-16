@@ -329,7 +329,3 @@ export function findPiSession(sessionId: string, options: FindPiSessionOptions =
   // listPiSessions this neither collects every path nor reads title/tail data.
   return findPiSessionUnder(sessionId, options.sessionsDir ?? getPiSessionsDir(), options.onDirectoryVisited)
 }
-
-export function findPiSessionFile(sessionId: string): string | null {
-  return findPiSession(sessionId)?.sessionFile ?? null
-}

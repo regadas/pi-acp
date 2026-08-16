@@ -25,18 +25,16 @@ export function getToolPath(args: unknown): string | undefined {
   return undefined
 }
 
+type EditFields = { oldText?: unknown; newText?: unknown }
+type NormalizedEditInput = { record: EditFields; edits: readonly EditFields[] }
+
 // Match pi's current edit schema: { path, edits: [{ oldText, newText }] }, with
 // legacy top-level oldText/newText still accepted. Pi also normalizes stringified edits.
 // https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts
-function getParsedEdits(args: unknown): Array<{ oldText: string; newText: string }> {
-  const record = args as { oldText?: unknown; newText?: unknown; edits?: unknown } | null | undefined
-  const parsed: Array<{ oldText: string; newText: string }> = []
+function normalizeEditInput(args: unknown): NormalizedEditInput {
+  const record = (args ?? {}) as EditFields & { edits?: unknown }
 
-  if (typeof record?.oldText === 'string' && typeof record?.newText === 'string') {
-    parsed.push({ oldText: record.oldText, newText: record.newText })
-  }
-
-  let edits = record?.edits
+  let edits = record.edits
   if (typeof edits === 'string') {
     try {
       edits = JSON.parse(edits) as unknown
@@ -45,41 +43,41 @@ function getParsedEdits(args: unknown): Array<{ oldText: string; newText: string
     }
   }
 
-  if (Array.isArray(edits)) {
-    for (const edit of edits) {
-      const item = edit as { oldText?: unknown; newText?: unknown } | null | undefined
-      if (typeof item?.oldText === 'string' && typeof item?.newText === 'string') {
-        parsed.push({ oldText: item.oldText, newText: item.newText })
-      }
-    }
-  }
-
-  return parsed
+  return { record, edits: Array.isArray(edits) ? (edits as EditFields[]) : [] }
 }
 
+/** Complete `{ oldText, newText }` pairs, legacy top-level pair first. */
+function completeEdits({ record, edits }: NormalizedEditInput): Array<{ oldText: string; newText: string }> {
+  const pairs: Array<{ oldText: string; newText: string }> = []
+
+  if (typeof record.oldText === 'string' && typeof record.newText === 'string') {
+    pairs.push({ oldText: record.oldText, newText: record.newText })
+  }
+
+  for (const edit of edits) {
+    if (typeof edit?.oldText === 'string' && typeof edit?.newText === 'string') {
+      pairs.push({ oldText: edit.oldText, newText: edit.newText })
+    }
+  }
+
+  return pairs
+}
+
+/**
+ * Every `oldText` that can anchor a location hint, complete pairs first. An
+ * entry whose `newText` is missing or malformed still contributes: the hint is
+ * best-effort and only needs the text being replaced.
+ */
 export function getEditOldTexts(args: unknown): string[] {
-  const record = args as { oldText?: unknown; edits?: unknown } | null | undefined
-  const oldTexts = getParsedEdits(args).map(edit => edit.oldText)
+  const input = normalizeEditInput(args)
+  const oldTexts = new Set(completeEdits(input).map(edit => edit.oldText))
 
-  if (typeof record?.oldText === 'string' && !oldTexts.includes(record.oldText)) oldTexts.push(record.oldText)
-
-  let edits = record?.edits
-  if (typeof edits === 'string') {
-    try {
-      edits = JSON.parse(edits) as unknown
-    } catch {
-      edits = undefined
-    }
+  if (typeof input.record.oldText === 'string') oldTexts.add(input.record.oldText)
+  for (const edit of input.edits) {
+    if (typeof edit?.oldText === 'string') oldTexts.add(edit.oldText)
   }
 
-  if (Array.isArray(edits)) {
-    for (const edit of edits) {
-      const oldText = (edit as { oldText?: unknown } | null | undefined)?.oldText
-      if (typeof oldText === 'string' && !oldTexts.includes(oldText)) oldTexts.push(oldText)
-    }
-  }
-
-  return oldTexts
+  return [...oldTexts]
 }
 
 export function toToolCallLocations(
