@@ -100,7 +100,7 @@ test('setSessionConfigOption: rejects when the post-write probe fails after set_
     }
   )
   assert.deepEqual(thinkingLevels, ['high'])
-  assert.deepEqual(conn.updates, [], 'an unverified write must not publish current_mode/config updates')
+  assert.deepEqual(conn.updates, [], 'an unverified write must not publish config updates')
 })
 
 test('setSessionConfigOption: rejects when pi clamps the requested thinking level', async () => {
@@ -128,30 +128,6 @@ test('setSessionConfigOption: rejects when pi clamps the requested thinking leve
       assert.match(String(e?.message), /did not apply thinking level high/)
       return true
     }
-  )
-  assert.deepEqual(conn.updates, [])
-})
-
-test('setSessionMode: rejects clamped writes through the same verified path', async () => {
-  const session = {
-    sessionId: 's1',
-    cwd: TEST_CWD,
-    ...fakeSessionConfigSync(),
-    proc: {
-      async getAvailableModels() {
-        return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
-      },
-      async getState() {
-        return { thinkingLevel: 'medium', model: { provider: 'test', id: 'alpha', reasoning: true } }
-      },
-      async setThinkingLevel(_level: string) {}
-    }
-  }
-  const { agent, conn } = makeAgent(session)
-
-  await assert.rejects(
-    () => agent.setSessionMode({ sessionId: 's1', modeId: 'high' } as any),
-    (e: any) => e?.code === -32603 && /did not apply thinking level/.test(String(e?.message))
   )
   assert.deepEqual(conn.updates, [])
 })
@@ -277,7 +253,7 @@ test('newSession: unknown model state advertises only the conservative off level
     'no thinking level may be advertised blind'
   )
   assert.equal(thought?.currentValue, 'off', 'currentValue must be one of the advertised options')
-  assert.equal(result.modes?.currentModeId, 'off')
+  assert.equal('modes' in (result as any), false, 'thinking levels are not advertised as legacy session modes')
 })
 
 test('newSession: non-reasoning models advertise only off with a valid currentValue', async () => {
@@ -340,7 +316,7 @@ test('config mutations serialize publication: a second write waits for the first
   }
   const { agent, conn } = makeAgent(session)
 
-  // Block the first mutation's publication (current_mode_update) so its
+  // Block the first mutation's publication (config_option_update) so its
   // exclusive section is still open when the second mutation arrives.
   const deliver = conn.sessionUpdate.bind(conn)
   conn.sessionUpdate = async update => {
@@ -366,14 +342,7 @@ test('config mutations serialize publication: a second write waits for the first
   const relevant = ops.filter(op => op.startsWith('set:') || op.startsWith('publish:'))
   assert.deepEqual(
     relevant,
-    [
-      'set:high',
-      'publish:current_mode_update',
-      'publish:config_option_update',
-      'set:low',
-      'publish:current_mode_update',
-      'publish:config_option_update'
-    ],
+    ['set:high', 'publish:config_option_update', 'set:low', 'publish:config_option_update'],
     'publication is part of the exclusive mutation, so updates arrive in apply order'
   )
 })

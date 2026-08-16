@@ -5,7 +5,7 @@ import type { PiRpcEvent, PiRpcTermination } from '../../src/pi-rpc/process.js'
 type SessionUpdateMsg = SessionNotification
 
 export type ConfigSyncRecord = {
-  seeds: Array<{ configOptions: SessionConfigOption[]; currentModeId: string | undefined }>
+  seeds: SessionConfigOption[][]
   beginCalls: number
   endCalls: number
 }
@@ -29,8 +29,8 @@ export function fakeSessionConfigSync(updateSink?: FakeAgentSideConnection) {
       if (!this.updateSink) throw new Error('fakeSessionConfigSync: no updateSink connected')
       await this.updateSink.sessionUpdate(params)
     },
-    seedSessionConfiguration(configOptions: SessionConfigOption[], currentModeId?: string): void {
-      configSync.seeds.push({ configOptions, currentModeId })
+    seedSessionConfiguration(configOptions: SessionConfigOption[]): void {
+      configSync.seeds.push(configOptions)
     },
     beginConfigurationMutation(): void {
       configSync.beginCalls += 1

@@ -91,19 +91,15 @@ test('PiAcpSession: a configuration probe in flight during an ACP mutation canno
   proc.state = { ...proc.state, thinkingLevel: 'high' }
   await session.sendSessionUpdate({
     sessionId: 's1',
-    update: { sessionUpdate: 'current_mode_update', currentModeId: 'high' }
-  })
-  await session.sendSessionUpdate({
-    sessionId: 's1',
     update: { sessionUpdate: 'config_option_update', configOptions: highOptions }
   })
-  session.seedSessionConfiguration(highOptions, 'high')
+  session.seedSessionConfiguration(highOptions)
   await session.endConfigurationMutation()
 
   const afterMutation = configUpdates(conn)
   assert.deepEqual(
     afterMutation.map(update => update.sessionUpdate),
-    ['current_mode_update', 'config_option_update']
+    ['config_option_update']
   )
 
   releaseProbe()
@@ -124,7 +120,7 @@ test('PiAcpSession: a configuration probe in flight during an ACP mutation canno
   assert.deepEqual(configUpdates(conn), afterMutation, 'stale state must not have been reseeded')
 })
 
-test('PiAcpAgent: setSessionMode publishes exactly one mode and one config update despite pi echoes', async () => {
+test('PiAcpAgent: a thought-level mutation publishes exactly one config update despite pi echoes', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.state = {
@@ -139,7 +135,7 @@ test('PiAcpAgent: setSessionMode publishes exactly one mode and one config updat
   const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as unknown as { sessions: FakeSessions }).sessions = new FakeSessions(session)
 
-  await agent.setSessionMode({ sessionId: 's1', modeId: 'high' })
+  await agent.setSessionConfigOption({ sessionId: 's1', configId: 'thought_level', value: 'high' })
   await tick()
   await tick()
 
@@ -148,12 +144,11 @@ test('PiAcpAgent: setSessionMode publishes exactly one mode and one config updat
   const published = configUpdates(conn)
   assert.deepEqual(
     published.map(update => update.sessionUpdate),
-    ['current_mode_update', 'config_option_update'],
-    'the pi echo must not duplicate the mutation\u2019s own publications'
+    ['config_option_update'],
+    'the pi echo must not duplicate the mutation\u2019s own publication'
   )
-  assert.equal(published[0]?.sessionUpdate === 'current_mode_update' && published[0].currentModeId, 'high')
 
-  const options = published[1]?.sessionUpdate === 'config_option_update' ? published[1].configOptions : []
+  const options = published[0]?.sessionUpdate === 'config_option_update' ? published[0].configOptions : []
   assert.deepEqual(
     options.map(option => [option.id, option.currentValue]),
     [
@@ -164,7 +159,7 @@ test('PiAcpAgent: setSessionMode publishes exactly one mode and one config updat
   )
 })
 
-test('PiAcpAgent: a blocked update queue cannot deliver a stale mode after a mutation published the new one', async () => {
+test('PiAcpAgent: a blocked update queue cannot deliver a stale configuration after a mutation published the new one', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.state = {
@@ -188,11 +183,9 @@ test('PiAcpAgent: a blocked update queue cannot deliver a stale mode after a mut
     if (deliveries === 1) await queueGate
     const update = notification.update
     wire.push(
-      update.sessionUpdate === 'current_mode_update'
-        ? `mode:${update.currentModeId}`
-        : update.sessionUpdate === 'config_option_update'
-          ? `config:${update.configOptions.find(option => option.id === 'thought_level')?.currentValue}`
-          : update.sessionUpdate
+      update.sessionUpdate === 'config_option_update'
+        ? `config:${update.configOptions.find(option => option.id === 'thought_level')?.currentValue}`
+        : update.sessionUpdate
     )
     await deliver(notification)
   }
@@ -206,7 +199,7 @@ test('PiAcpAgent: a blocked update queue cannot deliver a stale mode after a mut
   await tick()
   assert.equal(deliveries, 1, 'the stale sync update must be queued and blocked before the mutation runs')
 
-  const mutation = agent.setSessionMode({ sessionId: 's1', modeId: 'high' })
+  const mutation = agent.setSessionConfigOption({ sessionId: 's1', configId: 'thought_level', value: 'high' })
   await tick()
   await tick()
   assert.equal(wire.length, 0, 'nothing may reach the client while the queue is blocked')
@@ -217,14 +210,9 @@ test('PiAcpAgent: a blocked update queue cannot deliver a stale mode after a mut
   await tick()
 
   assert.deepEqual(proc.thinkingLevels, ['high'])
-  // The pre-fix repro delivered mode:high -> config:high -> mode:medium.
-  assert.deepEqual([...wire], ['mode:medium', 'mode:high', 'config:high'])
-  const lastMode = wire.filter(entry => entry.startsWith('mode:')).at(-1)
-  assert.equal(lastMode, 'mode:high', 'the last mode on the wire must be the mutation\u2019s value')
-  assert.ok(
-    wire.lastIndexOf('mode:high') > wire.lastIndexOf('mode:medium'),
-    'a stale mode may never be delivered after the mutation published the new one'
-  )
+  // The pre-fix repro delivered config:high before the stale config:medium.
+  assert.deepEqual([...wire], ['config:medium', 'config:high'])
+  assert.equal(wire.at(-1), 'config:high', 'the last configuration on the wire must be the mutation\u2019s value')
 })
 
 function deferred() {
@@ -277,11 +265,9 @@ test('PiAcpAgent: a sync queued before a mutation is discarded even when its cal
     if (deliveries === 1) await delivery.promise
     const update = notification.update
     wire.push(
-      update.sessionUpdate === 'current_mode_update'
-        ? `mode:${update.currentModeId}`
-        : update.sessionUpdate === 'config_option_update'
-          ? `config:${update.configOptions.find(option => option.id === 'thought_level')?.currentValue}`
-          : update.sessionUpdate
+      update.sessionUpdate === 'config_option_update'
+        ? `config:${update.configOptions.find(option => option.id === 'thought_level')?.currentValue}`
+        : update.sessionUpdate
     )
     await deliver(notification)
   }
@@ -302,7 +288,7 @@ test('PiAcpAgent: a sync queued before a mutation is discarded even when its cal
 
   // 3. Start the mutation and park it mid-write, so the queued sync's callback
   //    starts after beginConfigurationMutation bumped the epoch.
-  const mutation = agent.setSessionMode({ sessionId: 's1', modeId: 'high' })
+  const mutation = agent.setSessionConfigOption({ sessionId: 's1', configId: 'thought_level', value: 'high' })
   await tick()
   assert.equal(deliveries, 0, 'the mutation must still be applying its write')
 
@@ -333,12 +319,11 @@ test('PiAcpAgent: a sync queued before a mutation is discarded even when its cal
   await tick()
 
   assert.deepEqual(proc.thinkingLevels, ['high'])
-  const modes = wire.filter(entry => entry.startsWith('mode:'))
   const configs = wire.filter(entry => entry.startsWith('config:'))
   // Pre-fix the queued sync adopted the mutation's epoch and appended
-  // mode:medium/config:medium after the mutation's own publications.
-  assert.deepEqual(modes, ['mode:high'], 'no stale mode may reach the wire')
+  // config:medium after the mutation's own publication.
   assert.deepEqual(configs, ['config:high'], 'no stale config option list may reach the wire')
+  assert.deepEqual(wire, configs, 'no update other than the mutation\u2019s config publication may be delivered')
 })
 
 test('PiAcpSession: a sync invoked while another is publishing still reports newer pi state', async () => {
@@ -379,9 +364,11 @@ test('PiAcpSession: a sync invoked while another is publishing still reports new
   // Publishing from a sync is not an ACP mutation, so it must not discard the
   // queued sync that reports the newer level.
   assert.deepEqual(
-    configUpdates(conn)
-      .filter(update => update.sessionUpdate === 'current_mode_update')
-      .map(update => update.currentModeId),
+    configUpdates(conn).map(update =>
+      update.sessionUpdate === 'config_option_update'
+        ? update.configOptions.find(option => option.id === 'thought_level')?.currentValue
+        : update.sessionUpdate
+    ),
     ['medium', 'high']
   )
 })

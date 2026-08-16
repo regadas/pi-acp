@@ -63,7 +63,9 @@ test('app wiring: initialize advertises exactly the implemented capabilities', a
 test('app wiring: unimplemented ACP methods are not registered', async () => {
   const conn = connect()
 
-  for (const method of ['session/fork', 'logout', 'providers/list', 'nes/start']) {
+  // `session/set_mode` included: pi thinking levels are exposed exclusively
+  // through the standard `thought_level` session config option.
+  for (const method of ['session/fork', 'logout', 'providers/list', 'nes/start', 'session/set_mode']) {
     await assert.rejects(
       () => conn.agent.request(method, { sessionId: 'x', cwd: '/tmp' }),
       (err: unknown) => (err as RequestError).code === -32601,

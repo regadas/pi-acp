@@ -83,17 +83,12 @@ export async function applyThinkingLevel(proc: PiRpcProcess, level: ThinkingLeve
   return state
 }
 
-async function getThinkingState(
-  proc: PiRpcProcess,
-  pre?: { state?: any | null }
-): Promise<{
-  availableModes: Array<{
-    id: string
-    name: string
-    description?: string | null
-  }>
-  currentModeId: string
-}> {
+type ThoughtLevelState = {
+  available: readonly ThinkingLevel[]
+  current: ThinkingLevel
+}
+
+async function getThoughtLevelState(proc: PiRpcProcess, pre?: { state?: any | null }): Promise<ThoughtLevelState> {
   const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
 
   const available = thinkingLevelsFromState(state)
@@ -107,30 +102,13 @@ async function getThinkingState(
     current = available.includes('off') ? 'off' : (available[0] ?? 'off')
   }
 
-  return {
-    currentModeId: current,
-    availableModes: available.map(id => ({
-      id,
-      name: `Thinking: ${id}`,
-      description: null
-    }))
-  }
+  return { available, current }
 }
 
 export async function getSessionConfiguration(
   proc: PiRpcProcess,
   pre?: { state?: any | null; availableModels?: any | null }
-): Promise<{
-  configOptions: SessionConfigOption[]
-  modes: {
-    availableModes: Array<{
-      id: string
-      name: string
-      description?: string | null
-    }>
-    currentModeId: string
-  }
-}> {
+): Promise<SessionConfigOption[]> {
   // Resolve each health probe once. Missing prefetches are real RPC calls and
   // failures propagate; only a successful response with absent/unknown data
   // may produce conservative configuration.
@@ -141,15 +119,12 @@ export async function getSessionConfiguration(
     hasAvailableModels ? Promise.resolve(pre?.availableModels) : proc.getAvailableModels()
   ])
   const prefetched = { state, availableModels }
-  const [models, modes] = await Promise.all([
+  const [models, thoughtLevel] = await Promise.all([
     getModelState(proc, prefetched),
-    getThinkingState(proc, { state: prefetched.state })
+    getThoughtLevelState(proc, { state: prefetched.state })
   ])
 
-  return {
-    configOptions: buildConfigOptions({ models, modes }),
-    modes
-  }
+  return buildConfigOptions({ models, thoughtLevel })
 }
 
 function buildConfigOptions(state: {
@@ -157,14 +132,7 @@ function buildConfigOptions(state: {
     availableModels: AdvertisedModel[]
     currentModelId: string
   } | null
-  modes: {
-    availableModes: Array<{
-      id: string
-      name: string
-      description?: string | null
-    }>
-    currentModeId: string
-  }
+  thoughtLevel: ThoughtLevelState
 }): SessionConfigOption[] {
   const configOptions: SessionConfigOption[] = [
     {
@@ -173,11 +141,11 @@ function buildConfigOptions(state: {
       category: 'thought_level',
       name: 'Thinking',
       description: 'Set the reasoning effort for this session',
-      currentValue: state.modes.currentModeId,
-      options: state.modes.availableModes.map(mode => ({
-        value: mode.id,
-        name: mode.name,
-        description: mode.description ?? null
+      currentValue: state.thoughtLevel.current,
+      options: state.thoughtLevel.available.map(level => ({
+        value: level,
+        name: `Thinking: ${level}`,
+        description: null
       }))
     }
   ]
@@ -269,7 +237,7 @@ export async function emitConfigOptionsUpdate(
   proc: PiRpcProcess,
   pre?: { state?: any | null }
 ): Promise<SessionConfigOption[]> {
-  const { configOptions } = await getSessionConfiguration(proc, pre)
+  const configOptions = await getSessionConfiguration(proc, pre)
 
   await sink.sendSessionUpdate({
     sessionId,

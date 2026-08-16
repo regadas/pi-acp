@@ -223,7 +223,12 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
         /does not match the session's recorded cwd/i
       )
 
-      await agent.loadSession({ sessionId: 'sess-1', cwd: TEST_CWD, mcpServers: [], _meta: null })
+      const loaded = await agent.loadSession({ sessionId: 'sess-1', cwd: TEST_CWD, mcpServers: [], _meta: null })
+
+      // Session configuration is returned through standard config options only;
+      // thinking levels are never advertised as legacy session modes.
+      assert.ok(loaded.configOptions?.some(option => option.id === 'thought_level'))
+      assert.equal('modes' in (loaded as any), false)
 
       // loadSession should have replayed messages as session/update notifications.
       const texts = conn.updates

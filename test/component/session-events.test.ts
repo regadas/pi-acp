@@ -206,10 +206,10 @@ test('PiAcpSession: synchronizes session info and thinking configuration events 
   assert.equal(infoUpdates[0]?.title, 'Project session')
   assert.equal(typeof infoUpdates[0]?.updatedAt, 'string')
 
-  const modeUpdates = conn.updates
+  const legacyModeUpdates = conn.updates
     .map(notification => notification.update)
     .filter(update => update.sessionUpdate === 'current_mode_update')
-  assert.deepEqual(modeUpdates, [{ sessionUpdate: 'current_mode_update', currentModeId: 'high' }])
+  assert.deepEqual(legacyModeUpdates, [], 'thinking levels are never published as legacy session modes')
 
   const configUpdates = conn.updates
     .map(notification => notification.update)
@@ -272,18 +272,14 @@ test('PiAcpSession: coalesces thinking events produced by ACP configuration muta
   proc.emit({ type: 'thinking_level_changed', level: 'low' })
   await session.sendSessionUpdate({
     sessionId: 's1',
-    update: { sessionUpdate: 'current_mode_update', currentModeId: 'low' }
-  })
-  await session.sendSessionUpdate({
-    sessionId: 's1',
     update: { sessionUpdate: 'config_option_update', configOptions: lowConfigOptions }
   })
-  session.seedSessionConfiguration(lowConfigOptions, 'low')
+  session.seedSessionConfiguration(lowConfigOptions)
   await session.endConfigurationMutation()
 
   assert.deepEqual(
     conn.updates.map(notification => notification.update.sessionUpdate),
-    ['current_mode_update', 'config_option_update']
+    ['config_option_update']
   )
 })
 

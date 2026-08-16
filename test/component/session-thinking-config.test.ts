@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { RequestError } from '@agentclientprotocol/sdk'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
@@ -14,7 +15,7 @@ class FakeConn {
   }
 }
 
-test('PiAcpAgent: setSessionMode rejects invalid modes for active sessions', async () => {
+test('PiAcpAgent: the thought_level config option rejects unknown levels for active sessions', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const agent = new PiAcpAgent(asAgentConn(conn))
@@ -27,10 +28,15 @@ test('PiAcpAgent: setSessionMode rejects invalid modes for active sessions', asy
     fileCommands: []
   })
 
-  await assert.rejects(() => agent.setSessionMode({ sessionId: 'active', modeId: 'invalid' } as any), /unknown modeId/i)
+  await assert.rejects(
+    () => agent.setSessionConfigOption({ sessionId: 'active', configId: 'thought_level', value: 'invalid' }),
+    /unknown thinking level/i
+  )
+  assert.deepEqual(proc.thinkingLevels, [], 'an invalid level must never reach pi')
+  assert.deepEqual(conn.updates, [])
 })
 
-test('PiAcpAgent: setSessionMode rejects unknown sessions with a typed not-found error', async () => {
+test('PiAcpAgent: invalid thought_level values preserve typed not-found errors for unknown sessions', async () => {
   const oldAgentDir = process.env.PI_CODING_AGENT_DIR
   const oldAcpDir = process.env.PI_ACP_DIR
   process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'pi-acp-thinking-'))
@@ -41,9 +47,15 @@ test('PiAcpAgent: setSessionMode rejects unknown sessions with a typed not-found
     const agent = new PiAcpAgent(conn as any)
 
     await assert.rejects(
-      () => agent.setSessionMode({ sessionId: 'nope', modeId: 'invalid' } as any),
-      /resource not found/i
+      () => agent.setSessionConfigOption({ sessionId: 'nope', configId: 'thought_level', value: 'invalid' }),
+      (error: unknown) => {
+        assert.ok(error instanceof RequestError)
+        assert.equal(error.code, -32002)
+        assert.deepEqual(error.data, { uri: 'nope' })
+        return true
+      }
     )
+    assert.deepEqual(conn.updates, [], 'an unknown session must not publish configuration updates')
   } finally {
     if (oldAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = oldAgentDir

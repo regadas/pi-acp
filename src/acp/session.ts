@@ -131,9 +131,8 @@ export class PiAcpSession {
   private readonly pendingCustomMessages: PendingCustomMessage[] = []
   private publishedTitle: string | null | undefined
   private sessionInfoSyncTail: Promise<void> = Promise.resolve()
-  private publishedModeId: string | undefined
   private publishedConfigFingerprint: string | undefined
-  private publishedConfigModeId: string | undefined
+  private publishedThoughtLevel: string | undefined
   private publishedConfigOptions: SessionConfigOption[] = []
   private configurationSyncTail: Promise<void> = Promise.resolve()
   private configurationMutationDepth = 0
@@ -573,22 +572,21 @@ export class PiAcpSession {
 
   // An ACP-driven publication is authoritative: bumping the epoch discards
   // every configuration probe requested or read before this state.
-  seedSessionConfiguration(configOptions: SessionConfigOption[], currentModeId?: string): void {
+  seedSessionConfiguration(configOptions: SessionConfigOption[]): void {
     this.configurationEpoch += 1
-    this.applyPublishedConfiguration(configOptions, currentModeId)
+    this.applyPublishedConfiguration(configOptions)
   }
 
-  private applyPublishedConfiguration(configOptions: SessionConfigOption[], currentModeId?: string): void {
+  private applyPublishedConfiguration(configOptions: SessionConfigOption[]): void {
     this.publishedConfigOptions = configOptions
     this.publishedConfigFingerprint = JSON.stringify(configOptions)
     const thoughtOption = configOptions.find(option => option.id === THOUGHT_LEVEL_CONFIG_ID)
-    this.publishedConfigModeId =
+    this.publishedThoughtLevel =
       thoughtOption && typeof thoughtOption.currentValue === 'string' ? thoughtOption.currentValue : undefined
-    if (currentModeId !== undefined) this.publishedModeId = currentModeId
   }
 
   // Pi echoes ACP thinking mutations as events; hold that echo until the
-  // request's direct mode/config publications have seeded the de-duplication state.
+  // request's own configuration publication has seeded the de-duplication state.
   beginConfigurationMutation(): void {
     this.configurationMutationDepth += 1
     this.configurationEpoch += 1
@@ -604,7 +602,7 @@ export class PiAcpSession {
     await this.syncSessionConfiguration(undefined, level).catch(() => {})
   }
 
-  syncSessionConfiguration(pre?: { state?: unknown }, expectedModeId?: string): Promise<SessionConfigOption[]> {
+  syncSessionConfiguration(pre?: { state?: unknown }, expectedThoughtLevel?: string): Promise<SessionConfigOption[]> {
     // Captured at invocation rather than inside the queued callback: a probe
     // requested before an ACP mutation must be discarded even when it only
     // starts (and therefore reads pi) after that mutation bumped the epoch.
@@ -613,26 +611,16 @@ export class PiAcpSession {
     const operation = this.configurationSyncTail.then(async () => {
       if (this.disposed || this.configurationEpoch !== epoch) return this.publishedConfigOptions
       if (
-        expectedModeId !== undefined &&
-        this.publishedModeId === expectedModeId &&
-        this.publishedConfigModeId === expectedModeId &&
+        expectedThoughtLevel !== undefined &&
+        this.publishedThoughtLevel === expectedThoughtLevel &&
         this.publishedConfigFingerprint !== undefined
       ) {
         return this.publishedConfigOptions
       }
 
-      const { configOptions, modes } = await getSessionConfiguration(this.proc, pre)
+      const configOptions = await getSessionConfiguration(this.proc, pre)
       if (this.disposed || this.configurationEpoch !== epoch) return this.publishedConfigOptions
       const fingerprint = JSON.stringify(configOptions)
-
-      if (this.publishedModeId !== modes.currentModeId) {
-        await this.enqueueUpdate({
-          sessionUpdate: 'current_mode_update',
-          currentModeId: modes.currentModeId
-        })
-        if (this.configurationEpoch !== epoch) return this.publishedConfigOptions
-        this.publishedModeId = modes.currentModeId
-      }
 
       if (this.publishedConfigFingerprint !== fingerprint) {
         await this.enqueueUpdate({

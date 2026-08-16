@@ -63,10 +63,11 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
 
     const result = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] } as any)
 
-    // Model state is exposed only through standard configOptions; the legacy
-    // custom root `models` field is gone.
+    // Model and thinking state are exposed only through standard
+    // configOptions; the legacy custom root `models` field and the legacy
+    // session-mode representation of thinking levels are both gone.
     assert.equal('models' in (result as any), false)
-    assert.equal(result.modes?.currentModeId, 'high')
+    assert.equal('modes' in (result as any), false)
     assert.deepEqual(result.configOptions, [
       {
         type: 'select',
@@ -198,13 +199,6 @@ test('PiAcpAgent: setSessionConfigOption maps thought level changes to pi and em
     {
       sessionId: 's1',
       update: {
-        sessionUpdate: 'current_mode_update',
-        currentModeId: 'xhigh'
-      }
-    },
-    {
-      sessionId: 's1',
-      update: {
         sessionUpdate: 'config_option_update',
         configOptions: result.configOptions
       }
@@ -245,10 +239,6 @@ test('PiAcpAgent: setSessionConfigOption rejects thinking levels the current mod
       assert.match(String(e?.message), /not supported by the current model/)
       return true
     }
-  )
-  await assert.rejects(
-    () => agent.setSessionMode({ sessionId: 's1', modeId: 'max' } as any),
-    (e: any) => e?.code === -32602
   )
   assert.deepEqual(thinkingLevels, [], 'unsupported levels must be rejected before reaching pi')
 })

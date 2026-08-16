@@ -82,9 +82,10 @@ test('PiAcpAgent: resumeSession restores a session without replaying history', a
 
     // Resume returns current session configuration...
     assert.ok(Array.isArray(res.configOptions) && res.configOptions.length > 0)
-    assert.equal(res.modes?.currentModeId, 'medium')
-    // ...through standard fields only (no custom root models)...
+    assert.equal(res.configOptions?.find(option => option.id === 'thought_level')?.currentValue, 'medium')
+    // ...through standard fields only (no custom root models, no legacy modes)...
     assert.equal('models' in (res as any), false)
+    assert.equal('modes' in (res as any), false)
 
     // ...and MUST NOT replay conversation history before responding.
     assert.equal(historyReplayCalls, 0)

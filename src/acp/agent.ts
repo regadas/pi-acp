@@ -22,8 +22,6 @@ import {
   type SessionInfo,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
-  type SetSessionModeRequest,
-  type SetSessionModeResponse,
   type AuthMethod,
   type StopReason,
   type ToolCallContent
@@ -663,11 +661,11 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.internalError({}, String((stateErr as Error)?.message ?? stateErr))
     }
 
-    const { configOptions, modes } = await getSessionConfiguration(session.proc, {
+    const configOptions = await getSessionConfiguration(session.proc, {
       state,
       availableModels
     })
-    session.seedSessionConfiguration(configOptions, modes.currentModeId)
+    session.seedSessionConfiguration(configOptions)
 
     const quietStartup = getQuietStartup(params.cwd)
     const updateNotice = buildUpdateNotice()
@@ -689,7 +687,6 @@ export class PiAcpAgent implements ACPAgent {
     const response = {
       sessionId: session.sessionId,
       configOptions,
-      modes,
       _meta: {
         piAcp: {
           startupInfo: preludeText || null
@@ -1643,13 +1640,12 @@ export class PiAcpAgent implements ACPAgent {
           })
         }
 
-        const { configOptions, modes } = await getSessionConfiguration(proc)
+        const configOptions = await getSessionConfiguration(proc)
         this.assertLoadActive(params.sessionId, generation)
-        session.seedSessionConfiguration(configOptions, modes.currentModeId)
+        session.seedSessionConfiguration(configOptions)
 
         const response = {
           configOptions,
-          modes,
           _meta: {
             piAcp: {
               startupInfo: null
@@ -1706,8 +1702,8 @@ export class PiAcpAgent implements ACPAgent {
     })
 
     // Unlike session/load, resume MUST NOT replay conversation history.
-    const { configOptions, modes } = await getSessionConfiguration(session.proc)
-    session.seedSessionConfiguration(configOptions, modes.currentModeId)
+    const configOptions = await getSessionConfiguration(session.proc)
+    session.seedSessionConfiguration(configOptions)
 
     this.advertiseCommandsSoon(session, {
       fileCommands: loadSlashCommands(cwd),
@@ -1716,7 +1712,6 @@ export class PiAcpAgent implements ACPAgent {
 
     const response = {
       configOptions,
-      modes,
       _meta: {
         piAcp: {
           startupInfo: null
@@ -1842,42 +1837,6 @@ export class PiAcpAgent implements ACPAgent {
     return result
   }
 
-  async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
-    const mode = String(params.modeId)
-
-    // Restoration, validation, verification, write, and publication share one
-    // queue. Restoring first also preserves resource-not-found precedence for
-    // unknown sessions.
-    await this.runExclusiveConfigMutation(params.sessionId, async () => {
-      const session = await this.restoreSessionAwaitingLoads(params.sessionId)
-      session.beginConfigurationMutation()
-      try {
-        if (!isThinkingLevel(mode)) {
-          throw RequestError.invalidParams({}, `Unknown modeId: ${mode}`)
-        }
-        const state = await applyThinkingLevel(session.proc, mode)
-
-        // Publish through the session queue: an event-driven sync may already
-        // have a stale update in flight, and only shared ordering guarantees
-        // this mutation's state is the last one on the wire.
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'current_mode_update',
-            currentModeId: mode
-          }
-        })
-
-        const configOptions = await emitConfigOptionsUpdate(session, session.sessionId, session.proc, { state })
-        session.seedSessionConfiguration(configOptions, mode)
-      } finally {
-        await session.endConfigurationMutation()
-      }
-    })
-
-    return {}
-  }
-
   async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
     const configId = String(params.configId)
 
@@ -1889,15 +1848,15 @@ export class PiAcpAgent implements ACPAgent {
     if (configId !== MODEL_CONFIG_ID && configId !== THOUGHT_LEVEL_CONFIG_ID) {
       throw RequestError.invalidParams({}, `Unknown config option: ${configId}`)
     }
-    if (configId === THOUGHT_LEVEL_CONFIG_ID && !isThinkingLevel(value)) {
-      throw RequestError.invalidParams({}, `Unknown thinking level: ${value}`)
-    }
 
-    // Check + write + verify + publish run as one exclusive mutation so a
-    // concurrent mutation can neither interleave with the write nor apply
-    // before this one's updates are delivered.
+    // Restore + check + write + verify + publish run as one exclusive mutation.
+    // Restoring first preserves resource-not-found precedence and prevents
+    // concurrent configuration mutations from interleaving.
     const configOptions = await this.runExclusiveConfigMutation(params.sessionId, async () => {
       const session = await this.restoreSessionAwaitingLoads(params.sessionId)
+      if (configId === THOUGHT_LEVEL_CONFIG_ID && !isThinkingLevel(value)) {
+        throw RequestError.invalidParams({}, `Unknown thinking level: ${value}`)
+      }
       session.beginConfigurationMutation()
       try {
         if (configId === MODEL_CONFIG_ID) {
@@ -1908,15 +1867,11 @@ export class PiAcpAgent implements ACPAgent {
         }
 
         const state = await applyThinkingLevel(session.proc, value as ThinkingLevel)
-        await session.sendSessionUpdate({
-          sessionId: session.sessionId,
-          update: {
-            sessionUpdate: 'current_mode_update',
-            currentModeId: value
-          }
-        })
+        // Publish through the session queue: an event-driven sync may already
+        // have a stale update in flight, and only shared ordering guarantees
+        // this mutation's state is the last one on the wire.
         const options = await emitConfigOptionsUpdate(session, session.sessionId, session.proc, { state })
-        session.seedSessionConfiguration(options, value)
+        session.seedSessionConfiguration(options)
         return options
       } finally {
         await session.endConfigurationMutation()

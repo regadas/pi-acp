@@ -38,12 +38,12 @@ child.stdout.on('data', chunk => {
 
     if (msg?.id === 2 && msg?.result?.sessionId && !sessionId) {
       sessionId = msg.result.sessionId
-      // switch thinking level via ACP session/set_mode
+      // switch thinking level via the standard ACP thought_level config option
       send({
         jsonrpc: '2.0',
         id: 3,
-        method: 'session/set_mode',
-        params: { sessionId, modeId: 'low' }
+        method: 'session/set_config_option',
+        params: { sessionId, configId: 'thought_level', value: 'low' }
       })
     }
 

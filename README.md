@@ -26,7 +26,7 @@ Development is centered around [Zed](https://zed.dev) editor support, and other 
   - `session/list` discovers all known pi sessions or filters them by cwd
   - `session/load` restores a session and replays the complete active-branch history (via pi's `get_tree`) before responding: user text and images, assistant text, thinking, and tool calls, tool results, visible custom messages, and `!command` shell executions, including pre-compaction history
   - `session/resume` restores a session without replaying history
-  - Model and thinking-level selection go through standard ACP session config options (`session/set_config_option`); advertised thinking levels mirror exactly what the selected pi model supports (including pi's `max` level)
+  - Model and thinking-level selection go through standard ACP session config options (`session/set_config_option`); advertised thinking levels mirror exactly what the selected pi model supports (including pi's `max` level). Legacy ACP session modes are not used: no session response advertises `modes`, and `session/set_mode` is not implemented
   - `session/close` cancels live work and releases the session subprocess while preserving history
   - `session/delete` idempotently closes and removes a persisted pi session
 - Session persistence
@@ -150,7 +150,7 @@ Loaded from:
 Other built-in commands:
 
 - `/model` - maps to model selector in Zed
-- `/thinking` - maps to 'mode' selector in Zed
+- `/thinking` - maps to the thinking (`thought_level`) config option selector in Zed
 - `/clear` - not implemented (use ACP client 'new' command)
 
 #### 3) Skill commands
