@@ -1,10 +1,12 @@
 # pi-acp
 
-ACP ([Agent Client Protocol](https://agentclientprotocol.com/overview/introduction)) adapter for [`pi`](https://github.com/earendil-works/pi) coding agent (fka shitty coding agent).
+`pi-acp` connects the [`pi`](https://github.com/earendil-works/pi) coding agent to clients that support the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/overview/introduction).
 
-`pi-acp` communicates **ACP JSON-RPC 2.0 over stdio** to an ACP client (e.g. Zed editor) and spawns `pi --mode rpc`, bridging requests/events between the two.
+It translates ACP JSON-RPC 2.0 messages over stdio into commands for `pi --mode rpc`. It then streams pi events back to the client.
 
-This repository is independently maintained by [Filipe Regadas](https://github.com/regadas). It originated from [svkozak/pi-acp](https://github.com/svkozak/pi-acp) and preserves that project's Git history and MIT attribution, but it is not affiliated with the upstream project or its unscoped `pi-acp` npm package. The intended npm identity for a future release is `@regadas/pi-acp`; it is not currently published.
+This repository is maintained by [Filipe Regadas](https://github.com/regadas). It began as a fork of [svkozak/pi-acp](https://github.com/svkozak/pi-acp) and retains that project's Git history and MIT attribution.
+
+This project is independent of the original project and the unscoped `pi-acp` npm package. A future release will use the package name `@regadas/pi-acp`. The package is not published yet.
 
 ## Status
 
