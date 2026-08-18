@@ -382,6 +382,9 @@ test('PiAcpAgent: public close invalidates a load during its private replacement
   const cwd = process.cwd()
   // Restore validation requires pi to report the requested session.
   replacementProc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
+  // The retired child exits on SIGTERM, so the later load clears the
+  // replacement barrier instead of waiting out its bounded timeout.
+  oldProc.terminateOnDispose = true
 
   manager.getOrCreate(sessionId, {
     cwd,
@@ -670,6 +673,9 @@ test('PiAcpAgent: deleteSession closes an active session before removing persist
   try {
     const conn = new FakeAgentSideConnection()
     const proc = new FakePiRpcProcess()
+    // pi appends to the session file by path, so deletion waits for the retired
+    // child to actually exit. Model a child that exits on SIGTERM.
+    proc.terminateOnDispose = true
     const agent = new PiAcpAgent(asAgentConn(conn))
     const manager = (agent as any).sessions as SessionManager
 

@@ -172,6 +172,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
+// Slightly above PiRpcProcess's 2s SIGTERM -> SIGKILL grace plus its 1s stdio
+// close fallback, so an ordinary replacement never trips the barrier while a
+// child that ignores SIGTERM is still being escalated.
+const REPLACEMENT_TERMINATION_TIMEOUT_MS = 5_000
+
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AcpClient
   // Declared before `sessions` so the shared store exists when the manager
@@ -184,10 +189,19 @@ export class PiAcpAgent implements ACPAgent {
   private readonly activePrompts = new Map<string, Set<Promise<void>>>()
   private readonly activeLoads = new Map<string, Set<Promise<void>>>()
   private readonly closingSessions = new Map<string, Promise<void>>()
+  // Delete transactions in flight. A delete owns its session from the close
+  // through the retirement wait, the unlink, and the store tombstone; restoring
+  // anywhere inside that window would spawn a child that recreates the file the
+  // delete is about to remove (pi appends by path), so the deletion would not
+  // stick. `closingSessions` cannot express this: it is cleared as soon as the
+  // close finishes, which is only the first step of a delete.
+  private readonly deletingSessions = new Map<string, Promise<void>>()
   // Serializes model/thinking-level mutations per session so a concurrent
   // write cannot slip between another write's support check and its
   // post-write verification.
   private readonly configMutationQueues = new Map<string, Promise<void>>()
+  // Test seam: bound for the pre-spawn wait on a retired pi child's exit.
+  private replacementTerminationTimeoutMs = REPLACEMENT_TERMINATION_TIMEOUT_MS
   private disposed = false
 
   // Negotiated at initialize: the auth methods this connection advertised.
@@ -241,6 +255,20 @@ export class PiAcpAgent implements ACPAgent {
     }
 
     this.store.delete(sessionId)
+  }
+
+  /**
+   * Best-effort session-file aliases for the replacement barrier. A missing or
+   * unreadable mapping only narrows the barrier to the session id, which is the
+   * pre-existing behavior, so store problems must not fail the caller here.
+   */
+  private knownSessionFiles(sessionId: string): string[] {
+    try {
+      const sessionFile = this.store.get(sessionId)?.sessionFile
+      return sessionFile ? [sessionFile] : []
+    } catch {
+      return []
+    }
   }
 
   private findStoredSession(sessionId: string): { cwd: string; sessionFile: string } | null {
@@ -420,10 +448,29 @@ export class PiAcpAgent implements ACPAgent {
     await this.waitForActivePrompts(sessionId)
   }
 
+  /**
+   * Refuse to hand out (or create) a session while its deletion is in flight.
+   * One check at the single entry point covers the whole restore: the body's
+   * synchronous prefix (including the `findStoredSession` mapping refresh) runs
+   * in the same tick, and concurrent callers awaiting an in-flight restore
+   * already passed this guard themselves.
+   *
+   * Failing closed rather than waiting is deliberate: a restore parked until the
+   * delete finished would still be registered in `activePrompts`, and the
+   * delete's own `closeSessionResources` awaits exactly that set -- the wait
+   * would deadlock the transaction it is waiting for.
+   */
+  private assertNotDeleting(sessionId: string): void {
+    if (!this.deletingSessions.has(sessionId)) return
+    throw RequestError.requestCancelled({}, `session is being deleted: ${sessionId}`)
+  }
+
   private async restoreSession(
     sessionId: string,
     opts?: { cwd?: string; mcpServers?: LoadSessionRequest['mcpServers'] }
   ): Promise<PiAcpSession> {
+    this.assertNotDeleting(sessionId)
+
     const existing = this.sessions.maybeGet(sessionId)
     if (existing) return existing
 
@@ -437,6 +484,14 @@ export class PiAcpAgent implements ACPAgent {
       }
 
       const cwd = opts?.cwd ?? stored.cwd
+
+      // pi does not coordinate concurrent writers on a session file, so a
+      // replacement must not open this session's file while the child it
+      // replaces is still being terminated. Disposal only starts that
+      // escalation, so wait (bounded, fail closed) for the real exit first.
+      // Keyed by the file as well as the id: a child retired under a *different*
+      // session id (pi reported another identity) may still append to this file.
+      await this.sessions.waitForRetiredProcesses([sessionId, stored.sessionFile], this.replacementTerminationTimeoutMs)
 
       // Spawned through the session manager so the child is owned (and waited
       // for at shutdown) even if this restore disposes it below.
@@ -456,8 +511,11 @@ export class PiAcpAgent implements ACPAgent {
 
       // The connection may have been torn down while the spawn was in flight;
       // a disposed agent must never register (and thereby leak) this process.
+      // Every disposal below retires through the manager: this child opened
+      // `stored.sessionFile`, so an immediate retry must wait for its exit
+      // instead of opening the same file a second time.
       if (this.disposed) {
-        proc.dispose()
+        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
         throw RequestError.internalError({}, 'pi-acp agent is disposed')
       }
 
@@ -469,14 +527,14 @@ export class PiAcpAgent implements ACPAgent {
       try {
         state = (await proc.getState()) as any
       } catch (e) {
-        proc.dispose()
+        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
         throw (
           maybeAuthRequiredError(e, this.authMethods) ??
           RequestError.internalError({}, `pi did not report its session state: ${String((e as Error)?.message ?? e)}`)
         )
       }
       if (this.disposed) {
-        proc.dispose()
+        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
         throw RequestError.internalError({}, 'pi-acp agent is disposed')
       }
 
@@ -487,7 +545,12 @@ export class PiAcpAgent implements ACPAgent {
         !reportedFile ||
         (stored.sessionFile && !sessionPathsEquivalent(reportedFile, stored.sessionFile))
       ) {
-        proc.dispose()
+        // The child reported a different identity, so it may append to either
+        // file. Gate every identity a later restore could reach it through:
+        // otherwise a `session/load` for the *reported* id discovers that file
+        // (findPiSession scans pi's own directory) and spawns a second writer
+        // while this one is still escalating SIGTERM -> SIGKILL.
+        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile, reportedId, reportedFile])
         throw RequestError.internalError(
           {},
           `pi did not restore the requested session (requested ${sessionId} at ${stored.sessionFile}, ` +
@@ -514,7 +577,7 @@ export class PiAcpAgent implements ACPAgent {
         if (this.sessions.maybeGet(sessionId) === session && session.proc === proc) {
           this.sessions.close(sessionId)
         } else {
-          proc.dispose()
+          this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
         }
         throw error
       }
@@ -1729,7 +1792,9 @@ export class PiAcpAgent implements ACPAgent {
         // durable session file/store entry is retained so the session remains
         // loadable.
         if (!this.sessions.evictIfCurrent(params.sessionId, session)) {
-          session.dispose()
+          // A newer load already registered its own session under this id; this
+          // one still has to be retired through the replacement barrier.
+          this.sessions.retire(session)
         }
         throw error
       }
@@ -1780,28 +1845,66 @@ export class PiAcpAgent implements ACPAgent {
     return {}
   }
 
-  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
-    await this.closeSession({ sessionId: params.sessionId })
+  /**
+   * Run the whole delete transaction under one admission marker, registered
+   * synchronously so no restore can slip between the close and the unlink.
+   * Concurrent deletes for the same session coalesce onto this promise, which
+   * keeps the marker alive until the last one is done; a later retry after a
+   * failure starts a fresh transaction.
+   */
+  private beginSessionDelete(sessionId: string): Promise<void> {
+    const inProgress = this.deletingSessions.get(sessionId)
+    if (inProgress) return inProgress
 
-    // Only unlink a session file discovered by scanning pi's real session
-    // directory whose recorded header matches this sessionId. The adapter's
-    // session map is never trusted for deletion: a tampered map entry must
-    // not let session/delete unlink arbitrary paths.
-    const piSession = findPiSession(params.sessionId)
-    if (piSession) {
-      try {
-        unlinkSync(piSession.sessionFile)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw RequestError.internalError(
-            { code: (error as NodeJS.ErrnoException).code, path: piSession.sessionFile },
-            `Failed to delete session: ${params.sessionId}`
-          )
+    const deleting = Promise.resolve()
+      .then(async () => {
+        // Close admission, cancel every prompt path, dispose at the normal
+        // lifecycle point, and wait for the ACP responses to settle.
+        await this.beginSessionClose(sessionId)
+
+        // pi appends to its session file by path, reopening it per write, so a
+        // child that is still exiting recreates a file deleted underneath it as
+        // a stray stub. Wait (bounded, fail closed) for the retired child to
+        // actually exit first; an expired wait leaves the session file and its
+        // mapping intact rather than reporting a deletion that did not stick.
+        // The file path is gated too, so a child retired under another identity
+        // that may still append to this file also blocks the unlink.
+        await this.sessions.waitForRetiredProcesses(
+          [sessionId, ...this.knownSessionFiles(sessionId)],
+          this.replacementTerminationTimeoutMs
+        )
+
+        // Only unlink a session file discovered by scanning pi's real session
+        // directory whose recorded header matches this sessionId. The adapter's
+        // session map is never trusted for deletion: a tampered map entry must
+        // not let session/delete unlink arbitrary paths.
+        const piSession = findPiSession(sessionId)
+        if (piSession) {
+          try {
+            unlinkSync(piSession.sessionFile)
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+              throw RequestError.internalError(
+                { code: (error as NodeJS.ErrnoException).code, path: piSession.sessionFile },
+                `Failed to delete session: ${sessionId}`
+              )
+            }
+          }
         }
-      }
-    }
 
-    this.store.delete(params.sessionId)
+        this.store.delete(sessionId)
+      })
+      .finally(() => {
+        if (this.deletingSessions.get(sessionId) === deleting) {
+          this.deletingSessions.delete(sessionId)
+        }
+      })
+    this.deletingSessions.set(sessionId, deleting)
+    return deleting
+  }
+
+  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    await this.beginSessionDelete(params.sessionId)
 
     // Deleting an unknown or already-deleted session succeeds silently.
     return {}
@@ -1833,35 +1936,39 @@ export class PiAcpAgent implements ACPAgent {
   ): Promise<void> {
     if (this.sessions.maybeGet(session.sessionId) !== session) return
 
+    // Only a failed discovery selects the legacy file-based fallback. A
+    // delivery failure must not fall through to a second advertisement, which
+    // would silently replace pi's richer command set with the legacy list.
+    let availableCommands: AvailableCommand[]
     try {
       const pi = (await session.proc.getCommands()) as any
       const { commands } = toAvailableCommandsFromPiGetCommands(pi, {
         enableSkillCommands: opts.enableSkillCommands,
         includeExtensionCommands: false
       })
-
-      if (this.sessions.maybeGet(session.sessionId) !== session) return
-      await this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'available_commands_update',
-          availableCommands: mergeCommands(commands, builtinAvailableCommands())
-        }
-      })
-      return
+      availableCommands = mergeCommands(commands, builtinAvailableCommands())
     } catch {
       // Fall back to file-based prompt templates (legacy behavior).
+      availableCommands = mergeCommands(toAvailableCommands(opts.fileCommands), builtinAvailableCommands())
     }
 
     if (this.sessions.maybeGet(session.sessionId) !== session) return
     try {
-      await this.conn.sessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'available_commands_update',
-          availableCommands: mergeCommands(toAvailableCommands(opts.fileCommands), builtinAvailableCommands())
-        }
-      })
+      // Delivered through the session's ordered update chain: this deferred
+      // notification must not overtake updates already queued for the client.
+      // Sessions replaced under the same sessionId have independent chains, so
+      // the identity check is repeated at delivery time -- a stale chain held by
+      // a slow client must not land its commands after the replacement's.
+      await session.sendSessionUpdate(
+        {
+          sessionId: session.sessionId,
+          update: {
+            sessionUpdate: 'available_commands_update',
+            availableCommands
+          }
+        },
+        { isStale: () => this.sessions.maybeGet(session.sessionId) !== session }
+      )
     } catch {
       // The session or ACP connection may have closed before this deferred update.
     }

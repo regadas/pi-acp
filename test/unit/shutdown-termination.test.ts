@@ -49,6 +49,22 @@ async function spawnOwnedFake(manager: SessionManager, proc: FakePiRpcProcess): 
   }
 }
 
+/** Count spawn attempts through the real seam without producing a child. */
+function countedSpawn() {
+  const originalSpawn = PiRpcProcess.spawn
+  const state = { count: 0 }
+  ;(PiRpcProcess as any).spawn = async () => {
+    state.count += 1
+    return new FakePiRpcProcess() as unknown as PiRpcProcess
+  }
+  return {
+    state,
+    restore() {
+      PiRpcProcess.spawn = originalSpawn
+    }
+  }
+}
+
 function registerSession(manager: SessionManager, proc: FakePiRpcProcess, sessionId = 's1'): void {
   manager.getOrCreate(sessionId, {
     cwd: process.cwd(),
@@ -200,13 +216,54 @@ test('SessionManager.disposeAllAndWait: waits for a child a failed restore alrea
   assert.equal(settled, true)
 })
 
-test('SessionManager.spawnOwned: a spawn finishing after teardown is disposed and awaited', async () => {
+test('SessionManager.spawnOwned: refuses to start a child once teardown began', async () => {
+  const manager = new SessionManager()
+  const spawn = countedSpawn()
+
+  try {
+    manager.disposeAll()
+
+    // `disposeAllAndWait` can already have observed empty owned/pending sets and
+    // returned, so a child created here would never be awaited (nor SIGKILLed)
+    // before the adapter exits. Fail before any child exists instead.
+    await assert.rejects(manager.spawnOwned({ cwd: process.cwd() }), /session manager is disposed/)
+    assert.equal(spawn.state.count, 0, 'no pi child may be started after teardown')
+
+    // Nothing was created, so final shutdown stays immediate.
+    await manager.disposeAllAndWait(5_000)
+  } finally {
+    spawn.restore()
+  }
+})
+
+test('SessionManager.spawnOwned: cannot start a child after disposeAllAndWait already returned', async () => {
+  const manager = new SessionManager()
+  const spawn = countedSpawn()
+
+  try {
+    // Nothing owned or pending: shutdown drains instantly and the adapter is
+    // free to exit from here on.
+    await manager.disposeAllAndWait(5_000)
+
+    // This is the regression: a restore parked on the retirement barrier is
+    // registered in neither `owned` nor `pendingSpawns`, so it resumes only
+    // after the drain returned.
+    await assert.rejects(manager.spawnOwned({ cwd: process.cwd() }), /session manager is disposed/)
+    assert.equal(spawn.state.count, 0, 'a late spawn must never reach PiRpcProcess.spawn')
+  } finally {
+    spawn.restore()
+  }
+})
+
+test('SessionManager: a child handed over after teardown is still disposed and awaited', async () => {
   const manager = new SessionManager()
   const proc = new FakePiRpcProcess()
 
   manager.disposeAll()
-  await spawnOwnedFake(manager, proc)
-  assert.equal(proc.disposeCount, 1, 'a child spawned into a disposed manager must not stay alive')
+  // `spawnOwned` now refuses outright, but a child handed over through any
+  // other ownership path must still be signalled and waited for.
+  assert.throws(() => registerSession(manager, proc, 's-late-handover'), /disposed/i)
+  assert.equal(proc.disposeCount, 1, 'a child owned after teardown must not stay alive')
 
   let settled = false
   const waited = manager.disposeAllAndWait(5_000).then(() => {

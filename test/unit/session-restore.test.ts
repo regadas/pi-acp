@@ -22,6 +22,10 @@ class FakeSessions {
     return PiRpcProcess.spawn(params)
   }
 
+  // No child was ever retired for these sessions, so the pre-spawn barrier is
+  // a no-op here.
+  async waitForRetiredProcesses() {}
+
   getOrCreate(sessionId: string, params: any) {
     if (!this.restoredSession) {
       this.restoredSession = this.buildSession(sessionId, params)

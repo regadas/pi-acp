@@ -38,6 +38,12 @@ const baseParams = () => ({
   fileCommands: []
 })
 
+// A create that fails *before* pi reported an authoritative sessionId/sessionFile
+// cannot be retried by sessionId: no adapter mapping exists and `findPiSession`
+// has no id to match, so nothing can ever open that child's file again. Bare
+// disposal is correct there -- the replacement barrier is keyed by sessionId and
+// would have no key. Once the identity is known (store-write and construction
+// failures below), the child must be retired through the barrier instead.
 test('SessionManager.create: a get_state failure disposes the spawned process and rejects', async () => {
   await withEnv({ PI_ACP_DIR: mkdtempSync(join(tmpdir(), 'pi-acp-own-')) }, async () => {
     const proc = new FakePiRpcProcess()
@@ -99,6 +105,19 @@ test('SessionManager.create: a session-store write failure disposes the spawned 
         await assert.rejects(() => manager.create(baseParams() as any))
         assert.equal(proc.disposeCount, 1)
         assert.equal(manager.maybeGet('sess-1'), undefined)
+        assert.equal(proc.terminated, false, 'disposal only starts its termination')
+
+        // pi created this session, so `findPiSession` can still discover the
+        // file by scanning pi's directory even though the mapping write failed:
+        // a session/load must not open it while this child can still append.
+        await assert.rejects(
+          manager.waitForRetiredProcesses('sess-1', 15),
+          /did not exit within/i,
+          'the barrier must gate the next restore of this session'
+        )
+
+        proc.emitTermination({ reason: 'exit', code: 0, expected: true })
+        await manager.waitForRetiredProcesses('sess-1', 10)
       }
     )
   })
@@ -119,6 +138,14 @@ test('SessionManager.create: construction/subscription failure disposes the owne
         await assert.rejects(() => manager.create(baseParams() as any), /subscription failed/)
         assert.equal(proc.disposeCount, 1)
         assert.equal(manager.maybeGet('sess-construct'), undefined)
+        assert.equal(proc.terminated, false)
+
+        // The store mapping already exists here, so a later session/load can
+        // target this exact file.
+        await assert.rejects(manager.waitForRetiredProcesses('sess-construct', 15), /did not exit within/i)
+
+        proc.emitTermination({ reason: 'exit', code: 0, expected: true })
+        await manager.waitForRetiredProcesses('sess-construct', 10)
       }
     )
   })
@@ -168,7 +195,7 @@ test('SessionManager.getOrCreate: a losing fresh process is disposed when a regi
   })
 })
 
-test('SessionManager.getOrCreate: construction/subscription failure disposes the owned process', () => {
+test('SessionManager.getOrCreate: construction/subscription failure disposes the owned process', async () => {
   const manager = new SessionManager()
   const proc = new FakePiRpcProcess()
   ;(proc as any).onEvent = () => {
@@ -181,6 +208,10 @@ test('SessionManager.getOrCreate: construction/subscription failure disposes the
   )
   assert.equal(proc.disposeCount, 1)
   assert.equal(manager.maybeGet('sess-construct'), undefined)
+  await assert.rejects(manager.waitForRetiredProcesses('sess-construct', 15), /did not exit within/i)
+
+  proc.emitTermination({ reason: 'exit', code: 0, expected: true })
+  await manager.waitForRetiredProcesses('sess-construct', 10)
 })
 
 test('SessionManager.getOrCreate: refuses registration after disposeAll and disposes the process', async () => {

@@ -107,18 +107,36 @@ export class FakePiRpcProcess {
       stderrTail: '',
       ...info
     }
-    this.terminated = true
+    this.markTerminated()
     for (const h of this.terminationHandlers) h(termination)
   }
 
   terminated = false
+  private terminationWaiters: Array<() => void> = []
 
   whenTerminated(): Promise<void> {
     if (this.terminated) return Promise.resolve()
     return new Promise<void>(resolve => {
-      this.onTermination(() => resolve())
+      this.terminationWaiters.push(resolve)
     })
   }
+
+  /** Settle `whenTerminated` waiters; `emitTermination` also runs the handlers. */
+  private markTerminated(): void {
+    this.terminated = true
+    const waiters = this.terminationWaiters
+    this.terminationWaiters = []
+    for (const resolve of waiters) resolve()
+  }
+
+  /**
+   * Whether disposal terminates the child. Default `false` keeps it "alive"
+   * after SIGTERM so shutdown-escalation tests stay in control; tests that need
+   * a child which exits promptly on disposal opt in. Opting in emits a real
+   * termination (handlers *and* `whenTerminated`) because the two are
+   * inseparable in `PiRpcProcess.settleTermination`.
+   */
+  terminateOnDispose = false
 
   async prompt(message: string, attachments: unknown[] = [], onAccepted?: () => void): Promise<void> {
     this.prompts.push({ message, attachments })
@@ -173,6 +191,12 @@ export class FakePiRpcProcess {
     const pending = [...this.pending]
     this.pending.clear()
     for (const reject of pending) reject(new Error('pi process closed'))
+
+    // A real disposed child exits on SIGTERM (or is SIGKILLed), which is what
+    // the replacement barrier waits for.
+    if (this.terminateOnDispose) {
+      this.emitTermination({ reason: 'exit', code: 0, signal: null, expected: options?.expected ?? true })
+    }
   }
 
   async sendExtensionUiResponse(response: unknown): Promise<void> {

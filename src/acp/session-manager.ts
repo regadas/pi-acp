@@ -35,6 +35,14 @@ export class SessionManager {
   // `PiRpcProcess.spawn` before its promise resolves, so shutdown has to know
   // work is in flight even before it can see the process itself.
   private readonly pendingSpawns = new Set<Promise<void>>()
+  // Children that have not exited yet, indexed by every identity through which
+  // a later restore can reach the same persisted file: the sessionId it was
+  // asked for, its session-file path, and (when pi reported a different
+  // identity) the reported id and path. Disposal only starts the SIGTERM ->
+  // SIGKILL escalation, so a replacement must wait here first: pi session files
+  // have no writer coordination, and two live children would interleave their
+  // history writes. One process is commonly registered under several keys.
+  private readonly retiring = new Map<string, Set<PiRpcProcess>>()
   private readonly store: SessionStore
   private disposed = false
 
@@ -122,6 +130,17 @@ export class SessionManager {
    * the spawn -- is then covered by {@link disposeAllAndWait}.
    */
   spawnOwned(params: { cwd: string; sessionPath?: string; piCommand?: string }): Promise<PiRpcProcess> {
+    // Refuse before a child exists. A caller can reach this point long after
+    // teardown began -- a restore parked on {@link waitForRetiredProcesses} is
+    // registered nowhere -- and by then `disposeAllAndWait` may already have
+    // observed empty `owned`/`pendingSpawns` sets and returned, so the adapter
+    // is free to exit. Spawning then would leave a child that nothing waits
+    // for (nor escalates to SIGKILL). Guarding here covers every caller,
+    // because this is the only path that starts a pi child.
+    if (this.disposed) {
+      return Promise.reject(RequestError.internalError({}, 'pi-acp session manager is disposed'))
+    }
+
     const spawning = PiRpcProcess.spawn({ ...params, onProcess: proc => this.own(proc) })
 
     // Ownership is also taken on resolution: a spawn seam that never calls the
@@ -135,13 +154,118 @@ export class SessionManager {
     return spawning
   }
 
-  /** Dispose a session; its process stays owned until the child terminates. */
-  private retire(session: PiAcpSession): void {
+  /**
+   * Dispose a session and record its child for the replacement barrier. Public
+   * because a caller that built a session which never became (or is no longer)
+   * the registered one must retire it through the same path: the child already
+   * opened that session's persisted file.
+   */
+  retire(session: PiAcpSession): void {
+    this.trackRetired([session.sessionId], session.proc)
     try {
       session.dispose()
     } catch {
       // ignore
     }
+  }
+
+  /**
+   * Retire a pi child that is not registered under a session but did open that
+   * session's persisted file (restore validation failures, registration race
+   * losers, teardown during a restore). Plain `proc.dispose()` only *starts*
+   * the SIGTERM -> SIGKILL escalation, so skipping this lets the next restore
+   * open the same file while this child can still append to it.
+   */
+  retireProcess(sessionId: string, proc: PiRpcProcess, aliases: readonly string[] = []): void {
+    this.trackRetired([sessionId, ...aliases], proc)
+    proc.dispose()
+  }
+
+  /**
+   * Register `proc` under every supplied identity. `aliases` matter when pi
+   * reported a different session than the one it was asked for: the child may
+   * append to either file, so a later restore reaching it by *any* of those
+   * identities has to wait for this child to exit.
+   */
+  private trackRetired(keys: readonly string[], proc: PiRpcProcess): void {
+    let registered = false
+    for (const key of new Set(keys)) {
+      if (!key) continue
+      let procs = this.retiring.get(key)
+      if (!procs) {
+        procs = new Set()
+        this.retiring.set(key, procs)
+      }
+      procs.add(proc)
+      registered = true
+    }
+    if (!registered) return
+
+    // Sweep the live index rather than a captured key list: the same child can
+    // pick up further aliases before it exits, and a leftover alias would gate
+    // later restores forever. Deleting visited Map entries while iterating is
+    // safe.
+    const forget = () => {
+      for (const [key, procs] of this.retiring) {
+        procs.delete(proc)
+        if (procs.size === 0) this.retiring.delete(key)
+      }
+    }
+    void proc.whenTerminated().then(forget, forget)
+  }
+
+  /**
+   * Bounded fail-closed barrier before a session is restored onto a new pi
+   * child: resolve once every child previously retired for this session has
+   * actually exited. Callers must not spawn a replacement before this settles,
+   * and an expired wait rejects rather than opening the same session file
+   * twice.
+   */
+  async waitForRetiredProcesses(keys: string | readonly string[], timeoutMs: number): Promise<void> {
+    const wanted = [...new Set((typeof keys === 'string' ? [keys] : keys).filter(Boolean))]
+    const sessionId = wanted[0] ?? ''
+    // Every identity that can reach the same writer gates this caller, so a
+    // restore keyed by a session id is still blocked by a child retired only
+    // under that session's file path (or vice versa).
+    const stillRetiring = (): Set<PiRpcProcess> => {
+      const procs = new Set<PiRpcProcess>()
+      for (const key of wanted) {
+        for (const proc of this.retiring.get(key) ?? []) procs.add(proc)
+      }
+      return procs
+    }
+    if (!stillRetiring().size) return
+
+    let timer: NodeJS.Timeout | undefined
+    const expired = Symbol('expired')
+    const deadline = new Promise<typeof expired>(resolve => {
+      timer = setTimeout(() => resolve(expired), timeoutMs)
+      timer.unref?.()
+    })
+
+    try {
+      // A close racing this wait can retire another child for the same
+      // session, so re-read the index instead of trusting one snapshot.
+      // `awaited` keeps the loop finite regardless of when a terminated child
+      // drops out of `retiring`.
+      const awaited = new Set<PiRpcProcess>()
+      while (true) {
+        const pending = [...stillRetiring()].filter(proc => !awaited.has(proc))
+        if (!pending.length) return
+        for (const proc of pending) awaited.add(proc)
+
+        const settled = await Promise.race([Promise.all(pending.map(proc => proc.whenTerminated())), deadline])
+        if (settled === expired) break
+      }
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+
+    throw RequestError.internalError(
+      { sessionId },
+      `The previous pi process for session ${sessionId} did not exit within ${timeoutMs}ms; ` +
+        'refusing to start a second process on the same session file.'
+    )
   }
 
   private assertNotDisposed(proc?: PiRpcProcess): void {
@@ -200,6 +324,11 @@ export class SessionManager {
     // The ACP sessionId must be pi's authoritative persisted session identity;
     // fabricating one would return an ID that can never be found, listed, or
     // loaded again. Any failure past this point owns the spawned process.
+    // The two failures below happen before pi reported an authoritative
+    // identity, so no sessionId can name this child's file: nothing can be
+    // retried by sessionId, no store mapping exists, and `findPiSession` has no
+    // id to match. A bare disposal is therefore correct -- the replacement
+    // barrier is keyed by sessionId and would have nothing to key on.
     let state: any = null
     try {
       state = (await proc.getState()) as any
@@ -231,7 +360,11 @@ export class SessionManager {
     try {
       this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
     } catch (e) {
-      proc.dispose()
+      // pi already created this session, and `findPiSession` discovers it by
+      // scanning pi's own directory, so a later session/load can target the
+      // file even though the adapter mapping was never written. Retire through
+      // the barrier so that load cannot open it while this child still exits.
+      this.retireProcess(sessionId, proc, [sessionFile])
       throw toRequestError(e)
     }
 
@@ -248,7 +381,9 @@ export class SessionManager {
         authMethods: params.authMethods
       })
     } catch (error) {
-      proc.dispose()
+      // The store mapping already exists, so a later session/load can target
+      // this file: retire through the barrier instead of a bare dispose.
+      this.retireProcess(sessionId, proc)
       throw error
     }
 
@@ -273,11 +408,16 @@ export class SessionManager {
     // Restores spawn through `spawnOwned`; take ownership anyway so a process
     // handed over by any other path is still awaited at shutdown.
     this.own(params.proc)
-    this.assertNotDisposed(params.proc)
+    if (this.disposed) {
+      // This child already opened the session file, so it is retired (not just
+      // disposed) even when registration is refused.
+      this.retireProcess(sessionId, params.proc)
+      throw RequestError.internalError({}, 'pi-acp session manager is disposed')
+    }
 
     const existing = this.maybeGet(sessionId)
     if (existing) {
-      if (existing.proc !== params.proc) params.proc.dispose()
+      if (existing.proc !== params.proc) this.retireProcess(sessionId, params.proc)
       return existing
     }
 
@@ -294,7 +434,7 @@ export class SessionManager {
         authMethods: params.authMethods
       })
     } catch (error) {
-      params.proc.dispose()
+      this.retireProcess(sessionId, params.proc)
       throw error
     }
 

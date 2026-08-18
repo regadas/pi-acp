@@ -66,7 +66,24 @@ type QueuedPrompt = {
 }
 
 /** The adapter-handled slash command currently holding the session FIFO. */
-type ActiveCommand = { cancelled: boolean }
+type ActiveCommand = {
+  cancelled: boolean
+  /**
+   * Absolute deadline for waiting out autonomous pi work before this command
+   * may talk to pi. Set at its first park and preserved across re-parks, so
+   * re-parking can never extend the bounded wait.
+   */
+  admissionDeadlineAt?: number
+  /**
+   * Set when the channel died (or was fault-quarantined) while this command
+   * held the FIFO slot. Termination can land between any two of the command's
+   * await boundaries, so the classification is recorded on the command itself
+   * and rechecked after admission and before any result is published or
+   * returned. Left unset for a client cancel or adapter-driven teardown, which
+   * keep ACP cancellation semantics.
+   */
+  terminalFailure?: Error
+}
 
 /**
  * An adapter-handled slash command waiting for its place in the session FIFO.
@@ -75,6 +92,16 @@ type ActiveCommand = { cancelled: boolean }
  */
 type QueuedCommand = {
   kind: 'command'
+  command: ActiveCommand
+  admit: (admitted: boolean) => void
+  fail: (err: unknown) => void
+}
+
+/**
+ * An adapter-handled command that holds (or has just claimed) the FIFO slot and
+ * must wait for an autonomous pi run to settle before it may talk to pi.
+ */
+type DeferredCommandAdmission = {
   command: ActiveCommand
   admit: (admitted: boolean) => void
   fail: (err: unknown) => void
@@ -233,8 +260,15 @@ export class PiAcpSession {
   private piQueueHasMessages = false
   private continuationExpected = false
   private lifecycleAmbiguity: Error | null = null
+  // Two independent things can be held back by the out-of-band gate: a prompt's
+  // raw dispatch and an adapter command's admission. They are deliberately
+  // separate state machines, so every settlement path (complete, fail, cancel,
+  // shutdown, disposal, termination) must clear *both*.
   private deferredDispatch: { turn: PendingTurn; message: string; images: unknown[] } | null = null
   private deferredAdmissionTimer: NodeJS.Timeout | null = null
+  // Adapter command holding the FIFO slot while an out-of-band pi run settles.
+  private deferredCommandAdmission: DeferredCommandAdmission | null = null
+  private deferredCommandAdmissionTimer: NodeJS.Timeout | null = null
   private readonly deferredAdmissionTimeoutMs: number
 
   // For ACP diff support: capture file contents before edit/write mutations,
@@ -289,22 +323,143 @@ export class PiAcpSession {
 
   private handleProcessTermination(termination: PiRpcTermination): void {
     this.procTermination = termination
+    // Captured before releasing a parked command: settling that admission can
+    // hand the FIFO on, and only the turn installed at termination may be
+    // failed with this termination error.
     const turn = this.pendingTurn
-    if (!turn || turn.completionStarted) return
 
     // Adapter-driven teardown (dispose/close) settles as a cancellation, not
     // as an internal error surfaced to the client. Fault quarantine explicitly
     // opts out so disposal cannot reclassify the fault as cancellation.
+    // Classified before anything is settled below, because it decides how
+    // queued work settles too.
     if (termination.expected || this.closing || this.disposalExpected) this.cancelRequested = true
+
+    // One classification for every kind of work that can no longer finish:
+    // the running command, queued requests, and a parked admission.
+    const failure = this.terminalFailure(termination)
+
+    // A command already past admission must be marked *before* any slot or
+    // queue state is handed on: it may be sitting on an await inside its body
+    // and must not resume into a successful publication or return.
+    this.failActiveCommand(failure)
+
+    // Nothing queued may start against a dead child: settle it *before* the
+    // parked command's slot is handed on, since releasing that slot runs the
+    // next queued prompt or (purely local) built-in.
+    this.settleQueuedWorkForTermination(termination)
+
+    // A command parked on an out-of-band run can never be admitted once the
+    // child is gone: settle it locally instead of leaving it on its timeout.
+    // It is waiting work like a queued request, so an unexpected exit rejects
+    // it with the termination error rather than reporting a benign cancel.
+    this.releaseDeferredCommandAdmission(failure)
+    if (!turn || turn.completionStarted) return
+
     this.failTurn(turn, terminationError(termination))
+  }
+
+  /**
+   * Record on the command holding the FIFO slot that it can no longer produce a
+   * result, because the channel died or was fault-quarantined under it.
+   *
+   * `failure` is null only for a client cancel or adapter-driven teardown,
+   * which keep ACP cancellation semantics; otherwise the command must reject
+   * rather than report a benign cancellation for work pi never completed.
+   * `cancelled` is set either way, which is what stops every publication path
+   * (including {@link CommandContext.sendSessionUpdate}).
+   */
+  private failActiveCommand(failure: Error | null): void {
+    const command = this.activeCommand
+    if (!command) return
+    command.cancelled = true
+    if (failure) command.terminalFailure ??= failure
+  }
+
+  /**
+   * The error a command must reject with instead of reporting success, or null
+   * when ACP cancellation semantics apply. Combines a failure recorded while it
+   * waited with a live check, because termination can land between any two of
+   * the command's await boundaries. The first non-null classification is
+   * memoized so every later recheck rejects with the same error.
+   */
+  private commandTerminalFailure(command: ActiveCommand): Error | null {
+    if (command.terminalFailure) return command.terminalFailure
+    const failure = this.terminalFailure(this.procTermination)
+    if (failure) command.terminalFailure = failure
+    return failure
+  }
+
+  /** Drain and settle every queued prompt/command once the child is gone. */
+  private settleQueuedWorkForTermination(termination: PiRpcTermination): void {
+    const queued = this.turnQueue.splice(0, this.turnQueue.length)
+    if (!queued.length) return
+    void this.flushEmits().finally(() => this.settleTerminalQueue(queued, termination))
+  }
+
+  /**
+   * Settle queued work that can never run because the channel is closing or the
+   * child is gone. A client cancel or adapter-driven teardown keeps ACP
+   * cancellation semantics; an unexpected exit rejects with the termination
+   * error instead, so a queued request never reports a benign outcome for work
+   * pi never ran.
+   */
+  private settleTerminalQueue(queued: QueuedWork[], termination: PiRpcTermination | null): void {
+    const failure = this.terminalFailure(termination)
+    if (!failure) {
+      this.settleCancelledQueue(queued)
+      return
+    }
+
+    for (const entry of queued) {
+      if (entry.kind === 'prompt') entry.reject(failure)
+      else entry.fail(failure)
+    }
+  }
+
+  /**
+   * The error every request still waiting on this child must reject with, or
+   * null when ACP cancellation semantics apply instead (client cancel or
+   * adapter-driven teardown). One classification for queued work and for a
+   * command parked on the out-of-band admission gate.
+   */
+  private terminalFailure(termination: PiRpcTermination | null): Error | null {
+    if (this.cancelRequested) return null
+    if (termination) return this.toTurnFailure(terminationError(termination))
+
+    // Fault quarantine (`dispose({ expected: false })`) kills the channel
+    // synchronously, long before the child's termination event can arrive. Work
+    // still waiting at that moment never ran and never will, so it must not
+    // report a benign cancellation merely because `procTermination` is not
+    // populated yet. An expected disposal (client cancel, adapter teardown)
+    // keeps ACP cancellation semantics.
+    if (this.disposed && !this.disposalExpected) {
+      return this.toTurnFailure(
+        new Error('pi process was shut down after an unrecoverable fault before this request could run.')
+      )
+    }
+
+    return null
+  }
+
+  /** Map an internal failure onto the ACP error a turn-based request rejects with. */
+  private toTurnFailure(err: unknown): Error {
+    return maybeAuthRequiredError(err, this.authMethods) ?? toRequestError(err)
   }
 
   dispose(options?: { expected?: boolean }): void {
     if (this.disposed) return
     this.disposed = true
     this.disposalExpected = options?.expected ?? true
+    // Classified after the disposal flags are set, so a fault quarantine
+    // (`expected: false`, e.g. lifecycle ambiguity or a timed-out RPC) rejects
+    // the work it kills instead of reporting a benign cancellation for a
+    // request pi never ran. An expected disposal keeps cancellation semantics.
+    const failure = this.terminalFailure(null)
+    this.failActiveCommand(failure)
     // A held dispatch must never fire into a disposed channel.
     this.clearDeferredDispatch()
+    this.releaseDeferredCommandAdmission(failure)
     try {
       this.unsubscribe()
     } finally {
@@ -448,31 +603,70 @@ export class PiAcpSession {
    * the command was cancelled before or during execution.
    */
   async runCommand<T>(run: (ctx: CommandContext) => Promise<T>): Promise<T | null> {
-    if (this.isClosing()) return null
+    // Defense in depth for the invariant `startNextQueuedWork` enforces for
+    // queued work: no adapter command may run local-only work and report
+    // success for a session whose child is gone or whose channel was
+    // quarantined. An unexpected exit or fault rejects; client cancel and
+    // adapter-driven teardown stay cancellations. Not reachable through
+    // PiAcpAgent today (its only caller has no await between restoring the
+    // session and this call), so keep it to this check.
+    const entryFailure = this.terminalFailure(this.procTermination)
+    if (entryFailure) throw entryFailure
+    if (this.procTermination || this.isClosing()) return null
 
     const command: ActiveCommand = { cancelled: false }
-    if (!(await this.admitCommand(command))) return null
-
-    // Cancellation can land between admission and this resumption. Release the
-    // held FIFO slot without opening an adapter turn: a command that never runs
-    // must not flush the deferred startup banner or buffered custom messages.
-    if (command.cancelled) {
-      this.releaseCommandSlot()
+    if (!(await this.admitCommandForExecution(command))) {
+      // The admission was released rather than rejected, but the channel may
+      // still have died under it: reject instead of reporting a benign
+      // cancellation for work pi never ran. The slot was already handed on by
+      // whichever path released this admission.
+      if (command.terminalFailure) throw command.terminalFailure
       return null
     }
 
+    // Cancellation or termination can land between admission and this
+    // resumption. Release the held FIFO slot without opening an adapter turn: a
+    // command that never runs must not flush the deferred startup banner or
+    // buffered custom messages.
+    const admissionFailure = this.commandTerminalFailure(command)
+    if (admissionFailure) {
+      this.releaseCommandSlotFor(command)
+      throw admissionFailure
+    }
+    if (command.cancelled || this.isClosing()) {
+      this.releaseCommandSlotFor(command)
+      return null
+    }
+
+    // This command is now proven admitted, un-cancelled, and on a live channel,
+    // so it is safe to clear a cancellation that predates it: an idle
+    // `session/cancel` must not later classify this command's own crash as a
+    // benign cancellation. A cancellation that landed while it waited is
+    // preserved by the checks above and never reaches this line.
+    this.cancelRequested = false
+
+    // A terminal failure is as final as a cancellation for publication: nothing
+    // computed against a dead or quarantined channel may reach the client.
+    const settled = () => command.cancelled || Boolean(this.commandTerminalFailure(command))
     const ctx: CommandContext = {
-      cancelled: () => command.cancelled,
-      sendSessionUpdate: params => (command.cancelled ? Promise.resolve() : this.sendSessionUpdate(params))
+      cancelled: settled,
+      sendSessionUpdate: params => (settled() ? Promise.resolve() : this.sendSessionUpdate(params))
     }
 
     const finishAdapterPromptTurn = this.beginAdapterPromptTurn()
     try {
       const result = await run(ctx)
+      // Termination can land while the body ran: its result was computed against
+      // a child that is gone, so it must not be returned as a success.
+      const failure = this.commandTerminalFailure(command)
+      if (failure) throw failure
       return command.cancelled ? null : result
     } catch (error) {
       // A cancelled command's RPC rejects because cancellation quarantined the
-      // channel; report the cancellation rather than that induced failure.
+      // channel; report the cancellation rather than that induced failure. An
+      // unexpected termination is a real failure and must still reject.
+      const failure = this.commandTerminalFailure(command)
+      if (failure) throw failure
       if (command.cancelled) return null
       throw error
     } finally {
@@ -486,18 +680,143 @@ export class PiAcpSession {
     this.startNextQueuedWork()
   }
 
+  /**
+   * Admit an adapter command into the FIFO and keep it out of pi's way until the
+   * out-of-band gate is genuinely clear at the moment its body starts.
+   *
+   * `agent_settled` admits a parked command synchronously, but pi's stdout
+   * records are dispatched as one synchronous batch, so a later `agent_start`
+   * in the same batch can re-raise the gate before this caller's microtask
+   * runs. (A deferred prompt dispatch is immune because it is sent from inside
+   * that same handler.) Recheck after every resumption and re-park -- keeping
+   * the FIFO slot, so later prompts stay queued -- until the gate is clear.
+   */
+  private async admitCommandForExecution(command: ActiveCommand): Promise<boolean> {
+    if (!(await this.admitCommand(command))) return false
+
+    while (!command.cancelled && this.piBusyOutOfBand && !this.procTermination && !this.isClosing()) {
+      const readmitted = await new Promise<boolean>((resolve, reject) => {
+        this.admitClaimedCommand({ command, admit: resolve, fail: reject })
+      })
+      if (!readmitted) return false
+    }
+
+    return true
+  }
+
   private admitCommand(command: ActiveCommand): Promise<boolean> {
     // Claim the FIFO slot synchronously so a prompt arriving before this
     // caller resumes cannot start ahead of the command.
     if (!this.isBusy() && !this.turnQueue.length) {
       this.activeCommand = command
-      return Promise.resolve(true)
+      return new Promise<boolean>((resolve, reject) => {
+        this.admitClaimedCommand({ command, admit: resolve, fail: reject })
+      })
     }
 
     return new Promise<boolean>((resolve, reject) => {
       this.turnQueue.push({ kind: 'command', command, admit: resolve, fail: reject })
       this.emitQueuedNotice()
     })
+  }
+
+  /**
+   * Release a command that already holds the FIFO slot. Adapter commands reach
+   * pi through manual RPCs that pi will not abort, so one must never start
+   * while an autonomous run owns the event stream: keep the claimed slot (so
+   * later prompts stay queued) until that run reaches its authoritative
+   * `agent_settled` boundary, and fail closed if it never arrives. A dead or
+   * closing channel never defers -- the command's own RPC fails fast instead of
+   * parking behind a run that can no longer settle.
+   *
+   * Every park of one command shares a single absolute deadline, so re-parking
+   * after a same-batch gate re-raise cannot extend the bounded wait.
+   */
+  private admitClaimedCommand(entry: DeferredCommandAdmission): void {
+    if (!this.piBusyOutOfBand || this.procTermination || this.isClosing()) {
+      entry.admit(true)
+      return
+    }
+
+    const command = entry.command
+    command.admissionDeadlineAt ??= Date.now() + this.deferredAdmissionTimeoutMs
+    const remainingMs = command.admissionDeadlineAt - Date.now()
+    if (remainingMs <= 0) {
+      this.failClaimedCommandAdmission(entry)
+      return
+    }
+
+    this.deferredCommandAdmission = entry
+    const timer = setTimeout(() => {
+      if (this.deferredCommandAdmissionTimer === timer) this.deferredCommandAdmissionTimer = null
+      if (this.deferredCommandAdmission !== entry) return
+
+      // Detach before quarantining: disposal settles a parked admission as a
+      // plain cancellation, which would mask this timeout.
+      this.deferredCommandAdmission = null
+      this.failClaimedCommandAdmission(entry)
+    }, remainingMs)
+    timer.unref?.()
+    this.deferredCommandAdmissionTimer = timer
+  }
+
+  /**
+   * The out-of-band run never reached its settlement boundary within the
+   * command's whole admission budget. The child lifecycle can no longer be
+   * correlated safely, so quarantine it, hand the FIFO slot on, and reject.
+   */
+  private failClaimedCommandAdmission(entry: DeferredCommandAdmission): void {
+    const error = new Error('Timed out waiting for out-of-band pi work to settle before running the command.')
+    this.dispose({ expected: false })
+    this.releaseCommandSlotFor(entry.command)
+    entry.fail(error)
+  }
+
+  /** Admit a parked command at pi's authoritative settlement boundary. */
+  private admitDeferredCommand(): void {
+    const entry = this.takeDeferredCommandAdmission()
+    entry?.admit(true)
+  }
+
+  /**
+   * Settle a parked command admission without running it (cancel, shutdown,
+   * disposal, termination). It never reached pi, so it settles locally and
+   * hands its FIFO slot to whatever is next. The command stays marked cancelled
+   * either way so no later resumption can run its body.
+   *
+   * `failure` is set only when the child died unexpectedly or the channel was
+   * fault-quarantined: that request never ran and must not report a benign
+   * cancellation. Callers that pass it also record it via
+   * {@link failActiveCommand}, which is what {@link runCommand} converts into a
+   * rejection; rejecting the parked promise here simply keeps that failure on
+   * the awaiting call's own boundary instead of relying on the recorded copy.
+   */
+  private releaseDeferredCommandAdmission(failure: Error | null = null): void {
+    const entry = this.takeDeferredCommandAdmission()
+    if (!entry) return
+    entry.command.cancelled = true
+    this.releaseCommandSlotFor(entry.command)
+    if (failure) entry.fail(failure)
+    else entry.admit(false)
+  }
+
+  private takeDeferredCommandAdmission(): DeferredCommandAdmission | null {
+    const entry = this.deferredCommandAdmission
+    this.deferredCommandAdmission = null
+    if (this.deferredCommandAdmissionTimer) {
+      clearTimeout(this.deferredCommandAdmissionTimer)
+      this.deferredCommandAdmissionTimer = null
+    }
+    return entry
+  }
+
+  /**
+   * Hand on the FIFO slot of a command that never entered `runCommand`'s body,
+   * which is the only path that releases the slot itself.
+   */
+  private releaseCommandSlotFor(command: ActiveCommand): void {
+    if (this.activeCommand !== command) return
+    this.releaseCommandSlot()
   }
 
   private isBusy(): boolean {
@@ -551,6 +870,10 @@ export class PiAcpSession {
     if (activeCommand) {
       activeCommand.cancelled = true
 
+      // A command still waiting for an autonomous run to settle never reached
+      // pi: settle it locally instead of leaving it parked on its timeout.
+      this.releaseDeferredCommandAdmission()
+
       // Fail closed. pi's `abort` stops an agent run; it does not cancel the
       // manual compaction/export RPC an adapter command is waiting on, so an
       // aborted command would keep the ACP request and the FIFO held for the
@@ -588,6 +911,33 @@ export class PiAcpSession {
         await this.flushEmits()
         this.settleCancelledQueue(queued)
       }
+      return
+    }
+
+    if (!activeTurn.piRunOwned) {
+      // This prompt reached pi but does not own a pi run, so `abort` -- which
+      // stops the *currently running* run -- cannot stop it. Two shapes reach
+      // here, and quarantining the channel is the only way to guarantee neither
+      // executes after the client cancelled it:
+      //
+      // - Not acknowledged yet: still in preflight (extension input hooks,
+      //   overflow compaction), so no run exists for `abort` to stop. It can
+      //   succeed while preflight continues and pi then starts this very prompt.
+      // - Acknowledged but queued as a follow-up (`promptQueued`), or accepted
+      //   while autonomous work held the stream: `abort` would stop that
+      //   unrelated run while pi still delivers our queued message later, which
+      //   then claims ownership at its `message_start` and streams cancelled
+      //   work to the client.
+      //
+      // Ownership implies acceptance (`piRunOwned` is only ever set at the
+      // acceptance boundary or a matching `message_start`), so an accepted,
+      // owned run still takes the ordinary `abort` path below. The agent evicts
+      // this unavailable session so the next request restores a fresh
+      // subprocess.
+      this.dispose()
+      this.completeTurn(activeTurn)
+      await this.flushEmits()
+      this.settleCancelledQueue(queued)
       return
     }
 
@@ -632,9 +982,10 @@ export class PiAcpSession {
     // instead of depending on agent-level cancellation tracking.
     if (this.activeCommand) this.activeCommand.cancelled = true
 
-    // Drop any held dispatch before the first await so its admission timeout
-    // cannot race shutdown settlement.
+    // Drop any held dispatch or parked command admission before the first
+    // await so their admission timeouts cannot race shutdown settlement.
     this.clearDeferredDispatch()
+    this.releaseDeferredCommandAdmission()
 
     // Drain the queue synchronously so nothing already queued can start while
     // abort is in flight, but settle those requests only after final updates.
@@ -661,13 +1012,22 @@ export class PiAcpSession {
     await this.flushEmits()
   }
 
-  private enqueueUpdate(update: SessionUpdate): Promise<void> {
-    const delivery = this.lastEmit.then(() =>
-      this.conn.sessionUpdate({
+  /**
+   * `isStale` is evaluated *inside* the ordered chain, not before enqueueing:
+   * an update can wait here behind a slow client delivery, and a replacement
+   * session registered under the same sessionId in that window has its own
+   * chain, so a stale publication would otherwise land after the replacement's.
+   * It is opt-in per call so ordinary updates -- including final ones during
+   * teardown -- are never suppressed.
+   */
+  private enqueueUpdate(update: SessionUpdate, isStale?: () => boolean): Promise<void> {
+    const delivery = this.lastEmit.then(() => {
+      if (isStale?.()) return
+      return this.conn.sessionUpdate({
         sessionId: this.sessionId,
         update
       })
-    )
+    })
 
     this.lastEmit = delivery.catch(() => {
       // Ignore notification errors (client may have gone away). We still want
@@ -680,11 +1040,14 @@ export class PiAcpSession {
     void this.enqueueUpdate(update)
   }
 
-  sendSessionUpdate(params: Parameters<AcpClient['sessionUpdate']>[0]): Promise<void> {
+  sendSessionUpdate(
+    params: Parameters<AcpClient['sessionUpdate']>[0],
+    opts?: { isStale?: () => boolean }
+  ): Promise<void> {
     if (params.sessionId !== this.sessionId) {
       return Promise.reject(new Error(`session update mismatch: ${params.sessionId}`))
     }
-    return this.enqueueUpdate(params.update)
+    return this.enqueueUpdate(params.update, opts?.isStale)
   }
 
   /**
@@ -1146,17 +1509,11 @@ export class PiAcpSession {
           turn.resolve('cancelled')
           this.settleCancelledQueue(queued)
         } else {
-          const authErr = maybeAuthRequiredError(err, this.authMethods)
-          if (authErr) {
-            turn.reject(authErr)
-            failQueued(authErr)
-          } else {
-            // Non-auth, non-cancel failures must reject the ACP request rather
-            // than masquerade as a successful end_turn.
-            const rpcError = toRequestError(err)
-            turn.reject(rpcError)
-            failQueued(rpcError)
-          }
+          // Non-auth, non-cancel failures must reject the ACP request rather
+          // than masquerade as a successful end_turn.
+          const failure = this.toTurnFailure(err)
+          turn.reject(failure)
+          failQueued(failure)
         }
 
         // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
@@ -1191,14 +1548,18 @@ export class PiAcpSession {
   private startNextQueuedWork(): void {
     if (this.isBusy()) return
 
-    if (this.isClosing()) {
+    // A terminated child is just as terminal as a closing session: no queued
+    // prompt may be dispatched into a dead channel, and no adapter command may
+    // run local-only work and report success for a session that is gone.
+    const termination = this.procTermination
+    if (this.isClosing() || termination) {
       const queued = this.turnQueue.splice(0, this.turnQueue.length)
       // Cancel-quarantine and shutdown settle here too. Publish the terminal
       // snapshot before the drained requests resolve so a client's last queue
       // metadata is never a stale `running: true`.
       this.publishQueueState(false, 0)
       if (queued.length) {
-        void this.flushEmits().finally(() => this.settleCancelledQueue(queued))
+        void this.flushEmits().finally(() => this.settleTerminalQueue(queued, termination))
       }
       return
     }
@@ -1213,7 +1574,7 @@ export class PiAcpSession {
       // Claim the slot synchronously: the awaiting caller only resumes in a
       // later microtask and must not race a prompt arriving before then.
       this.activeCommand = next.command
-      next.admit(true)
+      this.admitClaimedCommand(next)
       return
     }
 
@@ -1800,6 +2161,9 @@ export class PiAcpSession {
         this.lowLevelAgentEnded = false
         this.piQueueHasMessages = false
         this.continuationExpected = false
+        // An adapter command parked behind that run is admitted at the same
+        // boundary that admits a deferred prompt dispatch.
+        this.admitDeferredCommand()
         const activeTurn = this.pendingTurn
         if (!activeTurn) break
 
