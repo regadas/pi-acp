@@ -18,38 +18,35 @@ class FakeStore {
   upsert() {}
 }
 
-const bashResultTree = {
-  tree: [
+const bashResultSnapshot = {
+  entries: [
     {
-      entry: {
-        type: 'message',
-        id: 'e1',
-        parentId: null,
-        timestamp: '2026-02-11T00:00:01.000Z',
-        message: {
-          role: 'toolResult',
-          toolCallId: 'call_1',
-          toolName: 'bash',
-          args: { command: 'echo hello' },
-          content: [{ type: 'text', text: 'hello from bash' }],
-          isError: false
-        }
-      },
-      children: []
+      type: 'message',
+      id: 'e1',
+      parentId: null,
+      timestamp: '2026-02-11T00:00:01.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'call_1',
+        toolName: 'bash',
+        args: { command: 'echo hello' },
+        content: [{ type: 'text', text: 'hello from bash' }],
+        isError: false
+      }
     }
   ],
   leafId: 'e1'
 }
 
-function mockSpawn(tree: unknown) {
+function mockSpawn(snapshot: unknown) {
   return async () =>
     ({
       onEvent: () => () => {},
       onTermination: () => () => {},
       whenTerminated: async () => {},
-      getTree: async (beforeResponseResolve?: () => void) => {
+      getEntries: async (beforeResponseResolve?: () => void) => {
         beforeResponseResolve?.()
-        return tree
+        return snapshot
       },
       getAvailableModels: async () => ({ models: [] }),
       // Restore validation requires pi to report the requested session.
@@ -59,7 +56,7 @@ function mockSpawn(tree: unknown) {
 
 test('PiAcpAgent: loadSession replays toolResult with negotiated Zed terminal metadata', async () => {
   const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(bashResultTree)
+  ;(PiRpcProcess as any).spawn = mockSpawn(bashResultSnapshot)
 
   try {
     const conn = new FakeAgentSideConnection()
@@ -100,7 +97,7 @@ test('PiAcpAgent: loadSession replays toolResult with negotiated Zed terminal me
 
 test('PiAcpAgent: loadSession replays bash output as standard content without negotiation', async () => {
   const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(bashResultTree)
+  ;(PiRpcProcess as any).spawn = mockSpawn(bashResultSnapshot)
 
   try {
     const conn = new FakeAgentSideConnection()
@@ -131,25 +128,22 @@ test('PiAcpAgent: loadSession replays bash output as standard content without ne
   }
 })
 
-const bashImageResultTree = {
-  tree: [
+const bashImageResultSnapshot = {
+  entries: [
     {
-      entry: {
-        type: 'message',
-        id: 'e1',
-        parentId: null,
-        timestamp: '2026-02-11T00:00:01.000Z',
-        message: {
-          role: 'toolResult',
-          toolCallId: 'call_img',
-          toolName: 'bash',
-          args: { command: 'render' },
-          content: [{ type: 'image', data: 'YmFzaA==', mimeType: 'image/png' }],
-          details: { stdout: 'rendered chart\n', exitCode: 0 },
-          isError: false
-        }
-      },
-      children: []
+      type: 'message',
+      id: 'e1',
+      parentId: null,
+      timestamp: '2026-02-11T00:00:01.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'call_img',
+        toolName: 'bash',
+        args: { command: 'render' },
+        content: [{ type: 'image', data: 'YmFzaA==', mimeType: 'image/png' }],
+        details: { stdout: 'rendered chart\n', exitCode: 0 },
+        isError: false
+      }
     }
   ],
   leafId: 'e1'
@@ -157,7 +151,7 @@ const bashImageResultTree = {
 
 test('PiAcpAgent: loadSession retains bash image blocks alongside negotiated terminal metadata', async () => {
   const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(bashImageResultTree)
+  ;(PiRpcProcess as any).spawn = mockSpawn(bashImageResultSnapshot)
 
   try {
     const conn = new FakeAgentSideConnection()
@@ -189,7 +183,7 @@ test('PiAcpAgent: loadSession retains bash image blocks alongside negotiated ter
 
 test('PiAcpAgent: loadSession retains bash image blocks as standard content for generic clients', async () => {
   const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(bashImageResultTree)
+  ;(PiRpcProcess as any).spawn = mockSpawn(bashImageResultSnapshot)
 
   try {
     const conn = new FakeAgentSideConnection()
@@ -214,30 +208,27 @@ test('PiAcpAgent: loadSession retains bash image blocks as standard content for 
 })
 
 test('PiAcpAgent: loadSession keeps failed replayed tools monotonic (never completed then failed)', async () => {
-  const failedTree = {
-    tree: [
+  const failedSnapshot = {
+    entries: [
       {
-        entry: {
-          type: 'message',
-          id: 'e1',
-          parentId: null,
-          timestamp: '2026-02-11T00:00:01.000Z',
-          message: {
-            role: 'toolResult',
-            toolCallId: 'call_err',
-            toolName: 'read',
-            content: [{ type: 'text', text: 'no such file' }],
-            isError: true
-          }
-        },
-        children: []
+        type: 'message',
+        id: 'e1',
+        parentId: null,
+        timestamp: '2026-02-11T00:00:01.000Z',
+        message: {
+          role: 'toolResult',
+          toolCallId: 'call_err',
+          toolName: 'read',
+          content: [{ type: 'text', text: 'no such file' }],
+          isError: true
+        }
       }
     ],
     leafId: 'e1'
   }
 
   const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(failedTree)
+  ;(PiRpcProcess as any).spawn = mockSpawn(failedSnapshot)
 
   try {
     const conn = new FakeAgentSideConnection()

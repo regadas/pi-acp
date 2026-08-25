@@ -26,7 +26,7 @@ test('PiAcpAgent: does not emit startup info on loadSession', async () => {
       onEvent: () => () => {},
       onTermination: () => () => {},
       whenTerminated: async () => {},
-      getTree: async () => ({ tree: [], leafId: null }),
+      getEntries: async () => ({ entries: [], leafId: null }),
       getAvailableModels: async () => ({ models: [] }),
       // Restore validation requires pi to report the requested session.
       getState: async () => ({ thinkingLevel: 'medium', sessionId: 's1', sessionFile: '/tmp/s.jsonl' })

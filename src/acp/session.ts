@@ -533,7 +533,7 @@ export class PiAcpSession {
       }
     }
 
-    // Only events observed up to the get_tree response boundary may be
+    // Only events observed up to the get_entries response boundary may be
     // reconciled. An identical event arriving after the boundary is a
     // genuinely new message (the snapshot cannot contain it), and counted
     // identity cannot tell it apart from an older snapshot occurrence, so it

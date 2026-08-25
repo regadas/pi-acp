@@ -227,12 +227,12 @@ export class FakePiRpcProcess {
     return { models: [{ provider: 'test', id: 'model', name: 'model' }] }
   }
 
-  // Mutable fake get_tree payload; tests set `tree` to replay history.
-  tree: { tree: unknown[]; leafId: string | null } = { tree: [], leafId: null }
+  // Mutable fake get_entries payload; tests set it to replay history.
+  entrySnapshot: { entries: unknown[]; leafId: string | null } = { entries: [], leafId: null }
 
-  async getTree(beforeResponseResolve?: () => void): Promise<any> {
+  async getEntries(beforeResponseResolve?: () => void): Promise<any> {
     beforeResponseResolve?.()
-    return this.tree
+    return this.entrySnapshot
   }
 }
 

@@ -49,7 +49,7 @@ import {
   translateUserContent
 } from './translate/pi-messages.js'
 import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
-import { PiSessionTreeError, walkActiveTreeBranch } from './translate/tree-walk.js'
+import { PiSessionEntriesError, walkActiveEntryBranch } from './translate/entry-walk.js'
 import { isThinkingLevel, type ThinkingLevel } from './thinking-levels.js'
 import {
   bashCommand,
@@ -1457,23 +1457,23 @@ export class PiAcpAgent implements ACPAgent {
         const proc = session.proc
         const fileCommands = loadSlashCommands(cwd)
 
-        // Replay the complete raw active-branch history via pi's get_tree
+        // Replay the complete raw active-branch history via pi's get_entries
         // (available on every supported pi version): unlike get_messages it
         // retains pre-compaction conversation. Capture the session's
-        // custom-message sequence at the exact get_tree response boundary so
+        // custom-message sequence at the exact get_entries response boundary so
         // events written after that response cannot be mistaken for entries in
         // its snapshot.
         let customMessageBoundary = session.currentCustomMessageSequence()
-        const treeData = await proc.getTree(() => {
+        const entryData = await proc.getEntries(() => {
           customMessageBoundary = session.currentCustomMessageSequence()
         })
         this.assertLoadActive(params.sessionId, generation)
 
-        let entries: ReturnType<typeof walkActiveTreeBranch>
+        let entries: ReturnType<typeof walkActiveEntryBranch>
         try {
-          entries = walkActiveTreeBranch(treeData)
+          entries = walkActiveEntryBranch(entryData)
         } catch (error) {
-          if (error instanceof PiSessionTreeError) {
+          if (error instanceof PiSessionEntriesError) {
             throw RequestError.internalError({}, `Cannot replay session history: ${error.message}`)
           }
           throw error
@@ -1784,7 +1784,7 @@ export class PiAcpAgent implements ACPAgent {
 
         return response
       } catch (error) {
-        // Any post-restore load failure (get_tree, malformed tree, replay
+        // Any post-restore load failure (get_entries, malformed snapshot, replay
         // delivery, configuration, or generation cancellation) must not leave
         // this load's freshly restored session and pi subprocess installed.
         // Only the exact instance this load produced is evicted/disposed — a

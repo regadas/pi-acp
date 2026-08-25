@@ -25,21 +25,21 @@ class FakeStore {
 }
 
 type MockProcOptions = {
-  getTree?: (beforeResponseResolve?: () => void) => Promise<unknown>
+  getEntries?: (beforeResponseResolve?: () => void) => Promise<unknown>
 }
 
 class MockProc {
   disposed = false
   disposeCount = 0
   abortCount = 0
-  private readonly getTreeImpl: NonNullable<MockProcOptions['getTree']>
+  private readonly getEntriesImpl: NonNullable<MockProcOptions['getEntries']>
 
   constructor(opts?: MockProcOptions) {
-    this.getTreeImpl =
-      opts?.getTree ??
+    this.getEntriesImpl =
+      opts?.getEntries ??
       (async beforeResponseResolve => {
         beforeResponseResolve?.()
-        return { tree: [], leafId: null }
+        return { entries: [], leafId: null }
       })
   }
 
@@ -59,8 +59,8 @@ class MockProc {
     this.disposed = true
     this.disposeCount += 1
   }
-  getTree(beforeResponseResolve?: () => void) {
-    return this.getTreeImpl(beforeResponseResolve)
+  getEntries(beforeResponseResolve?: () => void) {
+    return this.getEntriesImpl(beforeResponseResolve)
   }
   async getAvailableModels() {
     return { models: [] }
@@ -96,16 +96,16 @@ function makeAgent(conn = new FakeAgentSideConnection()) {
 
 const loadParams = { sessionId: 's1', cwd: TEST_CWD, mcpServers: [] }
 
-test('loadSession: get_tree rejection evicts and disposes the freshly restored session', async () => {
+test('loadSession: get_entries rejection evicts and disposes the freshly restored session', async () => {
   const proc = new MockProc({
-    getTree: async () => {
-      throw new Error('get_tree exploded')
+    getEntries: async () => {
+      throw new Error('get_entries exploded')
     }
   })
   const { agent, store, manager } = makeAgent()
 
   await withMockSpawn([proc], async () => {
-    await assert.rejects(() => agent.loadSession(loadParams), /get_tree exploded/)
+    await assert.rejects(() => agent.loadSession(loadParams), /get_entries exploded/)
   })
 
   assert.equal(manager.maybeGet('s1'), undefined, 'failed load must not leave the session installed')
@@ -113,11 +113,11 @@ test('loadSession: get_tree rejection evicts and disposes the freshly restored s
   assert.deepEqual(store.deletes, [], 'the durable session store entry must be retained')
 })
 
-test('loadSession: malformed tree evicts and disposes the freshly restored session', async () => {
+test('loadSession: malformed entry snapshot evicts and disposes the freshly restored session', async () => {
   const proc = new MockProc({
-    getTree: async beforeResponseResolve => {
+    getEntries: async beforeResponseResolve => {
       beforeResponseResolve?.()
-      return { tree: [{ entry: { type: 'message', id: 'a', parentId: null }, children: [] }], leafId: 'zzz' }
+      return { entries: [{ type: 'message', id: 'a', parentId: null }], leafId: 'zzz' }
     }
   })
   const { agent, store, manager } = makeAgent()
@@ -133,19 +133,16 @@ test('loadSession: malformed tree evicts and disposes the freshly restored sessi
 
 test('loadSession: a rejected client replay update evicts and disposes the session', async () => {
   const proc = new MockProc({
-    getTree: async beforeResponseResolve => {
+    getEntries: async beforeResponseResolve => {
       beforeResponseResolve?.()
       return {
-        tree: [
+        entries: [
           {
-            entry: {
-              type: 'message',
-              id: 'e1',
-              parentId: null,
-              timestamp: '2026-02-11T00:00:01.000Z',
-              message: { role: 'user', content: 'Hello' }
-            },
-            children: []
+            type: 'message',
+            id: 'e1',
+            parentId: null,
+            timestamp: '2026-02-11T00:00:01.000Z',
+            message: { role: 'user', content: 'Hello' }
           }
         ],
         leafId: 'e1'
@@ -174,10 +171,10 @@ test('loadSession: a losing load never disposes the replacement load that supers
     releaseFirstTree = resolve
   })
   const procA = new MockProc({
-    getTree: async beforeResponseResolve => {
+    getEntries: async beforeResponseResolve => {
       await firstTreeGate
       beforeResponseResolve?.()
-      return { tree: [], leafId: null }
+      return { entries: [], leafId: null }
     }
   })
   const procB = new MockProc()
@@ -185,7 +182,7 @@ test('loadSession: a losing load never disposes the replacement load that supers
 
   await withMockSpawn([procA, procB], async () => {
     const firstLoad = agent.loadSession(loadParams)
-    // Let the first load restore its session and block inside get_tree.
+    // Let the first load restore its session and block inside get_entries.
     await new Promise(resolve => setTimeout(resolve, 0))
 
     const secondLoad = agent.loadSession(loadParams)

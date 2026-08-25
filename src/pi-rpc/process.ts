@@ -60,10 +60,10 @@ const ABORT_TIMEOUT_MS = 10_000
 // explicit compaction rather than the short control-command default.
 const PROMPT_TIMEOUT_MS = 10 * 60_000
 const COMPACT_TIMEOUT_MS = 10 * 60_000
-// get_tree serializes the entire session tree and export_html renders the
-// whole session; both scale with history size, so give them a larger (still
-// finite) budget than short control commands.
-const GET_TREE_TIMEOUT_MS = 2 * 60_000
+// get_entries serializes the complete flat session history and export_html
+// renders the whole session; both scale with history size, so give them a
+// larger (still finite) budget than short control commands.
+const GET_ENTRIES_TIMEOUT_MS = 2 * 60_000
 const EXPORT_TIMEOUT_MS = 2 * 60_000
 const KILL_GRACE_MS = 2_000
 // If stdio never closes after exit (e.g. an orphaned grandchild holds the
@@ -97,7 +97,7 @@ type PiRpcCommand =
   | { type: 'get_session_stats'; id?: string }
   | { type: 'set_session_name'; id?: string; name: string }
   | { type: 'export_html'; id?: string; outputPath?: string }
-  | { type: 'get_tree'; id?: string }
+  | { type: 'get_entries'; id?: string }
   // Commands
   | { type: 'get_commands'; id?: string }
 
@@ -328,8 +328,8 @@ export class PiRpcProcess {
         return PROMPT_TIMEOUT_MS
       case 'compact':
         return COMPACT_TIMEOUT_MS
-      case 'get_tree':
-        return GET_TREE_TIMEOUT_MS
+      case 'get_entries':
+        return GET_ENTRIES_TIMEOUT_MS
       case 'export_html':
         return EXPORT_TIMEOUT_MS
       default:
@@ -608,9 +608,9 @@ export class PiRpcProcess {
    * The callback runs synchronously at the response line boundary, before
    * later stdout events can be dispatched from the same input chunk.
    */
-  async getTree(beforeResponseResolve?: () => void): Promise<unknown> {
-    const res = await this.request({ type: 'get_tree' }, { beforeResolve: beforeResponseResolve })
-    if (!res.success) throw new Error(`pi get_tree failed: ${res.error ?? JSON.stringify(res.data)}`)
+  async getEntries(beforeResponseResolve?: () => void): Promise<unknown> {
+    const res = await this.request({ type: 'get_entries' }, { beforeResolve: beforeResponseResolve })
+    if (!res.success) throw new Error(`pi get_entries failed: ${res.error ?? JSON.stringify(res.data)}`)
     return res.data
   }
 

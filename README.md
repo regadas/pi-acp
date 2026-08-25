@@ -26,7 +26,7 @@ Development is centered around [Zed](https://zed.dev) editor support, and other 
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
 - Stable ACP v1 session lifecycle
   - `session/list` discovers all known pi sessions or filters them by cwd
-  - `session/load` restores a session and replays the complete active-branch history (via pi's `get_tree`) before responding: user text and images, assistant text, thinking, and tool calls, tool results, visible custom messages, and `!command` shell executions, including pre-compaction history
+  - `session/load` restores a session and replays the complete active-branch history (via pi's `get_entries`) before responding: user text and images, assistant text, thinking, and tool calls, tool results, visible custom messages, and `!command` shell executions, including pre-compaction history
   - `session/resume` restores a session without replaying history
   - Model and thinking-level selection go through standard ACP session config options (`session/set_config_option`); advertised thinking levels mirror exactly what the selected pi model supports (including pi's `max` level). Legacy ACP session modes are not used: no session response advertises `modes`, and `session/set_mode` is not implemented
   - `session/close` cancels live work and releases the session subprocess while preserving history

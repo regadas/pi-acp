@@ -452,17 +452,14 @@ test('PiAcpAgent: close waits for deferred load updates and leaves no restored p
     upsert: () => {},
     delete: () => {}
   }
-  proc.tree = {
-    tree: [
+  proc.entrySnapshot = {
+    entries: [
       {
-        entry: {
-          type: 'message',
-          id: 'e1',
-          parentId: null,
-          timestamp: '',
-          message: { role: 'assistant', content: [{ type: 'text', text: 'restored history' }] }
-        },
-        children: []
+        type: 'message',
+        id: 'e1',
+        parentId: null,
+        timestamp: '',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'restored history' }] }
       }
     ],
     leafId: 'e1'

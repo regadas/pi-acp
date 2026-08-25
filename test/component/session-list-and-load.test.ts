@@ -160,19 +160,15 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
       toCustomMessageEntry({ customType: 'background-task', display: true, content: [] })
     ]
 
-    // Nest the chain into get_tree's node shape (one active branch, no forks).
-    let treeRoot: any = null
-    let cursor: any = null
-    chainEntries.forEach((entry, index) => {
-      const node = {
-        entry: { id: `e${index + 1}`, parentId: index === 0 ? null : `e${index}`, timestamp: '', ...entry },
-        children: [] as any[]
-      }
-      if (!treeRoot) treeRoot = node
-      else cursor.children.push(node)
-      cursor = node
-    })
-    const treeData = { tree: [treeRoot], leafId: `e${chainEntries.length}` }
+    const entryData = {
+      entries: chainEntries.map((entry, index) => ({
+        id: `e${index + 1}`,
+        parentId: index === 0 ? null : `e${index}`,
+        timestamp: '',
+        ...entry
+      })),
+      leafId: `e${chainEntries.length}`
+    }
 
     ;(PiRpcProcess as any).spawn = async (params: any) => {
       // ensure loadSession resolves to some jsonl that ends with our expected filename
@@ -188,7 +184,7 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
         },
         onTermination: () => () => {},
         whenTerminated: async () => {},
-        getTree: async (beforeResponseResolve?: () => void) => {
+        getEntries: async (beforeResponseResolve?: () => void) => {
           eventHandler?.({ type: 'message_end', message: { ...preBoundarySnapshotMessage } })
           eventHandler?.({ type: 'message_end', message: { ...repeatedMessage } })
           eventHandler?.({ type: 'message_end', message: { ...repeatedMessage } })
@@ -201,7 +197,7 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
           eventHandler?.({ type: 'message_end', message: { ...timestampLessQueuedMessage } })
           eventHandler?.({ type: 'message_end', message: { ...timestampLessSnapshotMessage } })
 
-          return treeData
+          return entryData
         },
         getAvailableModels: async () => ({ models: [] }),
         getState: async () => ({

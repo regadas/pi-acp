@@ -149,24 +149,21 @@ test('PiAcpSession: negotiated bash results retain every image as standard conte
 })
 
 test('PiAcpAgent: load replay keeps interleaved generic bash content in source order', async () => {
-  const tree = {
-    tree: [
+  const snapshot = {
+    entries: [
       {
-        entry: {
-          type: 'message',
-          id: 'e1',
-          parentId: null,
-          timestamp: '2026-02-11T00:00:01.000Z',
-          message: {
-            role: 'toolResult',
-            toolCallId: 'call_bash',
-            toolName: 'bash',
-            args: { command: 'render' },
-            ...interleavedBashResult,
-            isError: false
-          }
-        },
-        children: []
+        type: 'message',
+        id: 'e1',
+        parentId: null,
+        timestamp: '2026-02-11T00:00:01.000Z',
+        message: {
+          role: 'toolResult',
+          toolCallId: 'call_bash',
+          toolName: 'bash',
+          args: { command: 'render' },
+          ...interleavedBashResult,
+          isError: false
+        }
       }
     ],
     leafId: 'e1'
@@ -178,9 +175,9 @@ test('PiAcpAgent: load replay keeps interleaved generic bash content in source o
       onEvent: () => () => {},
       onTermination: () => () => {},
       whenTerminated: async () => {},
-      getTree: async (beforeResponseResolve?: () => void) => {
+      getEntries: async (beforeResponseResolve?: () => void) => {
         beforeResponseResolve?.()
-        return tree
+        return snapshot
       },
       getAvailableModels: async () => ({ models: [] }),
       getState: async () => ({ thinkingLevel: 'medium', sessionId: 's1', sessionFile: '/tmp/s.jsonl' })

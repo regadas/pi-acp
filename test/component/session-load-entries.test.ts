@@ -9,7 +9,7 @@ import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
 // Isolated workspace: repository-local .pi settings/commands must not leak in.
-const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-load-tree-cwd-'))
+const TEST_CWD = mkdtempSync(join(tmpdir(), 'pi-acp-load-entries-cwd-'))
 
 class FakeStore {
   get(_sessionId: string) {
@@ -18,15 +18,15 @@ class FakeStore {
   upsert() {}
 }
 
-function mockSpawn(tree: unknown) {
+function mockSpawn(snapshot: unknown) {
   return async () =>
     ({
       onEvent: () => () => {},
       onTermination: () => () => {},
       whenTerminated: async () => {},
-      getTree: async (beforeResponseResolve?: () => void) => {
+      getEntries: async (beforeResponseResolve?: () => void) => {
         beforeResponseResolve?.()
-        return tree
+        return snapshot
       },
       getAvailableModels: async () => ({ models: [] }),
       // Restore validation requires pi to report the requested session.
@@ -34,9 +34,9 @@ function mockSpawn(tree: unknown) {
     }) as any
 }
 
-async function loadWith(tree: unknown, supportsTerminalOutputMeta = false): Promise<FakeAgentSideConnection> {
+async function loadWith(snapshot: unknown, supportsTerminalOutputMeta = false): Promise<FakeAgentSideConnection> {
   const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(tree)
+  ;(PiRpcProcess as any).spawn = mockSpawn(snapshot)
   try {
     const conn = new FakeAgentSideConnection()
     const agent = new PiAcpAgent(asAgentConn(conn))
@@ -52,30 +52,21 @@ async function loadWith(tree: unknown, supportsTerminalOutputMeta = false): Prom
   }
 }
 
-/** Nest a flat chain of entries into get_tree's node shape. */
-function chainToTree(entries: Array<Record<string, unknown>>, extraBranches: Record<string, unknown[]> = {}) {
-  let root: any = null
-  let cursor: any = null
+function chainToEntries(
+  entries: Array<Record<string, unknown>>,
+  extraBranches: Record<string, Array<Record<string, unknown>>> = {}
+) {
+  const snapshotEntries: Record<string, unknown>[] = []
   entries.forEach((entry, index) => {
     const id = `e${index + 1}`
-    const node = {
-      entry: { id, parentId: index === 0 ? null : `e${index}`, timestamp: '', ...entry },
-      children: [] as any[]
-    }
-    for (const abandoned of extraBranches[id] ?? []) {
-      node.children.push({ entry: abandoned, children: [] })
-    }
-    if (!root) root = node
-    else cursor.children.push(node)
-    cursor = node
+    snapshotEntries.push({ id, parentId: index === 0 ? null : `e${index}`, timestamp: '', ...entry })
+    snapshotEntries.push(...(extraBranches[id] ?? []))
   })
-  // Abandoned children attached to the leaf's parent come before the active
-  // child; the walk must pick the branch containing leafId regardless.
-  return { tree: [root], leafId: `e${entries.length}` }
+  return { entries: snapshotEntries, leafId: `e${entries.length}` }
 }
 
 test('PiAcpAgent: loadSession replays the complete raw active branch in order', async () => {
-  const tree = chainToTree(
+  const snapshot = chainToEntries(
     [
       { type: 'message', message: { role: 'user', content: 'first question' } },
       {
@@ -140,7 +131,7 @@ test('PiAcpAgent: loadSession replays the complete raw active branch in order', 
     }
   )
 
-  const conn = await loadWith(tree)
+  const conn = await loadWith(snapshot)
   const updates = conn.updates.map(u => (u as any).update)
 
   const replay = updates
@@ -188,7 +179,7 @@ test('PiAcpAgent: loadSession replays the complete raw active branch in order', 
 })
 
 test('PiAcpAgent: loadSession replays failed and cancelled bashExecution entries as failed', async () => {
-  const tree = chainToTree([
+  const snapshot = chainToEntries([
     {
       type: 'message',
       message: { role: 'bashExecution', command: 'false', output: '', exitCode: 1, cancelled: false }
@@ -199,7 +190,7 @@ test('PiAcpAgent: loadSession replays failed and cancelled bashExecution entries
     }
   ])
 
-  const conn = await loadWith(tree)
+  const conn = await loadWith(snapshot)
   const updates = conn.updates.map(u => (u as any).update)
 
   const finals = updates.filter(u => u.sessionUpdate === 'tool_call_update')
@@ -216,7 +207,7 @@ test('PiAcpAgent: loadSession replays failed and cancelled bashExecution entries
 })
 
 test('PiAcpAgent: loadSession preserves tool-result image content in replay', async () => {
-  const tree = chainToTree([
+  const snapshot = chainToEntries([
     {
       type: 'message',
       message: {
@@ -232,7 +223,7 @@ test('PiAcpAgent: loadSession preserves tool-result image content in replay', as
     }
   ])
 
-  const conn = await loadWith(tree)
+  const conn = await loadWith(snapshot)
   const updates = conn.updates.map(u => (u as any).update)
   const end = updates.find(u => u.sessionUpdate === 'tool_call_update' && u.toolCallId === 'call_img')
   assert.deepEqual(end.content, [
@@ -242,7 +233,7 @@ test('PiAcpAgent: loadSession preserves tool-result image content in replay', as
 })
 
 test('PiAcpAgent: loadSession preserves interleaved and image-only tool-result content order', async () => {
-  const tree = chainToTree([
+  const snapshot = chainToEntries([
     {
       type: 'message',
       message: {
@@ -269,7 +260,7 @@ test('PiAcpAgent: loadSession preserves interleaved and image-only tool-result c
     }
   ])
 
-  const conn = await loadWith(tree)
+  const conn = await loadWith(snapshot)
   const updates = conn.updates.map(u => (u as any).update)
 
   const mixed = updates.find(u => u.sessionUpdate === 'tool_call_update' && u.toolCallId === 'call_mixed')
@@ -288,7 +279,7 @@ test('PiAcpAgent: loadSession preserves interleaved and image-only tool-result c
 })
 
 test('PiAcpAgent: loadSession replays custom-message image content in source order', async () => {
-  const tree = chainToTree([
+  const snapshot = chainToEntries([
     {
       type: 'custom_message',
       customType: 'vision',
@@ -300,7 +291,7 @@ test('PiAcpAgent: loadSession replays custom-message image content in source ord
     }
   ])
 
-  const conn = await loadWith(tree)
+  const conn = await loadWith(snapshot)
   const chunks = conn.updates
     .map(u => (u as any).update)
     .filter(u => u.sessionUpdate === 'agent_message_chunk')
@@ -313,7 +304,7 @@ test('PiAcpAgent: loadSession replays custom-message image content in source ord
 })
 
 test('PiAcpAgent: loadSession fails replayed tool calls that never got a durable result', async () => {
-  const tree = chainToTree([
+  const snapshot = chainToEntries([
     {
       type: 'message',
       message: {
@@ -336,7 +327,7 @@ test('PiAcpAgent: loadSession fails replayed tool calls that never got a durable
     }
   ])
 
-  const conn = await loadWith(tree)
+  const conn = await loadWith(snapshot)
   const updates = conn.updates.map(u => (u as any).update)
 
   const doneStatuses = updates.filter(u => u.toolCallId === 'call_done').map(u => u.status)
@@ -362,7 +353,7 @@ test('PiAcpAgent: loadSession fails replayed tool calls that never got a durable
 })
 
 test('PiAcpAgent: unmatched replayed Bash calls settle negotiated terminals and stay generic otherwise', async () => {
-  const tree = chainToTree([
+  const snapshot = chainToEntries([
     {
       type: 'message',
       message: {
@@ -372,7 +363,7 @@ test('PiAcpAgent: unmatched replayed Bash calls settle negotiated terminals and 
     }
   ])
 
-  const generic = await loadWith(tree)
+  const generic = await loadWith(snapshot)
   const genericUpdates = generic.updates.map(update => (update as any).update)
   const genericFinal = genericUpdates.find(
     update => update.toolCallId === 'call_bash_interrupted' && update.status === 'failed'
@@ -381,7 +372,7 @@ test('PiAcpAgent: unmatched replayed Bash calls settle negotiated terminals and 
   assert.equal(genericFinal.content.length, 1)
   assert.equal(genericFinal.content[0].type, 'content')
 
-  const terminal = await loadWith(tree, true)
+  const terminal = await loadWith(snapshot, true)
   const terminalUpdates = terminal.updates.map(update => (update as any).update)
   const terminalFinal = terminalUpdates.find(
     update => update.toolCallId === 'call_bash_interrupted' && update.status === 'failed'
@@ -393,29 +384,29 @@ test('PiAcpAgent: unmatched replayed Bash calls settle negotiated terminals and 
   assert.match(terminalFinal.content[1].content.text, /No result was recorded/)
 })
 
-test('PiAcpAgent: loadSession fails clearly on malformed trees instead of replaying garbage', async () => {
-  const missingLeaf = { tree: [{ entry: { type: 'message', id: 'a', parentId: null }, children: [] }], leafId: 'zzz' }
+test('PiAcpAgent: loadSession fails clearly on malformed entry snapshots instead of replaying garbage', async () => {
+  const missingLeaf = { entries: [{ type: 'message', id: 'a', parentId: null }], leafId: 'zzz' }
   const duplicate = {
-    tree: [
-      { entry: { type: 'message', id: 'a', parentId: null }, children: [] },
-      { entry: { type: 'message', id: 'a', parentId: null }, children: [] }
+    entries: [
+      { type: 'message', id: 'a', parentId: null },
+      { type: 'message', id: 'a', parentId: null }
     ],
     leafId: 'a'
   }
   const cycle = {
-    tree: [
-      { entry: { type: 'message', id: 'a', parentId: 'b' }, children: [] },
-      { entry: { type: 'message', id: 'b', parentId: 'a' }, children: [] }
+    entries: [
+      { type: 'message', id: 'a', parentId: 'b' },
+      { type: 'message', id: 'b', parentId: 'a' }
     ],
     leafId: 'a'
   }
 
-  for (const [label, tree] of Object.entries({ missingLeaf, duplicate, cycle })) {
+  for (const [label, snapshot] of Object.entries({ missingLeaf, duplicate, cycle })) {
     const conn = new FakeAgentSideConnection()
     const agent = new PiAcpAgent(asAgentConn(conn))
     ;(agent as any).store = new FakeStore()
     const originalSpawn = PiRpcProcess.spawn
-    ;(PiRpcProcess as any).spawn = mockSpawn(tree)
+    ;(PiRpcProcess as any).spawn = mockSpawn(snapshot)
     try {
       await assert.rejects(
         () => agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] }),
@@ -436,7 +427,7 @@ test('PiAcpAgent: loadSession replays an empty session (null leaf) without updat
   const agent = new PiAcpAgent(asAgentConn(conn))
   ;(agent as any).store = new FakeStore()
   const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn({ tree: [], leafId: null })
+  ;(PiRpcProcess as any).spawn = mockSpawn({ entries: [], leafId: null })
   try {
     const res = await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
     assert.equal('models' in (res as any), false, 'no custom root models field')

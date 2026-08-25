@@ -56,9 +56,9 @@ test('PiAcpAgent: resumeSession restores a session without replaying history', a
       onEvent: () => () => {},
       onTermination: () => () => {},
       whenTerminated: async () => {},
-      getTree: async () => {
+      getEntries: async () => {
         historyReplayCalls += 1
-        return { tree: [], leafId: null }
+        return { entries: [], leafId: null }
       },
       getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }),
       getState: async () => ({

@@ -33,23 +33,23 @@ class FakeStore {
 }
 
 type LoadOwnershipProcOptions = {
-  getTree?: (beforeResponseResolve?: () => void) => Promise<unknown>
+  getEntries?: (beforeResponseResolve?: () => void) => Promise<unknown>
 }
 
 class MockProc {
   disposed = false
   disposeCount = 0
   readonly thinkingLevels: string[] = []
-  private readonly getTreeImpl: NonNullable<LoadOwnershipProcOptions['getTree']>
+  private readonly getEntriesImpl: NonNullable<LoadOwnershipProcOptions['getEntries']>
   private thinkingLevel = 'medium'
   private eventHandlers: Array<(ev: any) => void> = []
 
   constructor(opts?: LoadOwnershipProcOptions) {
-    this.getTreeImpl =
-      opts?.getTree ??
+    this.getEntriesImpl =
+      opts?.getEntries ??
       (async beforeResponseResolve => {
         beforeResponseResolve?.()
-        return { tree: [], leafId: null }
+        return { entries: [], leafId: null }
       })
   }
 
@@ -75,8 +75,8 @@ class MockProc {
     this.disposed = true
     this.disposeCount += 1
   }
-  getTree(beforeResponseResolve?: () => void) {
-    return this.getTreeImpl(beforeResponseResolve)
+  getEntries(beforeResponseResolve?: () => void) {
+    return this.getEntriesImpl(beforeResponseResolve)
   }
   async getAvailableModels() {
     return { models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }
@@ -129,10 +129,10 @@ test('resumeSession waits for an active load and recovers after that load fails'
   const treeStarted = deferred()
   const releaseTree = deferred()
   const loadProc = new MockProc({
-    getTree: async () => {
+    getEntries: async () => {
       treeStarted.resolve()
       await releaseTree.promise
-      throw new Error('get_tree exploded mid-load')
+      throw new Error('get_entries exploded mid-load')
     }
   })
   const retryProc = new MockProc()
@@ -154,7 +154,7 @@ test('resumeSession waits for an active load and recovers after that load fails'
     assert.equal(resumeSettled, false, 'resume must not proceed while the load owns the provisional session')
 
     releaseTree.resolve()
-    await assert.rejects(load, /get_tree exploded mid-load/)
+    await assert.rejects(load, /get_entries exploded mid-load/)
 
     // The failed load evicted and disposed its provisional process; resume
     // recovers by restoring a fresh one instead of using the dead child.
@@ -199,10 +199,10 @@ test('setSessionConfigOption waits for an active load and recovers after that lo
   const treeStarted = deferred()
   const releaseTree = deferred()
   const loadProc = new MockProc({
-    getTree: async () => {
+    getEntries: async () => {
       treeStarted.resolve()
       await releaseTree.promise
-      throw new Error('get_tree exploded mid-load')
+      throw new Error('get_entries exploded mid-load')
     }
   })
   const retryProc = new MockProc()
@@ -225,7 +225,7 @@ test('setSessionConfigOption waits for an active load and recovers after that lo
     assert.deepEqual(loadProc.thinkingLevels, [], 'no write may reach the provisional process')
 
     releaseTree.resolve()
-    await assert.rejects(load, /get_tree exploded mid-load/)
+    await assert.rejects(load, /get_entries exploded mid-load/)
 
     const result = await config
     assert.ok(Array.isArray(result.configOptions))
@@ -261,21 +261,18 @@ test('session/load replay and concurrent live updates share one delivery order',
   const treeStarted = deferred()
   const releaseTree = deferred()
   const proc = new MockProc({
-    getTree: async beforeResponseResolve => {
+    getEntries: async beforeResponseResolve => {
       treeStarted.resolve()
       await releaseTree.promise
       beforeResponseResolve?.()
       return {
-        tree: [
+        entries: [
           {
-            entry: {
-              id: 'e1',
-              parentId: null,
-              timestamp: '',
-              type: 'message',
-              message: { role: 'assistant', content: [{ type: 'text', text: 'replayed history' }] }
-            },
-            children: []
+            id: 'e1',
+            parentId: null,
+            timestamp: '',
+            type: 'message',
+            message: { role: 'assistant', content: [{ type: 'text', text: 'replayed history' }] }
           }
         ],
         leafId: 'e1'

@@ -87,6 +87,28 @@ async function cleanupFixture(
   }
 }
 
+test('PiRpcProcess: session replay requests flat get_entries snapshots', async () => {
+  const mock = new MockChild()
+  const lines = collectStdin(mock)
+  const proc = PiRpcProcess.fromChild(asChild(mock))
+
+  const pending = proc.getEntries()
+  await tick()
+
+  const command = JSON.parse(lines[0]!)
+  assert.equal(command.type, 'get_entries')
+  mock.stdout.write(
+    `${JSON.stringify({
+      type: 'response',
+      id: command.id,
+      command: 'get_entries',
+      success: true,
+      data: { entries: [], leafId: null }
+    })}\n`
+  )
+  assert.deepEqual(await pending, { entries: [], leafId: null })
+})
+
 test('PiRpcProcess: U+2028/U+2029 inside event payloads survive stdout framing', async () => {
   const mock = new MockChild()
   const proc = PiRpcProcess.fromChild(asChild(mock))
