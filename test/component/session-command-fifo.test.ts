@@ -127,6 +127,63 @@ test('PiAcpAgent: an adapter command queues behind the active prompt instead of 
   assert.ok(appliedIndex > queuedIndex, 'the command result is delivered after its queue notice')
 })
 
+test('PiAcpAgent: prompt usage is captured before the FIFO admits the next prompt', async () => {
+  const proc = new FakePiRpcProcess() as any
+  const usageStarted = deferred<void>()
+  const usageResult = deferred<unknown>()
+  proc.getSessionStats = () => {
+    usageStarted.resolve()
+    return usageResult.promise
+  }
+  const { agent } = makeAgent(proc)
+
+  const first = agent.prompt(promptParams('first'))
+  await tick()
+  const second = agent.prompt(promptParams('second'))
+  proc.emit({ type: 'agent_settled' })
+  await usageStarted.promise
+  assert.deepEqual(
+    proc.prompts.map((item: { message: string }) => item.message),
+    ['first'],
+    'the next prompt stays queued while usage is captured'
+  )
+
+  usageResult.resolve({ tokens: { input: 1, output: 2, total: 3 } })
+  assert.equal((await first).usage?.totalTokens, 3)
+  await tick()
+  assert.deepEqual(
+    proc.prompts.map((item: { message: string }) => item.message),
+    ['first', 'second']
+  )
+  proc.emit({ type: 'agent_settled' })
+  assert.equal((await second).stopReason, 'end_turn')
+})
+
+test('PiAcpAgent: command usage is captured before the FIFO admits the next prompt', async () => {
+  const proc = new FakePiRpcProcess() as any
+  const usageStarted = deferred<void>()
+  const usageResult = deferred<unknown>()
+  proc.compact = async () => ({ tokensBefore: 10 })
+  proc.getSessionStats = () => {
+    usageStarted.resolve()
+    return usageResult.promise
+  }
+  const { agent } = makeAgent(proc)
+
+  const compacting = agent.prompt(promptParams('/compact'))
+  await usageStarted.promise
+  const queued = agent.prompt(promptParams('after command'))
+  await tick()
+  assert.equal(proc.prompts.length, 0, 'usage capture keeps the command FIFO slot')
+
+  usageResult.resolve({ tokens: { input: 4, output: 5, total: 9 } })
+  assert.equal((await compacting).usage?.totalTokens, 9)
+  await tick()
+  assert.equal(proc.prompts[0]?.message, 'after command')
+  proc.emit({ type: 'agent_settled' })
+  assert.equal((await queued).stopReason, 'end_turn')
+})
+
 test('PiAcpAgent: a prompt arriving during an adapter command waits for it', async () => {
   const proc = new FakePiRpcProcess() as any
   const compactStarted = deferred<void>()

@@ -1,5 +1,13 @@
 import { methods, type AgentContext } from '@agentclientprotocol/sdk'
-import type { RequestPermissionRequest, RequestPermissionResponse, SessionNotification } from '@agentclientprotocol/sdk'
+import type {
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  RequestPermissionRequest,
+  RequestPermissionResponse,
+  SessionNotification
+} from '@agentclientprotocol/sdk'
+
+type RequestOptions = { cancellationSignal?: AbortSignal }
 
 /**
  * Narrow client-facing surface the agent calls back into. This is the subset
@@ -9,7 +17,8 @@ import type { RequestPermissionRequest, RequestPermissionResponse, SessionNotifi
  */
 export interface AcpClient {
   sessionUpdate(params: SessionNotification): Promise<void>
-  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>
+  requestPermission(params: RequestPermissionRequest, options?: RequestOptions): Promise<RequestPermissionResponse>
+  createElicitation(params: CreateElicitationRequest, options?: RequestOptions): Promise<CreateElicitationResponse>
 }
 
 /**
@@ -24,7 +33,11 @@ export class ClientConnection implements AcpClient {
     return this.ctx.notify(methods.client.session.update, params)
   }
 
-  requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-    return this.ctx.request(methods.client.session.requestPermission, params)
+  requestPermission(params: RequestPermissionRequest, options?: RequestOptions): Promise<RequestPermissionResponse> {
+    return this.ctx.request(methods.client.session.requestPermission, params, options)
+  }
+
+  createElicitation(params: CreateElicitationRequest, options?: RequestOptions): Promise<CreateElicitationResponse> {
+    return this.ctx.request(methods.client.elicitation.create, params, options)
   }
 }

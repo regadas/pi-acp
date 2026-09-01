@@ -1,4 +1,4 @@
-import type { AuthMethod, McpServer } from '@agentclientprotocol/sdk'
+import type { AuthMethod } from '@agentclientprotocol/sdk'
 import { RequestError } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
 import { mkdirSync } from 'node:fs'
@@ -10,15 +10,15 @@ import { PiAcpSession } from './session.js'
 import { toRequestError } from './session-errors.js'
 
 type SessionCreateParams = {
+  [key: string]: unknown
   cwd: string
-  mcpServers: McpServer[]
   conn: AcpClient
-  fileCommands?: import('./slash-commands.js').FileSlashCommand[]
   piCommand?: string
   /** Client negotiated Zed's `_meta.terminal_output` tool rendering convention. */
   supportsTerminalOutputMeta?: boolean
   /** Auth methods the owning agent advertised at initialize (for auth-required errors). */
   authMethods?: AuthMethod[]
+  supportsElicitationForm?: boolean
 }
 
 export class SessionManager {
@@ -35,6 +35,7 @@ export class SessionManager {
   // `PiRpcProcess.spawn` before its promise resolves, so shutdown has to know
   // work is in flight even before it can see the process itself.
   private readonly pendingSpawns = new Set<Promise<void>>()
+  private readonly pendingSpawnAborts = new Set<AbortController>()
   // Children that have not exited yet, indexed by every identity through which
   // a later restore can reach the same persisted file: the sessionId it was
   // asked for, its session-file path, and (when pi reported a different
@@ -58,6 +59,7 @@ export class SessionManager {
    */
   disposeAll(): void {
     this.disposed = true
+    for (const controller of this.pendingSpawnAborts) controller.abort()
     for (const [id] of this.sessions) this.close(id)
   }
 
@@ -141,7 +143,13 @@ export class SessionManager {
       return Promise.reject(RequestError.internalError({}, 'pi-acp session manager is disposed'))
     }
 
-    const spawning = PiRpcProcess.spawn({ ...params, onProcess: proc => this.own(proc) })
+    const controller = new AbortController()
+    this.pendingSpawnAborts.add(controller)
+    const spawning = PiRpcProcess.spawn({
+      ...params,
+      signal: controller.signal,
+      onProcess: proc => this.own(proc)
+    })
 
     // Ownership is also taken on resolution: a spawn seam that never calls the
     // hook still hands its child over before the caller resumes. Failures and
@@ -149,7 +157,10 @@ export class SessionManager {
     // ever waits on it.
     const tracked = spawning.then(proc => this.own(proc)).catch(() => {})
     this.pendingSpawns.add(tracked)
-    void tracked.then(() => this.pendingSpawns.delete(tracked))
+    void tracked.then(() => {
+      this.pendingSpawns.delete(tracked)
+      this.pendingSpawnAborts.delete(controller)
+    })
 
     return spawning
   }
@@ -373,12 +384,11 @@ export class SessionManager {
       session = new PiAcpSession({
         sessionId,
         cwd: params.cwd,
-        mcpServers: params.mcpServers,
         proc,
         conn: params.conn,
-        fileCommands: params.fileCommands ?? [],
         supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
-        authMethods: params.authMethods
+        authMethods: params.authMethods,
+        supportsElicitationForm: params.supportsElicitationForm
       })
     } catch (error) {
       // The store mapping already exists, so a later session/load can target
@@ -426,12 +436,11 @@ export class SessionManager {
       session = new PiAcpSession({
         sessionId,
         cwd: params.cwd,
-        mcpServers: params.mcpServers,
         proc: params.proc,
         conn: params.conn,
-        fileCommands: params.fileCommands ?? [],
         supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
-        authMethods: params.authMethods
+        authMethods: params.authMethods,
+        supportsElicitationForm: params.supportsElicitationForm
       })
     } catch (error) {
       this.retireProcess(sessionId, params.proc)

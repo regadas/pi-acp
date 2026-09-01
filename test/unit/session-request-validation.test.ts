@@ -10,6 +10,7 @@ import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
 type CreateOnlySessionManager = {
   create(params: unknown): Promise<never>
+  maybeGet?(): undefined
 }
 
 function replaceSessionManager(agent: PiAcpAgent, manager: CreateOnlySessionManager): void {
@@ -85,6 +86,9 @@ test('PiAcpAgent accepts empty or omitted additionalDirectories', async () => {
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
   let createCalls = 0
   replaceSessionManager(agent, {
+    maybeGet() {
+      return undefined
+    },
     async create() {
       createCalls += 1
       throw sentinel

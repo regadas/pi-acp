@@ -230,7 +230,58 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
   }
 })
 
-test('PiAcpAgent: cancel ignores stale session IDs without spawning a restore process', async () => {
+test('PiAcpAgent: restore discovery receives the request cwd', async () => {
+  const conn = new FakeAgentSideConnection()
+  const requestedCwd = '/tmp/requested-project'
+  const sessionFile = '/tmp/requested-project/custom/s.jsonl'
+  const observedCwds: Array<string | undefined> = []
+  const sessions = new FakeSessions((sessionId, params) => ({
+    sessionId,
+    cwd: params.cwd,
+    proc: params.proc
+  }))
+  const originalSpawn = PiRpcProcess.spawn
+  ;(PiRpcProcess as any).spawn = async () =>
+    ({
+      getState: async () => ({ sessionId: 'requested-session', sessionFile })
+    }) as any
+
+  try {
+    const agent = new PiAcpAgent(asAgentConn(conn)) as any
+    const store = { upsert() {} }
+    agent.store = store
+    agent.repository = {
+      store,
+      async find(sessionId: string, cwd?: string) {
+        observedCwds.push(cwd)
+        return { sessionId, cwd: requestedCwd, sessionFile, title: null, updatedAt: null }
+      }
+    }
+    agent.sessions = sessions
+
+    const restored = await agent.restoreSession('requested-session', { cwd: requestedCwd })
+    assert.equal(restored.cwd, requestedCwd)
+    assert.deepEqual(observedCwds, [requestedCwd])
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
+  }
+})
+
+test('PiAcpAgent: active and in-flight restores still validate a request cwd', async () => {
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection())) as any
+  const recorded = { sessionId: 'cwd-session', cwd: '/tmp/recorded', proc: {} }
+  const sessions = new FakeSessions(() => recorded)
+  sessions.restoredSession = recorded
+  agent.sessions = sessions
+
+  await assert.rejects(() => agent.restoreSession('cwd-session', { cwd: '/tmp/wrong' }), /does not match/i)
+
+  sessions.restoredSession = null
+  agent.restoringSessions.set('cwd-session', Promise.resolve(recorded))
+  await assert.rejects(() => agent.restoreSession('cwd-session', { cwd: '/tmp/wrong' }), /does not match/i)
+})
+
+test('PiAcpAgent: many stale cancels leave no epochs and spawn no restore process', async () => {
   const conn = new FakeAgentSideConnection()
   const spawnCalls: any[] = []
 
@@ -248,8 +299,9 @@ test('PiAcpAgent: cancel ignores stale session IDs without spawning a restore pr
       throw new Error('cancel should not restore a missing session')
     }) as any
 
-    await agent.cancel({ sessionId: 'stale-session' } as any)
+    for (let i = 0; i < 1_000; i++) await agent.cancel({ sessionId: `stale-${i}` } as any)
 
+    assert.equal((agent as any).cancellationEpochs.size, 0)
     assert.deepEqual(spawnCalls, [])
     assert.deepEqual(conn.updates, [])
   } finally {

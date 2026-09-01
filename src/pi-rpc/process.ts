@@ -1,7 +1,15 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { getPiCommand, resolvePiCommandForVersionPreflight, shouldUseShellForPiCommand } from './command.js'
+import { buildPiInvocation, getPiCommand } from './command.js'
 import { LfLineDecoder } from './line-decoder.js'
 import { assertSupportedPiVersion, PiVersionError } from './version.js'
+import {
+  decodePiRecord,
+  type PiRpcCommand,
+  type PiRpcEvent,
+  type PiRpcResponse,
+  type PiThinkingLevel
+} from './protocol.js'
+export type { PiRpcEvent, PiThinkingLevel } from './protocol.js'
 
 export class PiRpcSpawnError extends Error {
   /** Underlying spawn error code, e.g. ENOENT, EACCES */
@@ -11,7 +19,7 @@ export class PiRpcSpawnError extends Error {
     super(message)
     this.name = 'PiRpcSpawnError'
     this.code = opts?.code
-    ;(this as any).cause = opts?.cause
+    this.cause = opts?.cause
   }
 }
 
@@ -78,46 +86,10 @@ type PiRpcProcessOptions = {
   maxStdoutRecordBytes?: number
 }
 
-type PiRpcCommand =
-  | { type: 'prompt'; id?: string; message: string; images?: unknown[]; streamingBehavior?: 'steer' | 'followUp' }
-  | { type: 'abort'; id?: string }
-  | { type: 'get_state'; id?: string }
-  // Model
-  | { type: 'get_available_models'; id?: string }
-  | { type: 'set_model'; id?: string; provider: string; modelId: string }
-  // Thinking
-  | { type: 'set_thinking_level'; id?: string; level: PiThinkingLevel }
-  // Modes
-  | { type: 'set_follow_up_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
-  | { type: 'set_steering_mode'; id?: string; mode: 'all' | 'one-at-a-time' }
-  // Compaction
-  | { type: 'compact'; id?: string; customInstructions?: string }
-  | { type: 'set_auto_compaction'; id?: string; enabled: boolean }
-  // Session
-  | { type: 'get_session_stats'; id?: string }
-  | { type: 'set_session_name'; id?: string; name: string }
-  | { type: 'export_html'; id?: string; outputPath?: string }
-  | { type: 'get_entries'; id?: string }
-  // Commands
-  | { type: 'get_commands'; id?: string }
-
-export type PiThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-
-type PiRpcResponse = {
-  type: 'response'
-  id?: string
-  command: string
-  success: boolean
-  data?: unknown
-  error?: string
-}
-
 type PiExtensionUiResponse =
   | { id: string; value: string }
   | { id: string; confirmed: boolean }
   | { id: string; cancelled: true }
-
-export type PiRpcEvent = Record<string, unknown>
 
 type SpawnParams = {
   cwd: string
@@ -125,6 +97,8 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** Cancels the version preflight before the RPC child is spawned. */
+  signal?: AbortSignal
   /**
    * Called synchronously with the wrapper as soon as the OS child exists,
    * which is before this spawn resolves. Owners take responsibility for
@@ -224,16 +198,17 @@ export class PiRpcProcess {
       return
     }
 
-    const record = msg as { type?: unknown; id?: unknown }
-    if (record?.type === 'response') {
+    const decoded = decodePiRecord(msg)
+    if (!decoded) return
+    if (decoded.type === 'response' && 'command' in decoded && 'success' in decoded) {
       // Responses are correlation records, never pi events. A response whose
       // request already timed out is stale and must not reach session event
       // handlers or a later turn.
-      if (typeof record.id !== 'string') return
-      const entry = this.takePending(record.id)
+      if (typeof decoded.id !== 'string') return
+      const entry = this.takePending(decoded.id)
       if (!entry) return
+      const response = decoded as PiRpcResponse
       try {
-        const response = msg as PiRpcResponse
         entry.beforeResolve?.(response)
         entry.resolve(response)
       } catch (error) {
@@ -242,7 +217,7 @@ export class PiRpcProcess {
       return
     }
 
-    this.dispatchEvent(msg as PiRpcEvent)
+    this.dispatchEvent(decoded as PiRpcEvent)
   }
 
   private dispatchEvent(ev: PiRpcEvent): void {
@@ -341,20 +316,12 @@ export class PiRpcProcess {
     // On Windows, npm commonly creates pi.cmd / pi.bat launcher scripts.
     const cmd = getPiCommand(params.piCommand)
 
-    // Preflight Windows command scripts before probing them through a shell.
-    // The resolved path is used only to classify a missing pi.cmd/pi.bat as
-    // ENOENT. The probe itself must use the original command: converting a
-    // bare launcher to an absolute path containing spaces can make cmd.exe
-    // tokenize a valid installation incorrectly.
-    const versionPreflightCommand = resolvePiCommandForVersionPreflight(cmd, params.cwd)
-    if (!versionPreflightCommand) throw piExecutableNotFoundError(cmd)
-
     // Fail closed on unsupported/unknown pi versions before spawning the RPC
     // subprocess (see MIN_PI_VERSION): the ACP prompt lifecycle depends on
     // pi's `agent_settled` event. Launch failures return null here and are
     // surfaced by the detailed spawn error handling below instead.
     try {
-      assertSupportedPiVersion(cmd, params.cwd)
+      await assertSupportedPiVersion(cmd, params.cwd, params.signal)
     } catch (e) {
       if (e instanceof PiVersionError) {
         throw new PiRpcSpawnError(e.message, { code: 'UNSUPPORTED_PI_VERSION', cause: e })
@@ -369,11 +336,14 @@ export class PiRpcProcess {
     const args = ['--mode', 'rpc', '--no-themes']
     if (params.sessionPath) args.push('--session', params.sessionPath)
 
-    const child = spawn(cmd, args, {
+    const invocation = buildPiInvocation(cmd, args, { cwd: params.cwd })
+    if (!invocation) throw piExecutableNotFoundError(cmd)
+    const child = spawn(invocation.executable, invocation.args, {
       cwd: params.cwd,
       stdio: 'pipe',
       env: process.env,
-      shell: shouldUseShellForPiCommand(cmd)
+      shell: false,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments
     })
     // Wire stdout/stderr and lifecycle listeners immediately. A child can exit
     // directly after its `spawn` event; constructing only after awaiting that
@@ -397,9 +367,9 @@ export class PiRpcProcess {
           cleanup()
           resolve()
         }
-        const onError = (err: any) => {
+        const onError = (error: Error) => {
           cleanup()
-          reject(err)
+          reject(error)
         }
         const cleanup = () => {
           child.off('spawn', onSpawn)
@@ -409,9 +379,10 @@ export class PiRpcProcess {
         child.once('spawn', onSpawn)
         child.once('error', onError)
       })
-    } catch (e: any) {
+    } catch (error) {
       proc.dispose({ expected: false })
-      const code = typeof e?.code === 'string' ? e.code : undefined
+      const e = error as NodeJS.ErrnoException
+      const code = typeof e.code === 'string' ? e.code : undefined
       if (code === 'ENOENT') {
         throw piExecutableNotFoundError(cmd, e)
       }
@@ -560,6 +531,18 @@ export class PiRpcProcess {
     return res.data
   }
 
+  async getAvailableThinkingLevels(): Promise<unknown> {
+    const res = await this.request({ type: 'get_available_thinking_levels' })
+    if (!res.success) {
+      const error = new Error(`pi get_available_thinking_levels failed: ${res.error ?? JSON.stringify(res.data)}`)
+      ;(error as Error & { unsupportedCommand?: boolean }).unsupportedCommand = /unknown command|unsupported/i.test(
+        res.error ?? ''
+      )
+      throw error
+    }
+    return res.data
+  }
+
   async setThinkingLevel(level: PiThinkingLevel): Promise<void> {
     const res = await this.request({ type: 'set_thinking_level', level })
     if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
@@ -600,7 +583,7 @@ export class PiRpcProcess {
   async exportHtml(outputPath?: string): Promise<{ path: string }> {
     const res = await this.request({ type: 'export_html', outputPath })
     if (!res.success) throw new Error(`pi export_html failed: ${res.error ?? JSON.stringify(res.data)}`)
-    const data: any = res.data
+    const data = res.data as { path?: unknown } | null | undefined
     return { path: String(data?.path ?? '') }
   }
 

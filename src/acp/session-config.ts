@@ -30,20 +30,30 @@ function thinkingLevelsFromState(state: unknown): readonly ThinkingLevel[] {
   return supported.length ? supported : FALLBACK_THINKING_LEVELS
 }
 
+async function availableThinkingLevels(proc: PiRpcProcess, state: unknown): Promise<readonly ThinkingLevel[]> {
+  if (typeof proc.getAvailableThinkingLevels !== 'function') return thinkingLevelsFromState(state)
+  try {
+    const data = (await proc.getAvailableThinkingLevels()) as { levels?: unknown } | unknown[]
+    const raw = Array.isArray(data) ? data : Array.isArray(data?.levels) ? data.levels : []
+    return raw.filter((level): level is ThinkingLevel => typeof level === 'string' && isThinkingLevel(level))
+  } catch (error) {
+    if ((error as Error & { unsupportedCommand?: boolean }).unsupportedCommand) return thinkingLevelsFromState(state)
+    throw error
+  }
+}
+
 async function assertThinkingLevelSupported(proc: PiRpcProcess, level: ThinkingLevel): Promise<void> {
   let state: unknown
   try {
     state = await proc.getState()
   } catch (e) {
-    // Fail closed: without state, support cannot be established, and pi would
-    // silently clamp an unsupported level while we report success.
     throw RequestError.internalError(
       {},
       `Cannot verify thinking level support (get_state failed): ${String((e as Error)?.message ?? e)}`
     )
   }
 
-  const supported = thinkingLevelsFromState(state)
+  const supported = await availableThinkingLevels(proc, state)
   if (!supported.includes(level)) {
     throw RequestError.invalidParams(
       {},
@@ -91,7 +101,7 @@ type ThoughtLevelState = {
 async function getThoughtLevelState(proc: PiRpcProcess, pre?: { state?: any | null }): Promise<ThoughtLevelState> {
   const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
 
-  const available = thinkingLevelsFromState(state)
+  const available = await availableThinkingLevels(proc, state)
 
   const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
   let current: ThinkingLevel = tl && isThinkingLevel(tl) ? tl : 'off'

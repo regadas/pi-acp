@@ -2,15 +2,21 @@ import { ndJsonStream } from '@agentclientprotocol/sdk'
 import { createPiAcpAgentApp } from './acp/app.js'
 import type { PiAcpAgent } from './acp/agent.js'
 import { createShutdownCoordinator } from './acp/shutdown.js'
-import { getPiCommand, shouldUseShellForPiCommand } from './pi-rpc/command.js'
+import { buildPiInvocation, getPiCommand } from './pi-rpc/command.js'
 // Terminal Auth entrypoint. The ACP client launches the agent with `--terminal-login`.
 if (process.argv.includes('--terminal-login')) {
   const { spawnSync } = await import('node:child_process')
   const cmd = getPiCommand(process.env.PI_ACP_PI_COMMAND)
-  const res = spawnSync(cmd, [], {
+  const invocation = buildPiInvocation(cmd, [], { cwd: process.cwd() })
+  if (!invocation) {
+    process.stderr.write(`pi-acp: could not start pi (command not found: ${cmd}).\n`)
+    process.exit(1)
+  }
+  const res = spawnSync(invocation.executable, invocation.args, {
     stdio: 'inherit',
     env: process.env,
-    shell: shouldUseShellForPiCommand(cmd)
+    shell: false,
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments
   })
 
   if ((res as any).error && (res as any).error.code === 'ENOENT') {

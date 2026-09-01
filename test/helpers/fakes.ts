@@ -53,10 +53,15 @@ export class FakeAgentSideConnection {
   }
 
   async requestPermission(
-    params: unknown
+    params: unknown,
+    _options?: { cancellationSignal?: AbortSignal }
   ): Promise<{ outcome: { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' } }> {
     this.permissionRequests.push(params)
     return this.nextPermissionResponse
+  }
+
+  async createElicitation(): Promise<{ action: 'cancel' }> {
+    return { action: 'cancel' }
   }
 }
 
@@ -85,8 +90,8 @@ export class FakePiRpcProcess {
     }
   }
 
-  emit(ev: PiRpcEvent) {
-    for (const h of this.handlers) h(ev)
+  emit(ev: PiRpcEvent | Record<string, unknown>) {
+    for (const h of this.handlers) h(ev as PiRpcEvent)
   }
 
   onTermination(handler: (t: PiRpcTermination) => void): () => void {
@@ -208,6 +213,16 @@ export class FakePiRpcProcess {
   }
 
   readonly thinkingLevels: string[] = []
+  availableThinkingLevels: string[] | null = null
+
+  async getAvailableThinkingLevels(): Promise<unknown> {
+    if (this.availableThinkingLevels) return { levels: this.availableThinkingLevels }
+    const error = new Error('unknown command: get_available_thinking_levels') as Error & {
+      unsupportedCommand?: boolean
+    }
+    error.unsupportedCommand = true
+    throw error
+  }
   readonly models: Array<{ provider: string; modelId: string }> = []
   // Optional hook so tests can model pi echoing its own state-change events.
   afterThinkingLevelSet: ((level: string) => void) | null = null

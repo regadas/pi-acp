@@ -1,10 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   MIN_PI_VERSION,
+  PI_FEATURE_MIN_VERSION,
   PiVersionError,
   assertSupportedPiVersion,
   clearPiVersionCacheForTests,
@@ -15,6 +16,13 @@ import { resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
 import { PiRpcProcess, PiRpcSpawnError } from '../../src/pi-rpc/process.js'
 
 const isWindows = process.platform === 'win32'
+
+test('minimum-version feature matrix keeps only newer thinking discovery behind fallback', () => {
+  for (const [feature, version] of Object.entries(PI_FEATURE_MIN_VERSION)) {
+    if (feature === 'getAvailableThinkingLevels') assert.ok(comparePiVersions(version, MIN_PI_VERSION) > 0)
+    else assert.ok(comparePiVersions(version, MIN_PI_VERSION) <= 0, `${feature} must exist at the supported floor`)
+  }
+})
 
 function makePiStubIn(dir: string, name: string, versionOutput: string, versionExitCode = 0): string {
   const stub = join(dir, name)
@@ -30,6 +38,27 @@ function makePiStubIn(dir: string, name: string, versionOutput: string, versionE
 function makePiStub(name: string, versionOutput: string, versionExitCode = 0): string {
   const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-'))
   return makePiStubIn(dir, name, versionOutput, versionExitCode)
+}
+
+function makeHangingPiStub(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-hanging-'))
+  const stub = join(dir, 'pi-hanging')
+  writeFileSync(stub, '#!/usr/bin/env node\nsetInterval(() => {}, 1000)\n', 'utf-8')
+  chmodSync(stub, 0o755)
+  return stub
+}
+
+function makeDelayedCountingPiStub(counter: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-shared-'))
+  const stub = join(dir, 'pi-shared')
+  writeFileSync(
+    stub,
+    `#!/usr/bin/env node\nrequire('node:fs').appendFileSync(${JSON.stringify(counter)}, 'x')\n` +
+      `setTimeout(() => console.log(${JSON.stringify(MIN_PI_VERSION)}), 100)\n`,
+    'utf-8'
+  )
+  chmodSync(stub, 0o755)
+  return stub
 }
 
 test('parsePiVersion accepts semver output with optional v prefix', () => {
@@ -194,17 +223,45 @@ test('PiRpcProcess.spawn observes a child that exits immediately after spawn', {
   }
 })
 
-test('assertSupportedPiVersion accepts the minimum and newer versions', { skip: isWindows }, () => {
+test('assertSupportedPiVersion aborts an in-flight version child', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
-  assert.equal(assertSupportedPiVersion(makePiStub('pi-ok-min', MIN_PI_VERSION)), MIN_PI_VERSION)
-  assert.equal(assertSupportedPiVersion(makePiStub('pi-ok-newer', '0.80.6')), '0.80.6')
+  const controller = new AbortController()
+  const checking = assertSupportedPiVersion(makeHangingPiStub(), process.cwd(), controller.signal)
+  setTimeout(() => controller.abort(), 20)
+
+  await assert.rejects(
+    checking,
+    (error: unknown) => error instanceof Error && error.name === 'AbortError',
+    'shutdown cancellation must settle before the 15 second preflight timeout'
+  )
 })
 
-test('assertSupportedPiVersion fails closed on versions older than the minimum', { skip: isWindows }, () => {
+test('one version caller abort does not kill a probe used by another caller', { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  const counter = join(mkdtempSync(join(tmpdir(), 'pi-acp-version-count-')), 'count')
+  const command = makeDelayedCountingPiStub(counter)
+  const firstController = new AbortController()
+  const secondController = new AbortController()
+  const first = assertSupportedPiVersion(command, process.cwd(), firstController.signal)
+  const second = assertSupportedPiVersion(command, process.cwd(), secondController.signal)
+
+  setTimeout(() => firstController.abort(), 20)
+  await assert.rejects(first, (error: unknown) => error instanceof Error && error.name === 'AbortError')
+  assert.equal(await second, MIN_PI_VERSION)
+  assert.equal(readFileSync(counter, 'utf8'), 'x', 'concurrent callers share one version child')
+})
+
+test('assertSupportedPiVersion accepts the minimum and newer versions', { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-min', MIN_PI_VERSION)), MIN_PI_VERSION)
+  assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-newer', '0.80.6')), '0.80.6')
+})
+
+test('assertSupportedPiVersion fails closed on versions older than the minimum', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
   const stub = makePiStub('pi-old', '0.80.3')
-  assert.throws(
-    () => assertSupportedPiVersion(stub),
+  await assert.rejects(
+    assertSupportedPiVersion(stub),
     (err: unknown) =>
       err instanceof PiVersionError &&
       err.message.includes('0.80.3') &&
@@ -213,11 +270,11 @@ test('assertSupportedPiVersion fails closed on versions older than the minimum',
   )
 })
 
-test('assertSupportedPiVersion fails closed on unparseable version output', { skip: isWindows }, () => {
+test('assertSupportedPiVersion fails closed on unparseable version output', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
   const stub = makePiStub('pi-garbage', 'not a version')
-  assert.throws(
-    () => assertSupportedPiVersion(stub),
+  await assert.rejects(
+    assertSupportedPiVersion(stub),
     (err: unknown) => err instanceof PiVersionError && err.message.includes('Could not determine the pi version')
   )
 })
@@ -225,36 +282,50 @@ test('assertSupportedPiVersion fails closed on unparseable version output', { sk
 test(
   'assertSupportedPiVersion uses cwd for relative commands and isolates the cache by cwd',
   { skip: isWindows },
-  () => {
+  async () => {
     clearPiVersionCacheForTests()
     const supportedDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-cwd-supported-'))
     const oldDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-cwd-old-'))
     makePiStubIn(supportedDir, 'pi-relative', '0.80.6')
     makePiStubIn(oldDir, 'pi-relative', '0.80.3')
 
-    assert.equal(assertSupportedPiVersion('./pi-relative', supportedDir), '0.80.6')
-    assert.throws(
-      () => assertSupportedPiVersion('./pi-relative', oldDir),
+    assert.equal(await assertSupportedPiVersion('./pi-relative', supportedDir), '0.80.6')
+    await assert.rejects(
+      assertSupportedPiVersion('./pi-relative', oldDir),
       (err: unknown) => err instanceof PiVersionError && err.message.includes('0.80.3')
     )
   }
 )
 
-test('assertSupportedPiVersion fails closed when a runnable version probe exits nonzero', { skip: isWindows }, () => {
+test(
+  'assertSupportedPiVersion fails closed when a runnable version probe exits nonzero',
+  { skip: isWindows },
+  async () => {
+    clearPiVersionCacheForTests()
+    const stub = makePiStub('pi-version-fails', 'version unavailable', 7)
+    await assert.rejects(
+      assertSupportedPiVersion(stub),
+      (err: unknown) =>
+        err instanceof PiVersionError &&
+        err.message.includes('Could not determine the pi version') &&
+        err.message.includes('status 7')
+    )
+  }
+)
+
+test('assertSupportedPiVersion defers launch failures to the real spawn', async () => {
   clearPiVersionCacheForTests()
-  const stub = makePiStub('pi-version-fails', 'version unavailable', 7)
-  assert.throws(
-    () => assertSupportedPiVersion(stub),
-    (err: unknown) =>
-      err instanceof PiVersionError &&
-      err.message.includes('Could not determine the pi version') &&
-      err.message.includes('status 7')
-  )
+  assert.equal(await assertSupportedPiVersion('/definitely/not/a/real/pi-binary'), null)
 })
 
-test('assertSupportedPiVersion defers launch failures to the real spawn', () => {
+test('assertSupportedPiVersion does not retain a resolved missing-command result', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
-  assert.equal(assertSupportedPiVersion('/definitely/not/a/real/pi-binary'), null)
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-late-install-'))
+  const command = join(dir, 'pi-late')
+  assert.equal(await assertSupportedPiVersion(command, dir), null)
+
+  makePiStubIn(dir, 'pi-late', MIN_PI_VERSION)
+  assert.equal(await assertSupportedPiVersion(command, dir), MIN_PI_VERSION)
 })
 
 test(
@@ -317,9 +388,8 @@ test('PiRpcProcess.spawn reports the child to its owner before resolving', { ski
     onProcess: proc => reported.push(proc)
   })
 
-  // The OS child already exists here, so shutdown must be able to see it
-  // without waiting for the spawn promise.
-  assert.equal(reported.length, 1, 'the child is handed over before the spawn resolves')
+  // The asynchronous version preflight runs before the RPC child exists.
+  assert.equal(reported.length, 0)
 
   const proc = await spawning
   assert.equal(proc, reported[0], 'the reported child is the one handed back')

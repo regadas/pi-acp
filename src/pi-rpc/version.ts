@@ -1,19 +1,23 @@
-import { spawnSync } from 'node:child_process'
-import { shouldUseShellForPiCommand } from './command.js'
+import { spawn } from 'node:child_process'
+import { buildPiInvocation } from './command.js'
 
-/**
- * Minimum pi version supported by this adapter.
- *
- * The ACP `session/prompt` lifecycle relies on pi's `agent_settled` RPC event
- * (added in pi 0.80.4). `agent_end` only marks a low-level agent run boundary:
- * pi may continue with automatic retries, compaction retries, and queued
- * continuations afterwards, and only `agent_settled` marks the fully settled
- * prompt. Completing the ACP turn at `agent_end` produces protocol-violating
- * out-of-turn `session/update` notifications, while waiting for
- * `agent_settled` on an older pi would hang forever. We therefore fail closed
- * with a clear error instead of silently misbehaving on unsupported versions.
- */
+/** agent_settled is the lifecycle floor; newer commands use explicit fallbacks. */
 export const MIN_PI_VERSION = '0.80.4'
+
+export const PI_FEATURE_MIN_VERSION = {
+  agentSettled: '0.80.4',
+  prompt: '0.80.4',
+  abort: '0.80.4',
+  stateAndModels: '0.80.4',
+  modelAndThinkingMutation: '0.80.4',
+  queueModes: '0.80.4',
+  compaction: '0.80.4',
+  sessionStatsAndExport: '0.80.4',
+  getEntries: '0.80.4',
+  getCommands: '0.80.4',
+  extensionUi: '0.80.4',
+  getAvailableThinkingLevels: '0.81.0'
+} as const
 
 export class PiVersionError extends Error {
   constructor(message: string) {
@@ -25,20 +29,16 @@ export class PiVersionError extends Error {
 const SEMVER_REGEX =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 
-/** Parse `pi --version` output into a bare, standard SemVer string, or null. */
 export function parsePiVersion(raw: string): string | null {
   const cleaned = raw.trim().replace(/^v/i, '')
   return SEMVER_REGEX.test(cleaned) ? cleaned : null
 }
 
 type ParsedSemver = { base: [bigint, bigint, bigint]; prerelease: string[] }
-
 function parseSemverParts(v: string): ParsedSemver {
   const normalized = parsePiVersion(v)
   if (!normalized) throw new TypeError(`Invalid semantic version: ${v}`)
-
-  // Build metadata never affects precedence (SemVer §10).
-  const withoutBuild = normalized.split('+')[0]
+  const withoutBuild = normalized.split('+')[0]!
   const dashIndex = withoutBuild.indexOf('-')
   const base = dashIndex === -1 ? withoutBuild : withoutBuild.slice(0, dashIndex)
   const prerelease = dashIndex === -1 ? [] : withoutBuild.slice(dashIndex + 1).split('.')
@@ -46,140 +46,240 @@ function parseSemverParts(v: string): ParsedSemver {
   return { base: [major!, minor!, patch!], prerelease }
 }
 
-/**
- * Compare two semver versions with full precedence rules (SemVer §11):
- * numeric x.y.z first; a prerelease sorts below its stable release
- * (0.80.4-alpha < 0.80.4); prerelease identifiers compare numerically when
- * both numeric, numeric below alphanumeric otherwise lexically; a shorter
- * identifier list sorts below a longer one with an equal prefix. Build
- * metadata is ignored.
- */
 export function comparePiVersions(a: string, b: string): number {
   const pa = parseSemverParts(a)
   const pb = parseSemverParts(b)
-
   for (let i = 0; i < 3; i++) {
     if (pa.base[i] > pb.base[i]) return 1
     if (pa.base[i] < pb.base[i]) return -1
   }
-
-  if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0
-  if (pa.prerelease.length === 0) return 1
-  if (pb.prerelease.length === 0) return -1
-
-  const length = Math.max(pa.prerelease.length, pb.prerelease.length)
-  for (let i = 0; i < length; i++) {
+  if (!pa.prerelease.length && !pb.prerelease.length) return 0
+  if (!pa.prerelease.length) return 1
+  if (!pb.prerelease.length) return -1
+  for (let i = 0; i < Math.max(pa.prerelease.length, pb.prerelease.length); i++) {
     const ia = pa.prerelease[i]
     const ib = pb.prerelease[i]
     if (ia === undefined) return -1
     if (ib === undefined) return 1
-
     const numericA = /^\d+$/.test(ia)
     const numericB = /^\d+$/.test(ib)
     if (numericA && numericB) {
       const na = BigInt(ia)
       const nb = BigInt(ib)
       if (na !== nb) return na < nb ? -1 : 1
-    } else if (numericA) {
-      return -1
-    } else if (numericB) {
-      return 1
-    } else if (ia !== ib) {
-      return ia < ib ? -1 : 1
-    }
+    } else if (numericA) return -1
+    else if (numericB) return 1
+    else if (ia !== ib) return ia < ib ? -1 : 1
   }
   return 0
 }
 
-const versionCache = new Map<string, string>()
+type VersionProbe = {
+  promise: Promise<string | null>
+  consumers: Set<symbol>
+  aborting: boolean
+  settled: boolean
+  abort(): void
+}
 
-/** Test seam: clear the per-process pi version cache. */
+const versionCache = new Map<string, VersionProbe>()
 export function clearPiVersionCacheForTests(): void {
   versionCache.clear()
 }
 
-/**
- * Verify the resolved pi command (including `PI_ACP_PI_COMMAND` overrides)
- * satisfies {@link MIN_PI_VERSION}.
- *
- * Policy:
- * - Version parsed and `>= MIN_PI_VERSION`: returns the version (cached per
- *   command and working directory for this process).
- * - Version parsed and too old: throws {@link PiVersionError} explaining the
- *   `agent_settled` requirement.
- * - The executable runs but `--version` fails, is interrupted, times out, or
- *   prints something unparseable: throws {@link PiVersionError}. An unknown
- *   version must fail explicitly rather than risk a later hang or a falsely
- *   settled ACP turn.
- * - Genuine launch failures (such as a missing or non-executable binary)
- *   return null and defer to the real spawn, which surfaces its more specific
- *   launch error.
- */
-export function assertSupportedPiVersion(piCommand: string, cwd: string = process.cwd()): string | null {
-  const cacheKey = JSON.stringify([piCommand, cwd])
-  const cached = versionCache.get(cacheKey)
-  if (cached) return cached
+function versionFailure(command: string, cwd: string, detail: string): PiVersionError {
+  return new PiVersionError(
+    `Could not determine the pi version: \`${command} --version\` ${detail} from ${cwd}. ` +
+      `pi-acp requires pi >= ${MIN_PI_VERSION} (for the \`agent_settled\` RPC event).`
+  )
+}
 
-  let result: ReturnType<typeof spawnSync>
-  try {
-    result = spawnSync(piCommand, ['--version'], {
+function abortReason(signal: AbortSignal): unknown {
+  if (signal.reason !== undefined) return signal.reason
+  const error = new Error('The operation was aborted')
+  error.name = 'AbortError'
+  return error
+}
+
+function startVersionProbe(piCommand: string, cwd: string): VersionProbe {
+  const controller = new AbortController()
+  const signal = controller.signal
+  const promise = new Promise<string | null>((resolve, reject) => {
+    const invocation = buildPiInvocation(piCommand, ['--version'], { cwd })
+    if (!invocation) return resolve(null)
+
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let abortedReason: unknown
+    const child = spawn(invocation.executable, invocation.args, {
       cwd,
-      encoding: 'utf-8',
-      timeout: 15000,
-      shell: shouldUseShellForPiCommand(piCommand)
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: false,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments
     })
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException | null | undefined)?.code
-    if (code === 'ENOENT' || code === 'EACCES' || code === 'EPERM' || code === 'ENOEXEC') return null
-    throw new PiVersionError(
-      `Could not determine the pi version: \`${piCommand} --version\` could not be checked from ${cwd}: ${String(err)}. ` +
-        `pi-acp requires pi >= ${MIN_PI_VERSION} (for the \`agent_settled\` RPC event).`
+    const cleanup = () => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+    }
+    const settle = (outcome: { value: string | null } | { error: unknown }) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if ('error' in outcome) reject(outcome.error)
+      else resolve(outcome.value)
+    }
+    const onAbort = () => {
+      if (settled || abortedReason !== undefined) return
+      abortedReason = abortReason(signal)
+      child.kill('SIGKILL')
+    }
+    child.stdout.setEncoding('utf8').on('data', chunk => (stdout += chunk))
+    child.stderr.setEncoding('utf8').on('data', chunk => (stderr += chunk))
+    child.once('error', error => {
+      if (abortedReason !== undefined) {
+        settle({ error: abortedReason })
+        return
+      }
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'EACCES' || code === 'EPERM' || code === 'ENOEXEC') settle({ value: null })
+      else settle({ error: versionFailure(piCommand, cwd, String(error)) })
+    })
+    child.once('close', (code, childSignal) => {
+      if (settled) return
+      if (abortedReason !== undefined) {
+        settle({ error: abortedReason })
+        return
+      }
+      const output = (stdout.trim() || stderr.trim()).slice(0, 120)
+      if (code !== 0 || childSignal) {
+        settle({
+          error: versionFailure(
+            piCommand,
+            cwd,
+            childSignal ? `was terminated by ${childSignal}` : `exited with status ${code}`
+          )
+        })
+        return
+      }
+      const version = parsePiVersion(output)
+      if (!version) {
+        settle({ error: versionFailure(piCommand, cwd, `printed ${JSON.stringify(output)}`) })
+        return
+      }
+      if (comparePiVersions(version, MIN_PI_VERSION) < 0) {
+        settle({
+          error: new PiVersionError(
+            `Unsupported pi version ${version} (command: ${piCommand}). pi-acp requires pi >= ${MIN_PI_VERSION}, ` +
+              'which adds the `agent_settled` RPC event used to close ACP prompt turns safely.'
+          )
+        })
+        return
+      }
+      settle({ value: version })
+    })
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      settle({ error: versionFailure(piCommand, cwd, 'timed out') })
+    }, 15_000)
+    timer.unref?.()
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+
+  const probe: VersionProbe = {
+    promise,
+    consumers: new Set(),
+    aborting: false,
+    settled: false,
+    abort() {
+      if (probe.aborting || probe.settled) return
+      probe.aborting = true
+      controller.abort()
+    }
+  }
+  void promise.then(
+    () => {
+      probe.settled = true
+    },
+    () => {
+      probe.settled = true
+    }
+  )
+  return probe
+}
+
+function consumeVersionProbe(probe: VersionProbe, signal?: AbortSignal): Promise<string | null> {
+  if (signal?.aborted) return Promise.reject(abortReason(signal))
+  const consumer = Symbol('version-probe-consumer')
+  probe.consumers.add(consumer)
+
+  return new Promise<string | null>((resolve, reject) => {
+    let finished = false
+    let aborted = false
+    const detach = () => {
+      signal?.removeEventListener('abort', onAbort)
+      probe.consumers.delete(consumer)
+    }
+    const finish = (outcome: { value: string | null } | { error: unknown }) => {
+      if (finished) return
+      finished = true
+      detach()
+      if ('error' in outcome) reject(outcome.error)
+      else resolve(outcome.value)
+    }
+    const onAbort = () => {
+      if (finished || aborted) return
+      aborted = true
+      const reason = abortReason(signal!)
+      detach()
+      if (probe.consumers.size > 0 || probe.settled) {
+        finished = true
+        reject(reason)
+        return
+      }
+
+      // The final owner waits for the shared child to close, preserving the
+      // SessionManager shutdown guarantee. Other callers already detached.
+      probe.abort()
+      void probe.promise.then(
+        () => finish({ error: reason }),
+        () => finish({ error: reason })
+      )
+    }
+
+    signal?.addEventListener('abort', onAbort, { once: true })
+    void probe.promise.then(
+      value => {
+        if (!aborted) finish({ value })
+      },
+      error => {
+        if (!aborted) finish({ error })
+      }
+    )
+    if (signal?.aborted) onAbort()
+  })
+}
+
+export function assertSupportedPiVersion(
+  piCommand: string,
+  cwd = process.cwd(),
+  signal?: AbortSignal
+): Promise<string | null> {
+  if (signal?.aborted) return Promise.reject(abortReason(signal))
+  const cacheKey = JSON.stringify([piCommand, cwd])
+  let probe = versionCache.get(cacheKey)
+  if (!probe || probe.aborting) {
+    probe = startVersionProbe(piCommand, cwd)
+    versionCache.set(cacheKey, probe)
+    void probe.promise.then(
+      version => {
+        if (version === null && versionCache.get(cacheKey) === probe) versionCache.delete(cacheKey)
+      },
+      () => {
+        if (versionCache.get(cacheKey) === probe) versionCache.delete(cacheKey)
+      }
     )
   }
-
-  const launchErrorCode = (result.error as NodeJS.ErrnoException | undefined)?.code
-  if (
-    launchErrorCode === 'ENOENT' ||
-    launchErrorCode === 'EACCES' ||
-    launchErrorCode === 'EPERM' ||
-    launchErrorCode === 'ENOEXEC'
-  ) {
-    return null
-  }
-
-  const output = String(result.stdout ?? '').trim() || String(result.stderr ?? '').trim()
-  if (result.error || result.signal || result.status !== 0) {
-    const detail = result.error
-      ? String(result.error)
-      : result.signal
-        ? `terminated by signal ${result.signal}`
-        : `exited with status ${String(result.status)}`
-    throw new PiVersionError(
-      `Could not determine the pi version: \`${piCommand} --version\` ${detail}` +
-        `${output ? ` after printing ${JSON.stringify(output.slice(0, 120))}` : ''}. ` +
-        `pi-acp requires pi >= ${MIN_PI_VERSION} (for the \`agent_settled\` RPC event) and fails closed on unknown ` +
-        `versions instead of risking hangs or premature ACP turn completion.`
-    )
-  }
-
-  const version = parsePiVersion(output)
-
-  if (!version) {
-    throw new PiVersionError(
-      `Could not determine the pi version: \`${piCommand} --version\` printed ${JSON.stringify(output.slice(0, 120))}. ` +
-        `pi-acp requires pi >= ${MIN_PI_VERSION} (for the \`agent_settled\` RPC event) and fails closed on unknown ` +
-        `versions instead of risking hangs or premature ACP turn completion.`
-    )
-  }
-
-  if (comparePiVersions(version, MIN_PI_VERSION) < 0) {
-    throw new PiVersionError(
-      `Unsupported pi version ${version} (command: ${piCommand}). pi-acp requires pi >= ${MIN_PI_VERSION}, which adds ` +
-        `the \`agent_settled\` RPC event used to close ACP prompt turns safely. ` +
-        `Update pi: \`npm i -g @earendil-works/pi-coding-agent\`.`
-    )
-  }
-
-  versionCache.set(cacheKey, version)
-  return version
+  return consumeVersionProbe(probe, signal)
 }

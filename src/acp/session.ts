@@ -1,20 +1,20 @@
 import type {
   AuthMethod,
   ContentBlock,
-  McpServer,
   PermissionOption,
   SessionConfigOption,
   SessionUpdate,
   ToolCallContent,
-  ToolCallLocation
+  ToolCallLocation,
+  Usage
 } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcRequestTimeoutError, type PiRpcEvent, type PiRpcTermination } from '../pi-rpc/process.js'
+import type { PiAssistantMessageEvent } from '../pi-rpc/protocol.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { terminationError, toRequestError } from './session-errors.js'
-import { expandSlashCommand, type FileSlashCommand } from './slash-commands.js'
 import {
   bashCommand,
   bashExitCode,
@@ -55,6 +55,7 @@ type PendingTurn = {
   promptQueued: boolean
   expectedPromptText: string
   matchingPromptMessagesToSkip: number
+  beforeRelease?: () => Promise<void>
 }
 
 type QueuedPrompt = {
@@ -63,6 +64,7 @@ type QueuedPrompt = {
   images: unknown[]
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
+  beforeRelease?: () => Promise<void>
 }
 
 /** The adapter-handled slash command currently holding the session FIFO. */
@@ -129,6 +131,8 @@ type PendingCustomMessage = {
 }
 
 type PermissionResponse = Awaited<ReturnType<AcpClient['requestPermission']>>
+type PiUiResponse = { id: string; value: string } | { id: string; confirmed: boolean } | { id: string; cancelled: true }
+type PendingUiRequest = { id: string; controller: AbortController }
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
@@ -198,7 +202,8 @@ export class PiAcpSession {
 
   readonly proc: PiRpcProcess
   private readonly conn: AcpClient
-  private readonly fileCommands: FileSlashCommand[]
+  private readonly supportsElicitationForm: boolean
+  private readonly pendingUiRequests = new Map<string, PendingUiRequest>()
   // Fabricated terminal references and terminal_* metadata are a negotiated
   // Zed convention; never expose them to a client that did not opt in.
   private readonly supportsTerminalOutputMeta: boolean
@@ -220,6 +225,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  private readonly streamedToolCalls = new Map<number, { id: string; name: string; argumentsText: string }>()
   // Tool calls already reported as completed/failed in the current turn.
   private readonly settledToolCallIds = new Set<string>()
 
@@ -294,12 +300,12 @@ export class PiAcpSession {
   private disposalExpected = false
 
   constructor(opts: {
+    [key: string]: unknown
     sessionId: string
     cwd: string
-    mcpServers: McpServer[]
     proc: PiRpcProcess
     conn: AcpClient
-    fileCommands?: FileSlashCommand[]
+    supportsElicitationForm?: boolean
     supportsTerminalOutputMeta?: boolean
     authMethods?: AuthMethod[]
     /** Test seam: maximum wait for an observed out-of-band run to settle. */
@@ -309,7 +315,7 @@ export class PiAcpSession {
     this.cwd = opts.cwd
     this.proc = opts.proc
     this.conn = opts.conn
-    this.fileCommands = opts.fileCommands ?? []
+    this.supportsElicitationForm = opts.supportsElicitationForm ?? false
     this.supportsTerminalOutputMeta = opts.supportsTerminalOutputMeta ?? false
     this.authMethods = opts.authMethods ?? []
     this.deferredAdmissionTimeoutMs = opts.deferredAdmissionTimeoutMs ?? DEFERRED_ADMISSION_TIMEOUT_MS
@@ -323,6 +329,7 @@ export class PiAcpSession {
 
   private handleProcessTermination(termination: PiRpcTermination): void {
     this.procTermination = termination
+    this.drainPendingUiRequests()
     // Captured before releasing a parked command: settling that admission can
     // hand the FIFO on, and only the turn installed at termination may be
     // failed with this termination error.
@@ -448,6 +455,7 @@ export class PiAcpSession {
   }
 
   dispose(options?: { expected?: boolean }): void {
+    this.drainPendingUiRequests()
     if (this.disposed) return
     this.disposed = true
     this.disposalExpected = options?.expected ?? true
@@ -502,6 +510,52 @@ export class PiAcpSession {
       // later custom messages are deferred instead of escaping after response.
       this.activeAdapterPromptTurns -= 1
       await this.flushEmits()
+    }
+  }
+
+  async publishUsageAndGet(opts?: { isStale?: () => boolean }): Promise<Usage | undefined> {
+    let stats: unknown
+    try {
+      stats = await this.proc.getSessionStats()
+    } catch {
+      return undefined
+    }
+    const record = stats as {
+      tokens?: { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown; total?: unknown }
+      cost?: unknown
+      contextUsage?: { tokens?: unknown; contextWindow?: unknown }
+    }
+    const finite = (value: unknown): number | undefined =>
+      typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+    const inputTokens = finite(record.tokens?.input)
+    const outputTokens = finite(record.tokens?.output)
+    const totalTokens = finite(record.tokens?.total)
+    if (inputTokens === undefined || outputTokens === undefined || totalTokens === undefined) return undefined
+
+    const used = finite(record.contextUsage?.tokens)
+    const size = finite(record.contextUsage?.contextWindow)
+    if (used !== undefined && size !== undefined) {
+      const amount = finite(record.cost)
+      await this.sendSessionUpdate(
+        {
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: 'usage_update',
+            used,
+            size,
+            ...(amount === undefined ? {} : { cost: { amount, currency: 'USD' } })
+          }
+        },
+        { isStale: opts?.isStale }
+      ).catch(() => {})
+    }
+
+    return {
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      cachedReadTokens: finite(record.tokens?.cacheRead),
+      cachedWriteTokens: finite(record.tokens?.cacheWrite)
     }
   }
 
@@ -564,15 +618,12 @@ export class PiAcpSession {
     }
   }
 
-  async prompt(message: string, images: unknown[] = []): Promise<StopReason> {
+  async prompt(message: string, images: unknown[] = [], beforeRelease?: () => Promise<void>): Promise<StopReason> {
     // Once shutdown starts, no new work may be admitted to this subprocess.
     if (this.isClosing()) return 'cancelled'
 
-    // pi RPC mode disables slash command expansion, so we do it here.
-    const expandedMessage = expandSlashCommand(message, this.fileCommands)
-
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedPrompt = { kind: 'prompt', message: expandedMessage, images, resolve, reject }
+      const queued: QueuedPrompt = { kind: 'prompt', message, images, resolve, reject, beforeRelease }
 
       // If a turn or adapter command is running (or work is already waiting
       // behind it), enqueue so every prompt path stays FIFO.
@@ -854,6 +905,7 @@ export class PiAcpSession {
   }
 
   async cancel(): Promise<void> {
+    this.drainPendingUiRequests()
     // Cancel current and clear any queued work.
     this.cancelRequested = true
 
@@ -975,6 +1027,7 @@ export class PiAcpSession {
   }
 
   private async runShutdown(): Promise<void> {
+    this.drainPendingUiRequests()
     this.cancelRequested = true
 
     // An adapter command settles as cancelled when disposal rejects its
@@ -1285,7 +1338,8 @@ export class PiAcpSession {
       piRunOwned: false,
       promptQueued: false,
       expectedPromptText: t.message,
-      matchingPromptMessagesToSkip: 0
+      matchingPromptMessagesToSkip: 0,
+      beforeRelease: t.beforeRelease
     }
     this.pendingTurn = turn
 
@@ -1468,14 +1522,20 @@ export class PiAcpSession {
         ? 'max_tokens'
         : 'end_turn'
 
-    void this.flushEmits().finally(() => {
-      // Keep the completing turn installed until its updates have flushed. New
-      // prompts must remain queued behind it; clearing pendingTurn earlier lets
-      // a newcomer start and then get overwritten by startNextQueuedTurn().
-      this.pendingTurn = null
-      turn.resolve(reason)
-      this.startNextQueuedWork()
-    })
+    void (async () => {
+      try {
+        await this.flushEmits()
+        await turn.beforeRelease?.()
+      } catch {
+        // Usage capture/publication is best-effort and must not strand the FIFO.
+      } finally {
+        // Keep the completing turn installed until its updates and usage have
+        // flushed. New prompts must remain queued behind it.
+        this.pendingTurn = null
+        turn.resolve(reason)
+        this.startNextQueuedWork()
+      }
+    })()
   }
 
   private failTurn(turn: PendingTurn, err: unknown): void {
@@ -1606,7 +1666,7 @@ export class PiAcpSession {
   }
 
   private handlePiEvent(ev: PiRpcEvent) {
-    const type = String((ev as any).type ?? '')
+    const type = ev.type
     const turn = this.pendingTurn
 
     // A streaming prompt queues its expanded text before pi writes the prompt
@@ -1702,7 +1762,7 @@ export class PiAcpSession {
       }
 
       case 'message_update': {
-        const ame = (ev as any).assistantMessageEvent
+        const ame = ev.assistantMessageEvent as PiAssistantMessageEvent | undefined
 
         // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
@@ -1724,24 +1784,42 @@ export class PiAcpSession {
         // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
         // while the model is still streaming tool call args.
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
-          const toolCall =
-            // pi sometimes includes the tool call directly on the event
-            (ame as any)?.toolCall ??
-            // ...and always includes it in the partial assistant message at contentIndex
-            (ame as any)?.partial?.content?.[(ame as any)?.contentIndex ?? 0]
+          const contentIndex = typeof ame.contentIndex === 'number' ? ame.contentIndex : 0
+          const whole = ame.toolCall as
+            | { id?: unknown; name?: unknown; arguments?: unknown; partialArgs?: unknown }
+            | undefined
+          if (ame.type === 'toolcall_start') {
+            const id = typeof ame.id === 'string' ? ame.id : typeof whole?.id === 'string' ? whole.id : ''
+            const name =
+              typeof ame.toolName === 'string' ? ame.toolName : typeof whole?.name === 'string' ? whole.name : 'tool'
+            if (id) this.streamedToolCalls.set(contentIndex, { id, name, argumentsText: '' })
+          }
+          const buffered = this.streamedToolCalls.get(contentIndex)
+          if (ame.type === 'toolcall_delta' && buffered) {
+            const delta =
+              typeof ame.argumentsDelta === 'string'
+                ? ame.argumentsDelta
+                : typeof ame.delta === 'string'
+                  ? ame.delta
+                  : typeof whole?.partialArgs === 'string'
+                    ? whole.partialArgs
+                    : ''
+            buffered.argumentsText += delta
+          }
 
-          const toolCallId = String((toolCall as any)?.id ?? '')
-          const toolName = String((toolCall as any)?.name ?? 'tool')
+          const toolCallId = String(whole?.id ?? ame.id ?? buffered?.id ?? '')
+          const toolName = String(whole?.name ?? ame.toolName ?? buffered?.name ?? 'tool')
 
           if (toolCallId) {
             if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
             if (ame.type === 'toolcall_delta' && this.subagentToolCallIds.has(toolCallId)) break
 
             const rawInput =
-              (toolCall as any)?.arguments && typeof (toolCall as any).arguments === 'object'
-                ? (toolCall as any).arguments
+              whole?.arguments && typeof whole.arguments === 'object'
+                ? whole.arguments
                 : (() => {
-                    const s = String((toolCall as any)?.partialArgs ?? '')
+                    const s =
+                      typeof whole?.partialArgs === 'string' ? whole.partialArgs : (buffered?.argumentsText ?? '')
                     if (!s) return undefined
                     try {
                       return JSON.parse(s)
@@ -1749,6 +1827,7 @@ export class PiAcpSession {
                       return { partialArgs: s }
                     }
                   })()
+            if (ame.type === 'toolcall_end') this.streamedToolCalls.delete(contentIndex)
 
             const locations =
               ame.type === 'toolcall_delta' ? undefined : toToolCallLocations(toolName, rawInput, this.cwd)
@@ -1829,7 +1908,7 @@ export class PiAcpSession {
       }
 
       case 'message_end': {
-        const message = (ev as any).message
+        const message = ev.message as { role?: unknown; display?: unknown; content?: unknown } | undefined
         if (message?.role !== 'custom' || message.display !== true) break
 
         const blocks = translateCustomMessageContent(message.content)
@@ -1851,9 +1930,9 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_start': {
-        const toolCallId = String((ev as any).toolCallId ?? crypto.randomUUID())
-        const toolName = String((ev as any).toolName ?? 'tool')
-        const args = (ev as any).args
+        const toolCallId = String(ev.toolCallId ?? crypto.randomUUID())
+        const toolName = String(ev.toolName ?? 'tool')
+        const args = ev.args
         let line: number | undefined
 
         if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
@@ -1928,11 +2007,11 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_update': {
-        const toolCallId = String((ev as any).toolCallId ?? '')
+        const toolCallId = String(ev.toolCallId ?? '')
         if (!toolCallId) break
-        if (!this.ensureToolCallStarted(toolCallId, String((ev as any).toolName ?? 'tool'), (ev as any).args)) break
+        if (!this.ensureToolCallStarted(toolCallId, String(ev.toolName ?? 'tool'), ev.args)) break
 
-        const partial = (ev as any).partialResult
+        const partial = ev.partialResult
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({ toolCallId, status: 'in_progress', result: partial })
           break
@@ -1952,14 +2031,14 @@ export class PiAcpSession {
       }
 
       case 'tool_execution_end': {
-        const toolCallId = String((ev as any).toolCallId ?? '')
+        const toolCallId = String(ev.toolCallId ?? '')
         if (!toolCallId) break
 
         const toolName = String(ev.toolName ?? 'tool')
-        if (!this.ensureToolCallStarted(toolCallId, toolName, (ev as any).args)) break
+        if (!this.ensureToolCallStarted(toolCallId, toolName, ev.args)) break
 
-        const result = (ev as any).result
-        const isError = Boolean((ev as any).isError)
+        const result = ev.result
+        const isError = Boolean(ev.isError)
         if (this.bashToolCallIds.has(toolCallId)) {
           this.emitBashOutputUpdate({
             toolCallId,
@@ -2021,14 +2100,7 @@ export class PiAcpSession {
       }
 
       case 'extension_ui_request': {
-        void this.handleExtensionUiRequest(ev).catch(() => {
-          const id = stringProp(ev, 'id')
-          if (!id) {
-            return
-          }
-
-          void this.proc.sendExtensionUiResponse({ id, cancelled: true }).catch(() => {})
-        })
+        void this.handleExtensionUiRequest(ev).catch(() => {})
         break
       }
 
@@ -2237,6 +2309,30 @@ export class PiAcpSession {
     }
   }
 
+  private beginUiRequest(id: string): PendingUiRequest | null {
+    const duplicate = this.pendingUiRequests.get(id)
+    if (duplicate) {
+      this.settleUiRequest(duplicate, { id, cancelled: true })
+      return null
+    }
+    const pending = { id, controller: new AbortController() }
+    this.pendingUiRequests.set(id, pending)
+    return pending
+  }
+
+  private settleUiRequest(pending: PendingUiRequest, response: PiUiResponse): void {
+    if (this.pendingUiRequests.get(pending.id) !== pending) return
+    this.pendingUiRequests.delete(pending.id)
+    pending.controller.abort()
+    void this.proc.sendExtensionUiResponse(response).catch(() => {})
+  }
+
+  private drainPendingUiRequests(): void {
+    for (const pending of [...this.pendingUiRequests.values()]) {
+      this.settleUiRequest(pending, { id: pending.id, cancelled: true })
+    }
+  }
+
   private async handleExtensionUiRequest(ev: PiRpcEvent): Promise<void> {
     const id = stringProp(ev, 'id')
     const method = stringProp(ev, 'method')
@@ -2266,14 +2362,7 @@ export class PiAcpSession {
     }
 
     if (method === 'input' || method === 'editor') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: {
-          type: 'text',
-          text: `Pi ${method} UI request is not supported in ACP yet; cancelling it.`
-        } satisfies ContentBlock
-      })
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      await this.handleExtensionElicitation(ev, id)
       return
     }
 
@@ -2296,51 +2385,83 @@ export class PiAcpSession {
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
-
-    const permissionOptions: PermissionOption[] = options.map((name, index) => ({
-      optionId: `${CHOICE_OPTION_PREFIX}${index}`,
-      name,
-      kind: 'allow_once'
-    }))
-
-    const selected = await this.requestExtensionPermission(id, ev, permissionOptions)
-    if (selected === null) {
-      return
-    }
-
-    const selectedOptionId = selected.outcome.outcome === 'selected' ? selected.outcome.optionId : null
-    const index = selectedOptionId === null ? null : optionIndex(selectedOptionId)
+    const requested = await this.requestExtensionPermission(
+      id,
+      ev,
+      options.map((name, index) => ({ optionId: `${CHOICE_OPTION_PREFIX}${index}`, name, kind: 'allow_once' }))
+    )
+    if (!requested) return
+    const selectedId = requested.response.outcome.outcome === 'selected' ? requested.response.outcome.optionId : null
+    const index = selectedId === null ? null : optionIndex(selectedId)
     const value = index === null ? null : (options.at(index) ?? null)
-    await this.proc.sendExtensionUiResponse(value === null ? { id, cancelled: true } : { id, value })
+    this.settleUiRequest(requested.pending, value === null ? { id, cancelled: true } : { id, value })
   }
 
   private async handleExtensionConfirm(ev: PiRpcEvent, id: string): Promise<void> {
-    const selected = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
-    if (selected === null) {
-      return
-    }
+    const requested = await this.requestExtensionPermission(id, ev, CONFIRM_PERMISSION_OPTIONS)
+    if (!requested) return
+    const response =
+      requested.response.outcome.outcome === 'selected'
+        ? { id, confirmed: requested.response.outcome.optionId === 'yes' }
+        : { id, cancelled: true as const }
+    this.settleUiRequest(requested.pending, response)
+  }
 
-    if (selected.outcome.outcome === 'cancelled') {
+  private async handleExtensionElicitation(ev: PiRpcEvent, id: string): Promise<void> {
+    if (!this.supportsElicitationForm) {
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
-
-    await this.proc.sendExtensionUiResponse({ id, confirmed: selected.outcome.optionId === 'yes' })
+    const pending = this.beginUiRequest(id)
+    if (!pending) return
+    try {
+      const response = await this.conn.createElicitation(
+        {
+          sessionId: this.sessionId,
+          toolCallId: `pi-ui-${id}`,
+          mode: 'form',
+          message: stringProp(ev, 'message') ?? stringProp(ev, 'title') ?? 'Input requested by pi',
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              value: {
+                type: 'string',
+                title: stringProp(ev, 'title') ?? 'Value',
+                description: stringProp(ev, 'placeholder'),
+                default: stringProp(ev, 'prefill')
+              }
+            },
+            required: ['value']
+          }
+        },
+        { cancellationSignal: pending.controller.signal }
+      )
+      if (this.pendingUiRequests.get(id) !== pending) return
+      const value =
+        response.action === 'accept'
+          ? (response.content as Record<string, unknown> | null | undefined)?.value
+          : undefined
+      this.settleUiRequest(pending, typeof value === 'string' ? { id, value } : { id, cancelled: true })
+    } catch {
+      this.settleUiRequest(pending, { id, cancelled: true })
+    }
   }
 
   private async requestExtensionPermission(
     id: string,
     ev: PiRpcEvent,
     options: PermissionOption[]
-  ): Promise<PermissionResponse | null> {
+  ): Promise<{ pending: PendingUiRequest; response: PermissionResponse } | null> {
+    const pending = this.beginUiRequest(id)
+    if (!pending) return null
     try {
-      return await this.conn.requestPermission({
-        sessionId: this.sessionId,
-        toolCall: extensionUiToolCall(id, ev),
-        options
-      })
+      const response = await this.conn.requestPermission(
+        { sessionId: this.sessionId, toolCall: extensionUiToolCall(id, ev), options },
+        { cancellationSignal: pending.controller.signal }
+      )
+      return this.pendingUiRequests.get(id) === pending ? { pending, response } : null
     } catch {
-      await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+      this.settleUiRequest(pending, { id, cancelled: true })
       return null
     }
   }
@@ -2403,9 +2524,9 @@ function optionIndex(optionId: string): number | null {
 }
 
 function formatAutoRetryMessage(ev: PiRpcEvent): string {
-  const attempt = Number((ev as any).attempt)
-  const maxAttempts = Number((ev as any).maxAttempts)
-  const delayMs = Number((ev as any).delayMs)
+  const attempt = Number(ev.attempt)
+  const maxAttempts = Number(ev.maxAttempts)
+  const delayMs = Number(ev.delayMs)
 
   if (!Number.isFinite(attempt) || !Number.isFinite(maxAttempts) || !Number.isFinite(delayMs)) {
     return 'Retrying...'

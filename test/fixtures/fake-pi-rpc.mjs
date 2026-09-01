@@ -45,8 +45,8 @@ function handle(cmd) {
 
 switch (behavior) {
   case 'events-then-exit':
-    send({ type: 'marker', text: 'line separator: \u2028 and paragraph separator: \u2029 survive' })
-    send({ type: 'marker', text: 'second' })
+    send({ type: 'session_info_changed', text: 'line separator: \u2028 and paragraph separator: \u2029 survive' })
+    send({ type: 'session_info_changed', text: 'second' })
     process.exit(3)
     break
   case 'split-writes': {
@@ -65,7 +65,7 @@ switch (behavior) {
     break
   case 'ignore-sigterm':
     process.on('SIGTERM', () => {})
-    send({ type: 'ready' })
+    send({ type: 'session_info_changed', ready: true })
     setInterval(() => {}, 1_000)
     break
   default:

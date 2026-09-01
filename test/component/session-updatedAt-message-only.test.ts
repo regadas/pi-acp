@@ -4,7 +4,8 @@ import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { listPiSessions } from '../../src/acp/pi-sessions.js'
+import { SessionRepository } from '../../src/acp/session-repository.js'
+import { SessionStore } from '../../src/acp/session-store.js'
 
 test('listPiSessions: updatedAt prefers last message timestamp over later non-message entries', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-test-'))
@@ -47,7 +48,8 @@ test('listPiSessions: updatedAt prefers last message timestamp over later non-me
   process.env.PI_CODING_AGENT_DIR = root
 
   try {
-    const sessions = listPiSessions().filter(s => s.sessionId === 'sess-1')
+    const repository = new SessionRepository(new SessionStore(join(root, 'map.json')), {}, root)
+    const sessions = (await repository.list()).filter(session => session.sessionId === 'sess-1')
     assert.equal(sessions.length, 1)
     assert.equal(sessions[0]?.updatedAt, '2026-01-01T00:00:02.000Z')
   } finally {

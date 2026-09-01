@@ -1198,7 +1198,7 @@ test('PiAcpSession: sends cancelled response when ACP confirm is cancelled', asy
   assert.deepEqual(proc.extensionUiResponses, [{ id: 'ui-5', cancelled: true }])
 })
 
-test('PiAcpSession: cancels unsupported input and editor extension UI requests with visible fallback', async () => {
+test('PiAcpSession: cancels input and editor silently when elicitation was not negotiated', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -1220,9 +1220,7 @@ test('PiAcpSession: cancels unsupported input and editor extension UI requests w
     { id: 'ui-3', cancelled: true },
     { id: 'ui-4', cancelled: true }
   ])
-  assert.equal(conn.updates.length, 2)
-  assert.match((conn.updates[0]!.update as any).content.text, /input UI request is not supported/)
-  assert.match((conn.updates[1]!.update as any).content.text, /editor UI request is not supported/)
+  assert.equal(conn.updates.length, 0)
 })
 
 test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/maxAttempts and rounded delay', async () => {
@@ -1792,7 +1790,7 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   assert.equal(r2, 'cancelled')
 })
 
-test('PiAcpSession: expands /command before sending to pi', async () => {
+test('PiAcpSession: forwards non-adapter slash commands to pi unchanged', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
 
@@ -1814,7 +1812,7 @@ test('PiAcpSession: expands /command before sending to pi', async () => {
 
   const p = session.prompt('/hello world')
   assert.equal(proc.prompts.length, 1)
-  assert.equal(proc.prompts[0]!.message, 'Say hello to world')
+  assert.equal(proc.prompts[0]!.message, '/hello world')
 
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'turn_end' })

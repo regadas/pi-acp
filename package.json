@@ -41,12 +41,14 @@
     "build": "tsup",
     "start": "node dist/index.js",
     "format": "prettier . --write",
+    "format:check": "prettier . --check",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "node --import tsx --test test/**/*.test.ts",
     "smoke": "node scripts/smoke-acp.mjs",
-    "prepack": "npm run build",
-    "prepublishOnly": "npm run test && npm run build"
+    "validate": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run build",
+    "prepack": "npm run validate",
+    "prepublishOnly": "npm run validate"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.2.1"

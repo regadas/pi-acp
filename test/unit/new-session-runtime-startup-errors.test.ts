@@ -9,8 +9,12 @@ import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
 class FakeSessions {
   closeCalls: string[] = []
+  retirementWaits: Array<{ keys: string[]; timeoutMs: number }> = []
 
-  constructor(private readonly session: any) {}
+  constructor(
+    private readonly session: any,
+    private readonly retirementGate: Promise<void> = Promise.resolve()
+  ) {}
 
   async create() {
     return this.session
@@ -18,6 +22,11 @@ class FakeSessions {
 
   close(sessionId: string) {
     this.closeCalls.push(sessionId)
+  }
+
+  async waitForRetiredProcesses(keys: string[], timeoutMs: number) {
+    this.retirementWaits.push({ keys, timeoutMs })
+    await this.retirementGate
   }
 }
 
@@ -66,8 +75,86 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
   )
 
   assert.deepEqual(sessions.closeCalls, ['s-auth'])
+  assert.deepEqual(
+    sessions.retirementWaits.map(wait => wait.keys),
+    [['s-auth', sessionFile]]
+  )
   assert.equal(existsSync(sessionFile), false)
   assert.equal(store.get('s-auth'), null)
+})
+
+test('PiAcpAgent: newSession waits for writer exit before deleting a failed session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-runtime-writer-barrier-'))
+  const sessionFile = join(root, 'failed.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 's-barrier', cwd: process.cwd() })}\n`)
+  let releaseRetirement!: () => void
+  const retirementGate = new Promise<void>(resolve => {
+    releaseRetirement = resolve
+  })
+  const session = {
+    sessionId: 's-barrier',
+    cwd: process.cwd(),
+    proc: {
+      getAvailableModels: async () => ({ models: [] }),
+      getState: async () => ({ sessionFile })
+    }
+  }
+  const sessions = new FakeSessions(session, retirementGate)
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 's-barrier', cwd: process.cwd(), sessionFile })
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  ;(agent as any).sessions = sessions
+  ;(agent as any).store = store
+
+  const creating = agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(existsSync(sessionFile), true, 'the file remains while its writer is retiring')
+  assert.equal(sessions.retirementWaits.length, 1)
+
+  releaseRetirement()
+  await assert.rejects(creating, (error: any) => error?.code === -32000)
+  assert.equal(existsSync(sessionFile), false)
+})
+
+test('PiAcpAgent: post-create configuration failure rolls back the session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-runtime-config-rollback-'))
+  const sessionFile = join(root, 'failed.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 's-config', cwd: process.cwd() })}\n`)
+  let seeded = false
+  const session = {
+    sessionId: 's-config',
+    cwd: process.cwd(),
+    seedSessionConfiguration() {
+      seeded = true
+    },
+    proc: {
+      getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'model', name: 'Model' }] }),
+      getAvailableThinkingLevels: async () => {
+        throw new Error('thinking discovery failed')
+      },
+      getState: async () => ({
+        sessionId: 's-config',
+        sessionFile,
+        thinkingLevel: 'off',
+        model: { provider: 'test', id: 'model' }
+      })
+    }
+  }
+  const sessions = new FakeSessions(session)
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 's-config', cwd: process.cwd(), sessionFile })
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  ;(agent as any).sessions = sessions
+  ;(agent as any).store = store
+
+  await assert.rejects(
+    () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),
+    /thinking discovery failed/
+  )
+  assert.equal(seeded, false)
+  assert.deepEqual(sessions.closeCalls, ['s-config'])
+  assert.equal(existsSync(sessionFile), false)
+  assert.equal(store.get('s-config'), null)
 })
 
 test('PiAcpAgent: newSession returns Internal error on non-auth model probe failures after spawn', async () => {
@@ -137,7 +224,7 @@ test('PiAcpAgent: failed-session cleanup unlinks only the trusted store path, ne
   )
 
   assert.deepEqual(sessions.closeCalls, ['s-cleanup'])
-  assert.equal(existsSync(trustedSessionFile), false, 'the store-mapped session file is cleaned up')
+  assert.equal(existsSync(trustedSessionFile), true, 'an unvalidated store path is never unlinked')
   assert.equal(existsSync(untrustedSessionFile), true, 'a pi-reported path is never unlinked')
   assert.equal(store.get('s-cleanup'), null)
 })

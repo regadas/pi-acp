@@ -28,18 +28,17 @@ Development is centered around [Zed](https://zed.dev) editor support, and other 
   - `session/list` discovers all known pi sessions or filters them by cwd
   - `session/load` restores a session and replays the complete active-branch history (via pi's `get_entries`) before responding: user text and images, assistant text, thinking, and tool calls, tool results, visible custom messages, and `!command` shell executions, including pre-compaction history
   - `session/resume` restores a session without replaying history
-  - Model and thinking-level selection go through standard ACP session config options (`session/set_config_option`); advertised thinking levels mirror exactly what the selected pi model supports (including pi's `max` level). Legacy ACP session modes are not used: no session response advertises `modes`, and `session/set_mode` is not implemented
+  - Model and thinking-level selection go through standard ACP session config options (`session/set_config_option`); available thinking levels come from pi's RPC API, with a model-metadata fallback only for pi 0.80.x. Legacy ACP session modes are not used
   - `session/close` cancels live work and releases the session subprocess while preserving history
   - `session/delete` idempotently closes and removes a persisted pi session
 - Session persistence
   - pi stores its own sessions under its agent directory (normally `~/.pi/agent/sessions/...`)
   - `pi-acp` stores atomic per-session records under `~/.pi/pi-acp/session-map.json.d/` so concurrent adapter processes do not lose each other's mappings. An existing legacy `session-map.json` remains a read-only migration fallback; deletion tombstones prevent legacy entries from reappearing
-- Slash commands
-  - Loads file-based slash commands compatible with pi’s conventions
-  - Adds a small set of built-in commands for headless/editor usage
-  - Supports skill commands (if enabled in pi settings, they appear as `/skill:skill-name` in the ACP client)
-- Skills are loaded by pi directly and are available in ACP sessions
-- (Zed) `pi-acp` emits “startup info” block into the session (pi version, context, skills, prompts, extensions - similar to `pi` in the terminal). You can disable it by setting `quietStartup: true` in pi settings (`~/.pi/agent/settings.json` or `<project>/.pi/settings.json`). When `quietStartup` is enabled, `pi-acp` will still emit a 'New version available' message if the installed pi version is outdated.
+- Slash commands are advertised from pi's authoritative `get_commands` result, plus a small set of adapter built-ins
+- Pi owns project trust, prompt/template expansion, skills, extensions, and resource loading; the adapter does not scan project resources before pi applies trust policy
+- Text embedded resources and valid image resources are preserved. Malformed images, audio, and unsupported binary MIME types are rejected before any prompt is sent
+- Pi extension select/confirm UI maps to ACP permissions. Input/editor UI maps to unstable form elicitation only when the client negotiates it; otherwise pi receives cancellation
+- Prompt responses publish cumulative token usage and context-window/cost updates when pi reports finite values
 - (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
 
 ## Prerequisites
@@ -51,7 +50,7 @@ npm install -g @earendil-works/pi-coding-agent
 ```
 
 - Node.js >= 22.19.0
-- `pi` installed and available on your `PATH` (the adapter runs the `pi` executable)
+- pi >= 0.80.4 installed and available on your `PATH` (the adapter runs the `pi` executable)
 - Configure `pi` separately for your model providers/API keys
 
 ## Install
@@ -105,46 +104,23 @@ Alternatively, point Zed directly to the built entry point without linking it:
 
 ### Environment variables
 
-- `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` advertises ACP `promptCapabilities.embeddedContext` support to the client.
 - `PI_ACP_DIR=/path/to/state` overrides the adapter-owned state directory (default: `~/.pi/pi-acp`).
 - `PI_CODING_AGENT_DIR=/path/to/agent` overrides pi's global agent directory for settings, sessions, prompts, extensions, and skills (default: `~/.pi/agent`).
-- Default for `PI_ACP_ENABLE_EMBEDDED_CONTEXT`: unset/any other value means `false`.
-- When disabled, compliant ACP clients should avoid sending embedded `resource` blocks. If they send them anyway, `pi-acp` still degrades gracefully by converting them into plain-text prompt context.
-
-You can add the environment variable in the Zed settings with:
-
-```json
-  "agent_servers": {
-    "pi": {
-      "type": "custom",
-      "command": "node",
-      "args": ["/path/to/pi-acp/dist/index.js"],
-      "env": {
-          "PI_ACP_ENABLE_EMBEDDED_CONTEXT": "true",
-      }
-    }
-  }
-```
+- `PI_CODING_AGENT_SESSION_DIR` selects pi's custom session directory. Otherwise merged global/project `sessionDir` settings apply, then pi's cwd-encoded default. `~` expands and relative custom paths resolve from the session cwd.
 
 ### Slash commands
 
 `pi-acp` supports slash commands:
 
-#### 1) File-based commands (aka prompts)
+Pi discovers and expands file prompts, skills, and extension commands after applying its own project trust policy. `pi-acp` advertises the resulting command list without reading prompt files itself.
 
-Loaded from:
-
-- User commands: `<PI_CODING_AGENT_DIR>/prompts/**/*.md` (normally `~/.pi/agent/prompts/**/*.md`)
-- Project commands: `<cwd>/.pi/prompts/**/*.md`
-
-#### 2) Built-in commands
+#### Built-in commands
 
 - `/compact [instructions...]` – run pi compaction (optionally with custom instructions)
 - `/autocompact on|off|toggle` – toggle automatic compaction
 - `/export` – export the current session to HTML in the session `cwd`
 - `/session` – show session stats (tokens/messages/cost/session file)
 - `/name <name>` – set session display name
-- `/changelog` – print the installed pi changelog (best-effort)
 - `/steering` - maps to `pi` Steering Mode, get/set
 - `/follow-up` - maps to `pi` Follow-up Mode, get/set
 
@@ -154,11 +130,7 @@ Other built-in commands:
 - `/thinking` - maps to the thinking (`thought_level`) config option selector in Zed
 - `/clear` - not implemented (use ACP client 'new' command)
 
-#### 3) Skill commands
-
-- Skill commands can be enabled in pi settings and will appear in the slash command list in ACP client as `/skill:skill-name`.
-
-**Note**: Slash commands provided by pi extensions are not currently supported.
+Pi-provided skill and extension commands appear when pi includes them in `get_commands`.
 
 ## Authentication (ACP client support)
 
@@ -193,6 +165,8 @@ Project layout:
 - No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally. Bash tool calls are rendered through Zed's `_meta.terminal_output` convention only when the client negotiates it; otherwise output is plain tool content.
 - Terminal login is advertised only to clients that declare the (unstable) `clientCapabilities.auth.terminal` capability; Zed's `_meta["terminal-auth"]` launch banner additionally requires its matching client `_meta` flag.
 - ACP v1 requires agents to connect client-provided stdio MCP servers, but pi has no MCP support (it would require a pi extension to bridge them). `pi-acp` therefore rejects `session/new`, `session/load`, and `session/resume` requests that carry a non-empty `mcpServers` list with an explicit `invalid params` error instead of silently ignoring the requested servers; empty lists are accepted. This remains an explicit protocol conformance gap. Installing the [pi MCP adapter](https://github.com/nicobailon/pi-mcp-adapter) makes separately configured MCP servers available to pi, but does not wire the ACP request's `mcpServers` automatically.
+- ACP fork, steering/follow-up methods, MCP, additional directories, subagent lineage, goals/AIR, interactive terminal stdin, and sandbox/approval modes are not advertised because current pi RPC cannot safely provide those semantics. Adapter `/steering` and `/follow-up` commands only configure pi queue delivery modes.
+- On Windows, native executables launch directly. `.cmd`/`.bat` launchers necessarily pass through `cmd.exe`; pi-acp builds an escaped argument boundary and never enables Node's `shell` mode.
 - Additional workspace directories are not supported: the `sessionCapabilities.additionalDirectories` capability is not advertised, and `session/new`, `session/load`, and `session/resume` requests carrying a non-empty `additionalDirectories` list are rejected with `invalid params` instead of silently dropping the extra roots. The session's `cwd` remains the only workspace root.
 - Pi session files do not coordinate concurrent writers: each pi process keeps its own in-memory view while appending to the shared history. `pi-acp` inherits this constraint, so simultaneously operating on the same persisted session from multiple `pi-acp` or pi processes is unsupported. Atomic adapter mapping records prevent cross-process map updates from being lost, but they are not a session-ownership lease; keep one active writer per persisted session to prevent divergent or damaged history.
 - Assistant text streams as `agent_message_chunk`; extended thinking streams separately as `agent_thought_chunk`.

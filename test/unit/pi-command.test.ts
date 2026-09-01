@@ -1,44 +1,32 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { defaultPiCommand, shouldUseShellForPiCommand } from '../../src/pi-rpc/command.js'
+import { buildPiInvocation, resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
 
-test('defaultPiCommand: uses pi.cmd on Windows and pi elsewhere', () => {
-  const originalPlatform = process.platform
-
-  try {
-    Object.defineProperty(process, 'platform', { value: 'win32' })
-    assert.equal(defaultPiCommand(), 'pi.cmd')
-
-    Object.defineProperty(process, 'platform', { value: 'darwin' })
-    assert.equal(defaultPiCommand(), 'pi')
-  } finally {
-    Object.defineProperty(process, 'platform', { value: originalPlatform })
-  }
+test('buildPiInvocation launches native executables directly', () => {
+  assert.deepEqual(buildPiInvocation('/opt/pi', ['--session', '/tmp/a b.jsonl'], { platform: 'linux' }), {
+    executable: '/opt/pi',
+    args: ['--session', '/tmp/a b.jsonl']
+  })
 })
 
-test('shouldUseShellForPiCommand: enables shell for Windows cmd launchers only', () => {
-  const originalPlatform = process.platform
-  Object.defineProperty(process, 'platform', { value: 'win32' })
-
-  try {
-    assert.equal(shouldUseShellForPiCommand('pi.cmd'), true)
-    assert.equal(shouldUseShellForPiCommand('C:\\Users\\me\\AppData\\Roaming\\npm\\pi.CMD'), true)
-    assert.equal(shouldUseShellForPiCommand('pi.bat'), true)
-    assert.equal(shouldUseShellForPiCommand('pi'), false)
-    assert.equal(shouldUseShellForPiCommand('C:\\tools\\pi.exe'), false)
-  } finally {
-    Object.defineProperty(process, 'platform', { value: originalPlatform })
-  }
+test('buildPiInvocation resolves Windows batch launchers and escapes command syntax', () => {
+  const invocation = buildPiInvocation('pi.cmd', ['--session', 'C:\\x y\\a"&|<>^()%!.jsonl'], {
+    platform: 'win32',
+    cwd: 'C:\\work',
+    env: { PATH: 'C:\\bin', ComSpec: 'C:\\Windows\\System32\\cmd.exe' },
+    fileExists: path => path === 'C:\\bin\\pi.cmd'
+  })
+  assert.equal(invocation?.executable, 'C:\\Windows\\System32\\cmd.exe')
+  assert.equal(invocation?.windowsVerbatimArguments, true)
+  assert.deepEqual(invocation?.args.slice(0, 3), ['/d', '/s', '/c'])
+  const commandLine = invocation?.args[3] ?? ''
+  for (const escaped of ['^&', '^|', '^<', '^>', '^^', '^(', '^)', '%%', '^!']) assert.ok(commandLine.includes(escaped))
+  assert.doesNotMatch(invocation?.args[3] ?? '', /shell:true/)
 })
 
-test('shouldUseShellForPiCommand: keeps shell disabled on non-Windows', () => {
-  const originalPlatform = process.platform
-  Object.defineProperty(process, 'platform', { value: 'darwin' })
-
-  try {
-    assert.equal(shouldUseShellForPiCommand('pi.cmd'), false)
-    assert.equal(shouldUseShellForPiCommand('pi'), false)
-  } finally {
-    Object.defineProperty(process, 'platform', { value: originalPlatform })
-  }
+test('resolveWindowsScriptCommand does not accept a missing launcher', () => {
+  assert.equal(
+    resolveWindowsScriptCommand('pi.cmd', 'C:\\work', 'C:\\bin', () => false),
+    null
+  )
 })

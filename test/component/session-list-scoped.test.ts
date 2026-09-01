@@ -61,13 +61,17 @@ async function withSeededAgent(fn: (agent: PiAcpAgent) => Promise<void>): Promis
   seedSessions(root)
 
   const oldEnv = process.env.PI_CODING_AGENT_DIR
+  const oldAcpDir = process.env.PI_ACP_DIR
   process.env.PI_CODING_AGENT_DIR = root
+  process.env.PI_ACP_DIR = join(root, 'acp')
 
   try {
     await fn(new PiAcpAgent(asAgentConn(new FakeAgentSideConnection())))
   } finally {
     if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = oldEnv
+    if (oldAcpDir === undefined) delete process.env.PI_ACP_DIR
+    else process.env.PI_ACP_DIR = oldAcpDir
   }
 }
 

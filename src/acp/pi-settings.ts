@@ -27,7 +27,7 @@ function readJsonFile(path: string): Record<string, unknown> {
   }
 }
 
-function getMergedSettings(cwd: string): Record<string, unknown> {
+export function getMergedPiSettings(cwd: string): Record<string, unknown> {
   const globalSettingsPath = join(getAgentDir(), 'settings.json')
   const projectSettingsPath = resolve(cwd, '.pi', 'settings.json')
 
@@ -38,38 +38,4 @@ function getMergedSettings(cwd: string): Record<string, unknown> {
 
 export function getAgentDir(): string {
   return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
-}
-
-/**
- * Mirror pi settings semantics (global + project merge, project overrides global).
- * Only returns the bits we currently need.
- */
-export function getEnableSkillCommands(cwd: string): boolean {
-  const merged = getMergedSettings(cwd)
-
-  const direct = merged.enableSkillCommands
-  if (typeof direct === 'boolean') return direct
-
-  // Back-compat: some versions used skills.enableSkillCommands
-  const nested = isObject(merged.skills) ? merged.skills.enableSkillCommands : undefined
-  if (typeof nested === 'boolean') return nested
-
-  return true
-}
-
-/**
- * Mirror pi's quietStartup setting: if true, pi suppresses the verbose startup prelude.
- * We use it to decide whether to synthesize + emit our own "startup info" message.
- */
-export function getQuietStartup(cwd: string): boolean {
-  const merged = getMergedSettings(cwd)
-
-  const direct = merged.quietStartup
-  if (typeof direct === 'boolean') return direct
-
-  // Back-compat: some versions used quietStart
-  const legacy = (merged as any).quietStart
-  if (typeof legacy === 'boolean') return legacy
-
-  return false
 }

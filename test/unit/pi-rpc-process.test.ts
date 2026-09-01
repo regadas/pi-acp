@@ -115,7 +115,7 @@ test('PiRpcProcess: U+2028/U+2029 inside event payloads survive stdout framing',
   const events: PiRpcEvent[] = []
   proc.onEvent(ev => events.push(ev))
 
-  const record = JSON.stringify({ type: 'marker', text: 'a\u2028b\u2029c' })
+  const record = JSON.stringify({ type: 'session_info_changed', text: 'a\u2028b\u2029c' })
   mock.stdout.write(Buffer.from(record + '\n', 'utf8'))
   await tick()
 
@@ -129,7 +129,7 @@ test('PiRpcProcess: records split across stdout chunks (including mid code point
   const events: PiRpcEvent[] = []
   proc.onEvent(ev => events.push(ev))
 
-  const record = Buffer.from(JSON.stringify({ type: 'marker', text: 'héllo 🌍 world' }) + '\n', 'utf8')
+  const record = Buffer.from(JSON.stringify({ type: 'session_info_changed', text: 'héllo 🌍 world' }) + '\n', 'utf8')
   const mid = record.indexOf(Buffer.from('🌍', 'utf8')) + 2
   mock.stdout.write(record.subarray(0, mid))
   await tick()
@@ -148,10 +148,10 @@ test('PiRpcProcess: malformed stdout records do not block later valid records', 
   proc.onEvent(ev => events.push(ev))
 
   mock.stdout.write('starting fake pi...\n{not json\n')
-  mock.stdout.write(JSON.stringify({ type: 'marker', ok: true }) + '\n')
+  mock.stdout.write(JSON.stringify({ type: 'session_info_changed', ok: true }) + '\n')
   await tick()
 
-  assert.deepEqual(events, [{ type: 'marker', ok: true }])
+  assert.deepEqual(events, [{ type: 'session_info_changed', ok: true }])
 })
 
 test('PiRpcProcess: an unterminated framing flood is caught and quarantines the child', async () => {
@@ -174,12 +174,12 @@ test('PiRpcProcess: a throwing event handler does not break sibling handlers or 
   })
   proc.onEvent(ev => seen.push(ev))
 
-  mock.stdout.write('{"type":"one"}\n{"type":"two"}\n')
+  mock.stdout.write('{"type":"agent_start"}\n{"type":"agent_end"}\n')
   await tick()
 
   assert.deepEqual(
     seen.map(ev => ev.type),
-    ['one', 'two']
+    ['agent_start', 'agent_end']
   )
 })
 
@@ -273,13 +273,13 @@ test('PiRpcProcess: prompt wires followUp streaming behavior and resolves on suc
   // stdout chunk observe acceptance before Promise callbacks can run.
   mock.stdout.write(
     [
-      JSON.stringify({ type: 'foreign_start' }),
+      JSON.stringify({ type: 'agent_start' }),
       JSON.stringify({ type: 'response', id: request.id, command: 'prompt', success: true }),
-      JSON.stringify({ type: 'accepted_start' })
+      JSON.stringify({ type: 'turn_end' })
     ].join('\n') + '\n'
   )
   await prompt
-  assert.deepEqual(ordering, ['foreign_start', 'accepted', 'accepted_start'])
+  assert.deepEqual(ordering, ['agent_start', 'accepted', 'turn_end'])
   proc.dispose()
 })
 
@@ -290,20 +290,20 @@ test('PiRpcProcess: close fallback settles once and ignores later pipe data', as
   proc.onEvent(event => events.push(event))
   const terminationPromise = new Promise<PiRpcTermination>(resolve => proc.onTermination(resolve))
 
-  mock.stdout.write('{"type":"before-exit"}\n')
+  mock.stdout.write('{"type":"agent_start"}\n')
   mock.emit('exit', 4, null)
   const termination = await withTimeout(terminationPromise, 250, 'close fallback')
   assert.equal(termination.code, 4)
   assert.deepEqual(
     events.map(event => event.type),
-    ['before-exit']
+    ['agent_start']
   )
 
-  mock.stdout.write('{"type":"after-fallback"}\n')
+  mock.stdout.write('{"type":"agent_end"}\n')
   await tick()
   assert.deepEqual(
     events.map(event => event.type),
-    ['before-exit']
+    ['agent_start']
   )
 })
 
@@ -432,7 +432,7 @@ test('PiRpcProcess: buffered stdout events are dispatched before termination set
   const events: PiRpcEvent[] = []
   const eventsAtTermination: number[] = []
   proc.onEvent(ev => {
-    if (ev.type === 'marker') events.push(ev)
+    if (ev.type === 'session_info_changed') events.push(ev)
   })
   proc.onTermination(() => eventsAtTermination.push(events.length))
   const termination = await withTimeout(terminationPromise, 2_000, 'events fixture termination')
@@ -455,7 +455,7 @@ test(
 
     const readyPromise = new Promise<void>(resolve => {
       proc.onEvent(event => {
-        if (event.type === 'ready') resolve()
+        if (event.type === 'session_info_changed' && event.ready === true) resolve()
       })
     })
     await withTimeout(readyPromise, 2_000, 'SIGTERM fixture readiness')

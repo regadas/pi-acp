@@ -1,20 +1,13 @@
 import { statSync } from 'node:fs'
-import { platform } from 'node:os'
+import { platform as hostPlatform } from 'node:os'
 import { win32 } from 'node:path'
 
-export function defaultPiCommand(): string {
-  return platform() === 'win32' ? 'pi.cmd' : 'pi'
+export function defaultPiCommand(platform = hostPlatform()): string {
+  return platform === 'win32' ? 'pi.cmd' : 'pi'
 }
 
 export function getPiCommand(override?: string): string {
   return override ?? defaultPiCommand()
-}
-
-export function shouldUseShellForPiCommand(cmd: string): boolean {
-  if (platform() !== 'win32') return false
-
-  const normalized = cmd.trim().toLowerCase()
-  return normalized.endsWith('.cmd') || normalized.endsWith('.bat')
 }
 
 type FileExists = (path: string) => boolean
@@ -27,12 +20,6 @@ function isFile(path: string): boolean {
   }
 }
 
-/**
- * Resolve a Windows command script using the command-search order relevant to
- * pi-acp: an explicit path is resolved from cwd, while a bare command searches
- * cwd first and then PATH. The injectable existence check keeps the Windows
- * path semantics deterministically testable on non-Windows hosts.
- */
 export function resolveWindowsScriptCommand(
   command: string,
   cwd: string,
@@ -61,10 +48,40 @@ export function resolveWindowsScriptCommand(
   return null
 }
 
-/** Resolve shell-based Windows launchers only to preflight missing-command errors. */
-export function resolvePiCommandForVersionPreflight(cmd: string, cwd: string): string | null {
-  if (!shouldUseShellForPiCommand(cmd)) return cmd
+export type PiInvocation = { executable: string; args: string[]; windowsVerbatimArguments?: boolean }
 
-  const pathValue = Object.entries(process.env).find(([name]) => name.toLowerCase() === 'path')?.[1] ?? ''
-  return resolveWindowsScriptCommand(cmd, cwd, pathValue)
+function cmdToken(value: string): string {
+  // First quote for the batch launcher's argv parser, then escape cmd syntax.
+  const quoted = `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1')}"`
+  return quoted.replace(/[()%!^"<>&|]/g, char => (char === '%' ? '%%' : `^${char}`))
+}
+
+/** Build an argv-safe invocation without Node's shell/string-concatenation mode. */
+export function buildPiInvocation(
+  command: string,
+  args: readonly string[],
+  opts: {
+    cwd?: string
+    platform?: NodeJS.Platform
+    env?: NodeJS.ProcessEnv
+    fileExists?: FileExists
+  } = {}
+): PiInvocation | null {
+  const platform = opts.platform ?? process.platform
+  if (platform !== 'win32' || !/\.(?:cmd|bat)$/i.test(command.trim())) {
+    return { executable: command, args: [...args] }
+  }
+
+  const cwd = opts.cwd ?? process.cwd()
+  const env = opts.env ?? process.env
+  const pathValue = Object.entries(env).find(([name]) => name.toLowerCase() === 'path')?.[1] ?? ''
+  const script = resolveWindowsScriptCommand(command, cwd, pathValue, opts.fileExists)
+  if (!script) return null
+  const commandProcessor = env.ComSpec || env.COMSPEC || 'cmd.exe'
+  const commandLine = [script, ...args].map(cmdToken).join(' ')
+  return {
+    executable: commandProcessor,
+    args: ['/d', '/s', '/c', `"${commandLine}"`],
+    windowsVerbatimArguments: true
+  }
 }

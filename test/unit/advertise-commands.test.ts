@@ -4,7 +4,7 @@ import type { SessionNotification } from '@agentclientprotocol/sdk'
 import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
-import type { FileSlashCommand } from '../../src/acp/slash-commands.js'
+type FileSlashCommand = { name: string; description: string; content: string; source: string }
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 // `available_commands_update` is advertised after the request response. Only a
@@ -200,7 +200,7 @@ test('advertiseCommands: a stale session chain cannot deliver commands after its
   )
 })
 
-test('advertiseCommands: only a failed discovery selects the file-based fallback', async () => {
+test('advertiseCommands: failed pi discovery falls back only to adapter builtins', async () => {
   const conn = new GatedConnection()
   const proc = new FakePiRpcProcess() as any
   proc.getCommands = async () => {
@@ -212,7 +212,7 @@ test('advertiseCommands: only a failed discovery selects the file-based fallback
 
   const advertisements = commandUpdates(conn)
   assert.equal(advertisements.length, 1, 'the fallback is advertised exactly once')
-  assert.ok(advertisements[0]!.includes('legacy'), 'file-based prompt templates are used when discovery fails')
-  assert.ok(advertisements[0]!.includes('compact'), 'adapter builtins are still merged in')
+  assert.ok(!advertisements[0]!.includes('legacy'), 'adapter never reads or advertises file templates')
+  assert.ok(advertisements[0]!.includes('compact'), 'adapter builtins remain available')
   assert.ok(!advertisements[0]!.includes('pi-only'))
 })

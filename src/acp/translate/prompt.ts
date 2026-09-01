@@ -1,4 +1,4 @@
-import type { ContentBlock } from '@agentclientprotocol/sdk'
+import { RequestError, type ContentBlock } from '@agentclientprotocol/sdk'
 
 export type PiImage = {
   type: 'image'
@@ -6,66 +6,59 @@ export type PiImage = {
   data: string
 }
 
+function validatedImage(mimeType: unknown, data: unknown, label: string): PiImage {
+  if (typeof mimeType !== 'string' || !/^image\/[a-z0-9.+-]+$/i.test(mimeType)) {
+    throw RequestError.invalidParams({}, `${label} must use a valid image/* MIME type`)
+  }
+  if (
+    typeof data !== 'string' ||
+    data.length === 0 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
+  ) {
+    throw RequestError.invalidParams({}, `${label} contains malformed base64 data`)
+  }
+  return { type: 'image', mimeType, data }
+}
+
+/** Validate the complete prompt before returning anything that can be sent to pi. */
 export function promptToPiMessage(blocks: ContentBlock[]): {
   message: string
   images: PiImage[]
 } {
-  let message = ''
+  const text: string[] = []
   const images: PiImage[] = []
 
-  for (const b of blocks) {
-    switch (b.type) {
+  for (const block of blocks) {
+    switch (block.type) {
       case 'text':
-        message += b.text
+        text.push(block.text)
         break
-
       case 'resource_link':
-        // A lightweight, human-readable hint for the LLM.
-        message += `\n[Context] ${b.uri}`
+        text.push(`\n[Context] ${block.uri}`)
         break
-
-      case 'image': {
-        // pi expects base64 image bytes in `data` without a data-url prefix.
-        images.push({
-          type: 'image',
-          mimeType: b.mimeType,
-          data: b.data
-        })
+      case 'image':
+        images.push(validatedImage(block.mimeType, block.data, 'Image block'))
         break
-      }
-
       case 'resource': {
-        // Clients should not send this if embeddedContext=false, but be resilient.
-        const r: any = (b as any).resource
-        const uri = typeof r?.uri === 'string' ? r.uri : '(unknown)'
-
-        if (typeof r?.text === 'string') {
-          // TextResourceContents
-          const mime = typeof r?.mimeType === 'string' ? r.mimeType : 'text/plain'
-          message += `\n[Embedded Context] ${uri} (${mime})\n${r.text}`
-        } else if (typeof r?.blob === 'string') {
-          // BlobResourceContents
-          const mime = typeof r?.mimeType === 'string' ? r.mimeType : 'application/octet-stream'
-          const bytes = Buffer.byteLength(r.blob, 'base64')
-          message += `\n[Embedded Context] ${uri} (${mime}, ${bytes} bytes)`
-        } else {
-          message += `\n[Embedded Context] ${uri}`
+        const resource = block.resource
+        if ('text' in resource) {
+          const mime = resource.mimeType ?? 'text/plain'
+          text.push(`\n[Embedded Context] ${resource.uri} (${mime})\n${resource.text}`)
+          break
         }
+        const mime = resource.mimeType ?? 'application/octet-stream'
+        if (!mime.toLowerCase().startsWith('image/')) {
+          throw RequestError.invalidParams({}, `Unsupported embedded binary MIME type: ${mime}`)
+        }
+        images.push(validatedImage(mime, resource.blob, `Embedded resource ${resource.uri}`))
         break
       }
-
-      case 'audio': {
-        // Not supported by pi. Provide a marker so we don't silently drop context.
-        const bytes = Buffer.byteLength(b.data, 'base64')
-        message += `\n[Audio] (${b.mimeType}, ${bytes} bytes) not supported by pi-acp`
-        break
-      }
-
+      case 'audio':
+        throw RequestError.invalidParams({}, `Audio prompt content is unsupported: ${block.mimeType}`)
       default:
-        // Ignore unknown block types for now.
-        break
+        throw RequestError.invalidParams({}, `Unsupported prompt content block: ${(block as { type?: unknown }).type}`)
     }
   }
 
-  return { message, images }
+  return { message: text.join(''), images }
 }

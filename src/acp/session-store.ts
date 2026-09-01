@@ -1,5 +1,6 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs'
 import { createHash } from 'node:crypto'
+import { readFile, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { getPiAcpSessionMapPath } from './paths.js'
 
@@ -236,6 +237,53 @@ export class SessionStore {
     const record = this.readDirect(sessionId)
     if (record) return record.deleted ? null : record.session
     return this.readLegacy(sessionId)
+  }
+
+  /** Enumerate live records, including legacy entries not hidden by tombstones. */
+  async list(): Promise<StoredSession[]> {
+    const byId = new Map<string, StoredSession>()
+    let legacyRaw: string | null = null
+    try {
+      legacyRaw = await readFile(this.legacyMapPath, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    if (legacyRaw !== null) {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(legacyRaw)
+      } catch (e) {
+        throw new SessionStoreCorruptError(this.legacyMapPath, `invalid JSON: ${String((e as Error)?.message ?? e)}`)
+      }
+      const legacy = parsed as LegacySessionMapFile
+      if (!legacy || legacy.version !== 1 || !legacy.sessions || typeof legacy.sessions !== 'object') {
+        throw new SessionStoreCorruptError(this.legacyMapPath, 'unknown map shape or version')
+      }
+      for (const [id, session] of Object.entries(legacy.sessions)) {
+        if (!isStoredSession(session) || session.sessionId !== id) {
+          throw new SessionStoreCorruptError(this.legacyMapPath, `invalid legacy entry for ${id}`)
+        }
+        byId.set(id, session)
+      }
+    }
+
+    let names: string[] = []
+    try {
+      names = (await readdir(this.stateDir)).filter(name => name.endsWith('.json'))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    for (const name of names) {
+      const path = join(this.stateDir, name)
+      const raw = await readFile(path, 'utf8')
+      const parsed = JSON.parse(raw) as { deleted?: unknown; sessionId?: unknown; session?: unknown }
+      const id = parsed.deleted === true ? parsed.sessionId : (parsed.session as StoredSession | undefined)?.sessionId
+      if (typeof id !== 'string') throw new SessionStoreCorruptError(path, 'record without sessionId')
+      const record = parseRecord(path, raw, id)
+      if (record.deleted) byId.delete(id)
+      else byId.set(id, record.session)
+    }
+    return [...byId.values()]
   }
 
   upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {

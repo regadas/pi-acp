@@ -7,6 +7,7 @@ import { client, RequestError, methods, type ClientConnection } from '@agentclie
 import { createPiAcpAgentApp } from '../../src/acp/app.js'
 import type { PiAcpAgent } from '../../src/acp/agent.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
+import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 let oldAgentDir: string | undefined
@@ -50,7 +51,7 @@ test('app wiring: initialize advertises exactly the implemented capabilities', a
   assert.deepEqual(res.agentCapabilities?.promptCapabilities, {
     image: true,
     audio: false,
-    embeddedContext: false
+    embeddedContext: true
   })
   assert.deepEqual(res.agentCapabilities?.sessionCapabilities, {
     list: {},
@@ -71,6 +72,38 @@ test('app wiring: unimplemented ACP methods are not registered', async () => {
       (err: unknown) => (err as RequestError).code === -32601,
       `expected method-not-found for ${method}`
     )
+  }
+})
+
+test('SessionManager aborts and waits for an in-flight version preflight at shutdown', async () => {
+  const manager = new SessionManager()
+  const originalSpawn = PiRpcProcess.spawn
+  let observedSignal: AbortSignal | undefined
+  let preflightSettled = false
+  ;(PiRpcProcess as any).spawn = (params: { signal?: AbortSignal }) => {
+    observedSignal = params.signal
+    return new Promise((_resolve, reject) => {
+      params.signal?.addEventListener(
+        'abort',
+        () =>
+          setTimeout(() => {
+            preflightSettled = true
+            reject(params.signal?.reason)
+          }, 20),
+        { once: true }
+      )
+    })
+  }
+
+  try {
+    const spawning = manager.spawnOwned({ cwd: process.cwd() })
+    const rejected = assert.rejects(spawning, (error: unknown) => error instanceof Error && error.name === 'AbortError')
+    await manager.disposeAllAndWait(250)
+    await rejected
+    assert.equal(observedSignal?.aborted, true)
+    assert.equal(preflightSettled, true, 'shutdown waits for the aborted preflight to settle')
+  } finally {
+    PiRpcProcess.spawn = originalSpawn
   }
 })
 

@@ -15,6 +15,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+      - run: npm ci
+      - run: npm run validate
+      - run: npm install --global @earendil-works/pi-coding-agent@^0.84.3
+      - run: npm run smoke
 
       - name: Generate release notes
         run: |
