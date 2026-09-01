@@ -168,7 +168,6 @@ export class PiRpcProcess {
       // is dispatched to event handlers first; the fallback timer guards
       // against stdio that never closes.
       const timer = setTimeout(() => this.settleTermination({ reason: 'exit', code, signal }), this.closeFallbackMs)
-      timer.unref?.()
       this.exitFallbackTimer = timer
     })
     child.on('close', (code, signal) => {
@@ -482,7 +481,6 @@ export class PiRpcProcess {
         // ignore
       }
     }, this.killGraceMs)
-    timer.unref?.()
     this.killTimer = timer
   }
 
@@ -636,7 +634,6 @@ export class PiRpcProcess {
           this.dispose({ expected: false })
           reject(error)
         }, timeoutMs)
-        timer.unref?.()
         entry.timer = timer
       }
       this.pending.set(id, entry)

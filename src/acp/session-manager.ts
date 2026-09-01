@@ -251,7 +251,6 @@ export class SessionManager {
     const expired = Symbol('expired')
     const deadline = new Promise<typeof expired>(resolve => {
       timer = setTimeout(() => resolve(expired), timeoutMs)
-      timer.unref?.()
     })
 
     try {

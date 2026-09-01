@@ -183,7 +183,6 @@ function startVersionProbe(piCommand: string, cwd: string): VersionProbe {
       child.kill('SIGKILL')
       settle({ error: versionFailure(piCommand, cwd, 'timed out') })
     }, 15_000)
-    timer.unref?.()
     signal.addEventListener('abort', onAbort, { once: true })
   })
 

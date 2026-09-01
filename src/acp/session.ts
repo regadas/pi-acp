@@ -807,7 +807,7 @@ export class PiAcpSession {
       this.deferredCommandAdmission = null
       this.failClaimedCommandAdmission(entry)
     }, remainingMs)
-    timer.unref?.()
+    // Keep referenced: this timer is the fail-closed settlement path.
     this.deferredCommandAdmissionTimer = timer
   }
 
@@ -1395,7 +1395,7 @@ export class PiAcpSession {
         this.dispose({ expected: false })
         this.failTurn(turn, error)
       }, this.deferredAdmissionTimeoutMs)
-      timer.unref?.()
+      // Keep referenced: this timer is the fail-closed settlement path.
       this.deferredAdmissionTimer = timer
       return
     }
