@@ -212,3 +212,79 @@ test('PiAcpSession: emits write diff content for new files on completion', async
   assert.equal(diff.oldText, null)
   assert.equal(diff.newText, 'created\n')
 })
+
+test('PiAcpSession: oversized snapshots use text/image fallback, never a fabricated new-file diff', async () => {
+  const { rmSync } = await import('node:fs')
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-size-'))
+  try {
+    for (const oversizedBefore of [true, false]) {
+      const path = join(dir, 'large')
+      writeFileSync(path, oversizedBefore ? 'x'.repeat(1024 * 1024 + 1) : 'small')
+      const { conn, proc } = createSession(dir)
+      proc.emit({
+        type: 'tool_execution_start',
+        toolCallId: 't1',
+        toolName: 'write',
+        args: { path }
+      })
+      writeFileSync(path, oversizedBefore ? 'small' : 'x'.repeat(1024 * 1024 + 1))
+      const result = {
+        content: [
+          { type: 'text', text: 'written' },
+          { type: 'image', data: 'aGk=', mimeType: 'image/png' }
+        ]
+      }
+      proc.emit({ type: 'tool_execution_end', toolCallId: 't1', result })
+      await new Promise(resolve => setImmediate(resolve))
+      const end = completedToolUpdate(conn)!.update as any
+      assert.deepEqual(end.rawOutput, result)
+      assert.deepEqual(
+        end.content.map((item: any) => item.content.type),
+        ['text', 'image']
+      )
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test(
+  'PiAcpSession: real FIFO pre/post snapshots cannot block the event loop',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const { spawnSync } = await import('node:child_process')
+    const { rmSync } = await import('node:fs')
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-diff-fifo-'))
+    try {
+      const fifo = join(dir, 'fifo')
+      assert.equal(spawnSync('mkfifo', [fifo]).status, 0)
+      const code = `
+      import { PiAcpSession } from ${JSON.stringify(new URL('../../src/acp/session.ts', import.meta.url).href)};
+      import { FakePiRpcProcess, FakeAgentSideConnection } from ${JSON.stringify(new URL('../helpers/fakes.ts', import.meta.url).href)};
+      import { writeFileSync, unlinkSync } from 'node:fs';
+      import { execFileSync } from 'node:child_process';
+      const p = ${JSON.stringify(fifo)};
+      const proc = new FakePiRpcProcess();
+      const conn = new FakeAgentSideConnection();
+      new PiAcpSession({sessionId:'s', cwd:${JSON.stringify(dir)}, proc, conn});
+      proc.emit({type:'tool_execution_start', toolCallId:'pre', toolName:'write', args:{path:p}});
+      proc.emit({type:'tool_execution_end', toolCallId:'pre', result:{content:[{type:'text',text:'fallback'}]}});
+      unlinkSync(p); writeFileSync(p, 'old');
+      proc.emit({type:'tool_execution_start', toolCallId:'post', toolName:'write', args:{path:p}});
+      unlinkSync(p); execFileSync('mkfifo',[p]);
+      proc.emit({type:'tool_execution_end', toolCallId:'post', result:{content:[{type:'text',text:'fallback'}]}});
+      setTimeout(() => console.log('responsive'), 0);
+    `
+      const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', code], {
+        timeout: 3_000,
+        killSignal: 'SIGKILL',
+        encoding: 'utf8'
+      })
+      assert.equal(result.error, undefined, String(result.error))
+      assert.equal(result.status, 0, result.stderr)
+      assert.match(result.stdout, /responsive/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)

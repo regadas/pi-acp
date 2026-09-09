@@ -78,3 +78,41 @@ test('LfLineDecoder: end() flushes the trailing unterminated line', () => {
   assert.equal(decoder.end(), '{"partial":')
   assert.equal(decoder.end(), null)
 })
+
+test('LfLineDecoder: fragmented large records scan and count only new text', t => {
+  const originalIndexOf = String.prototype.indexOf
+  const originalByteLength = Buffer.byteLength
+  let scanned = 0
+  let counted = 0
+  t.mock.method(String.prototype, 'indexOf', function (this: string, search: string, position = 0) {
+    if (search === '\n') scanned += this.length - position
+    return originalIndexOf.call(this, search, position)
+  })
+  t.mock.method(Buffer, 'byteLength', (text: Parameters<typeof Buffer.byteLength>[0], encoding?: BufferEncoding) => {
+    if (typeof text === 'string') counted += text.length
+    return originalByteLength(text, encoding)
+  })
+  const size = 2 * 1024 * 1024
+  const decoder = new LfLineDecoder(size)
+  const chunk = 'x'.repeat(4096)
+  for (let i = 0; i < size / chunk.length; i++) decoder.push(chunk)
+  const lines = decoder.push('\nnext\ntrail')
+  assert.equal(lines[0].length, size)
+  assert.equal(lines[1], 'next')
+  assert.equal(decoder.end(), 'trail')
+  assert.ok(scanned < size * 2, `newline work ${scanned} must be linear`)
+  assert.ok(counted < size * 2, `byte accounting work ${counted} must be linear`)
+})
+
+test('LfLineDecoder: exact UTF-8 limit, split surrogate strings, and incomplete byte flush', () => {
+  const decoder = new LfLineDecoder(4)
+  for (const byte of Buffer.from('🌍')) assert.deepEqual(decoder.push(Buffer.from([byte])), [])
+  assert.deepEqual(decoder.push('\nx\n'), ['🌍', 'x'])
+  decoder.push('\ud83c')
+  decoder.push('\udf0d')
+  assert.equal(decoder.end(), '🌍')
+  decoder.push(Buffer.from([0xe2]))
+  assert.equal(decoder.end(), '\ufffd')
+  const over = new LfLineDecoder(3)
+  assert.throws(() => over.push(Buffer.from('🌍\n')), LfLineTooLongError)
+})

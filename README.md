@@ -176,3 +176,11 @@ Project layout:
 ## License
 
 MIT (see [LICENSE](LICENSE)). This project originated from [svkozak/pi-acp](https://github.com/svkozak/pi-acp) and retains its original copyright and license attribution; independently maintained changes are attributed separately.
+
+### Auxiliary manual probes
+
+`npm run smoke` remains an isolated, non-provider initialize/new/builtin/cancel/shutdown check.
+After `npm run build`, the other `scripts/smoke-*.mjs` entrypoints are manual probes, not CI coverage.
+Use disposable `PI_CODING_AGENT_DIR`, `PI_ACP_DIR`, and `PI_CODING_AGENT_SESSION_DIR` directories.
+`smoke-compact.mjs`, `smoke-export.mjs`, and `smoke-acp-load.mjs` can generate provider traffic and require
+`PI_ACP_MANUAL_PROVIDER=1` plus configured credentials. All probes assert responses and have finite deadlines.

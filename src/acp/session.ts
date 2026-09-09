@@ -9,7 +9,7 @@ import type {
   Usage
 } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
-import { readFileSync } from 'node:fs'
+import { fileSnapshot } from './file-snapshot.js'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 import { PiRpcProcess, PiRpcRequestTimeoutError, type PiRpcEvent, type PiRpcTermination } from '../pi-rpc/process.js'
 import type { PiAssistantMessageEvent } from '../pi-rpc/protocol.js'
@@ -264,6 +264,9 @@ export class PiAcpSession {
   // fail closed rather than consuming its settlement as the current boundary.
   private lowLevelAgentEnded = false
   private piQueueHasMessages = false
+  // Queue removal precedes awaited extension hooks and message_start. With no
+  // queue-origin IDs, only settlement safely retires this steering evidence.
+  private readonly steeringTextsInRun = new Set<string>()
   private continuationExpected = false
   private lifecycleAmbiguity: Error | null = null
   // Two independent things can be held back by the out-of-band gate: a prompt's
@@ -701,7 +704,8 @@ export class PiAcpSession {
     const settled = () => command.cancelled || Boolean(this.commandTerminalFailure(command))
     const ctx: CommandContext = {
       cancelled: settled,
-      sendSessionUpdate: params => (settled() ? Promise.resolve() : this.sendSessionUpdate(params))
+      sendSessionUpdate: params =>
+        settled() ? Promise.resolve() : this.sendSessionUpdate(params, { isStale: settled })
     }
 
     const finishAdapterPromptTurn = this.beginAdapterPromptTurn()
@@ -1115,12 +1119,15 @@ export class PiAcpSession {
       if (this.disposed || isCancelled?.()) return
       if (this.publishedTitle === title) return this.flushEmits()
 
-      await this.enqueueUpdate({
-        sessionUpdate: 'session_info_update',
-        title,
-        updatedAt: new Date().toISOString()
-      })
-      this.publishedTitle = title
+      await this.enqueueUpdate(
+        {
+          sessionUpdate: 'session_info_update',
+          title,
+          updatedAt: new Date().toISOString()
+        },
+        isCancelled
+      )
+      if (!isCancelled?.()) this.publishedTitle = title
     })
     this.sessionInfoSyncTail = operation.catch(() => {})
     return operation
@@ -1314,12 +1321,35 @@ export class PiAcpSession {
 
   private cleanupToolCall(toolCallId: string): void {
     this.settledToolCallIds.add(toolCallId)
+    for (const [index, call] of this.streamedToolCalls) {
+      if (call.id === toolCallId) this.streamedToolCalls.delete(index)
+    }
     this.currentToolCalls.delete(toolCallId)
     this.fileSnapshots.delete(toolCallId)
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
     this.subagentToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+  }
+
+  private terminalizeToolCalls(): void {
+    for (const toolCallId of this.currentToolCalls.keys()) {
+      this.emit({
+        sessionUpdate: 'tool_call_update',
+        toolCallId,
+        status: 'failed',
+        ...(this.bashToolCallIds.has(toolCallId) && this.supportsTerminalOutputMeta
+          ? { _meta: bashTerminalExitMeta(toolCallId, 1) }
+          : {})
+      })
+      this.cleanupToolCall(toolCallId)
+    }
+    this.streamedToolCalls.clear()
+    this.fileSnapshots.clear()
+    this.fileMutationToolCallIds.clear()
+    this.bashToolCallIds.clear()
+    this.subagentToolCallIds.clear()
+    this.bashOutputSnapshots.clear()
   }
 
   private startTurn(t: QueuedPrompt): void {
@@ -1515,6 +1545,7 @@ export class PiAcpSession {
   private completeTurn(turn: PendingTurn): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
+    this.terminalizeToolCalls()
     this.clearDeferredDispatch()
     const reason: StopReason = this.cancelRequested
       ? 'cancelled'
@@ -1541,6 +1572,7 @@ export class PiAcpSession {
   private failTurn(turn: PendingTurn, err: unknown): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
+    this.terminalizeToolCalls()
     this.clearDeferredDispatch()
 
     // Keep the failed turn installed while its existing updates flush so any
@@ -1676,6 +1708,9 @@ export class PiAcpSession {
       const steering = Array.isArray(ev.steering) ? ev.steering : []
       const followUp = Array.isArray(ev.followUp) ? ev.followUp : []
       this.piQueueHasMessages = steering.length > 0 || followUp.length > 0
+      for (const text of steering) {
+        if (typeof text === 'string') this.steeringTextsInRun.add(text)
+      }
 
       if (turn?.promptDispatched && !turn.promptAccepted && !turn.completionStarted) {
         const queuedText = followUp.at(-1)
@@ -1687,6 +1722,18 @@ export class PiAcpSession {
           // message_start records have been skipped.
           turn.matchingPromptMessagesToSkip = followUp.slice(0, -1).filter(item => item === queuedText).length
         }
+      }
+      if (
+        turn?.promptQueued &&
+        !turn.piRunOwned &&
+        !turn.completionStarted &&
+        this.steeringTextsInRun.has(turn.expectedPromptText)
+      ) {
+        const error = new Error('Pi queued steering text indistinguishable from the accepted follow-up prompt.')
+        this.lifecycleAmbiguity = error
+        this.dispose({ expected: false })
+        this.failTurn(turn, error)
+        return
       }
       // Pi invokes agent_end extension handlers before publishing agent_end,
       // so their queue_update can precede our low-level end flag. Retain the
@@ -1746,7 +1793,13 @@ export class PiAcpSession {
       case 'session_info_changed': {
         const name = ev.name
         if (name !== undefined && typeof name !== 'string') break
-        void this.syncSessionInfo(name).catch(() => {})
+        // A claimed FIFO slot may still be parked behind foreign work. Capture
+        // only an executing command so its echo keeps that command's lifetime.
+        const command = this.activeAdapterPromptTurns > 0 ? this.activeCommand : null
+        const isCancelled = command
+          ? () => command.cancelled || Boolean(this.commandTerminalFailure(command))
+          : undefined
+        void this.syncSessionInfo(name, isCancelled).catch(() => {})
         break
       }
 
@@ -1786,13 +1839,24 @@ export class PiAcpSession {
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
           const contentIndex = typeof ame.contentIndex === 'number' ? ame.contentIndex : 0
           const whole = ame.toolCall as
-            | { id?: unknown; name?: unknown; arguments?: unknown; partialArgs?: unknown }
+            | {
+                id?: unknown
+                name?: unknown
+                arguments?: unknown
+                partialArgs?: unknown
+              }
             | undefined
           if (ame.type === 'toolcall_start') {
             const id = typeof ame.id === 'string' ? ame.id : typeof whole?.id === 'string' ? whole.id : ''
             const name =
               typeof ame.toolName === 'string' ? ame.toolName : typeof whole?.name === 'string' ? whole.name : 'tool'
-            if (id) this.streamedToolCalls.set(contentIndex, { id, name, argumentsText: '' })
+            if (this.settledToolCallIds.has(id)) break
+            if (id)
+              this.streamedToolCalls.set(contentIndex, {
+                id,
+                name,
+                argumentsText: ''
+              })
           }
           const buffered = this.streamedToolCalls.get(contentIndex)
           if (ame.type === 'toolcall_delta' && buffered) {
@@ -1811,6 +1875,7 @@ export class PiAcpSession {
           const toolName = String(whole?.name ?? ame.toolName ?? buffered?.name ?? 'tool')
 
           if (toolCallId) {
+            if (this.settledToolCallIds.has(toolCallId)) break
             if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
             if (ame.type === 'toolcall_delta' && this.subagentToolCallIds.has(toolCallId)) break
 
@@ -1931,6 +1996,7 @@ export class PiAcpSession {
 
       case 'tool_execution_start': {
         const toolCallId = String(ev.toolCallId ?? crypto.randomUUID())
+        if (this.settledToolCallIds.has(toolCallId)) break
         const toolName = String(ev.toolName ?? 'tool')
         const args = ev.args
         let line: number | undefined
@@ -1960,20 +2026,19 @@ export class PiAcpSession {
           this.fileMutationToolCallIds.add(toolCallId)
           const p = getToolPath(args)
           if (p) {
-            try {
-              const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
-              snapshotOldText = readFileSync(abs, 'utf8')
-              this.fileSnapshots.set(toolCallId, { path: p, oldText: snapshotOldText })
-
-              if (toolName === 'edit') {
+            const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
+            snapshotOldText = fileSnapshot(abs)
+            if (snapshotOldText !== undefined) {
+              this.fileSnapshots.set(toolCallId, {
+                path: p,
+                oldText: snapshotOldText
+              })
+              if (toolName === 'edit' && snapshotOldText !== null) {
                 for (const needle of getEditOldTexts(args)) {
                   line = findUniqueLineNumber(snapshotOldText, needle)
                   if (typeof line === 'number') break
                 }
               }
-            } catch {
-              snapshotOldText = null
-              this.fileSnapshots.set(toolCallId, { path: p, oldText: null })
             }
           }
         }
@@ -2059,8 +2124,8 @@ export class PiAcpSession {
         if (!isError && snapshot) {
           try {
             const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
-            const newText = readFileSync(abs, 'utf8')
-            if (snapshot.oldText === null || newText !== snapshot.oldText) {
+            const newText = fileSnapshot(abs)
+            if (typeof newText === 'string' && (snapshot.oldText === null || newText !== snapshot.oldText)) {
               hasStructuredDiff = true
               content = [
                 {
@@ -2232,6 +2297,7 @@ export class PiAcpSession {
         this.piBusyOutOfBand = false
         this.lowLevelAgentEnded = false
         this.piQueueHasMessages = false
+        this.steeringTextsInRun.clear()
         this.continuationExpected = false
         // An adapter command parked behind that run is admitted at the same
         // boundary that admits a deferred prompt dispatch.

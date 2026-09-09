@@ -271,3 +271,147 @@ test('PiAcpSession: failed acceptance probe quarantines the process and suppress
   assert.equal(restored.proc, freshProc)
   manager.close(session.sessionId)
 })
+
+for (const ending of ['success', 'error', 'cancel', 'exit'] as const) {
+  test(`PiAcpSession: ${ending} terminalizes incomplete arguments and running tools before response`, async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = new PiAcpSession({
+      sessionId: 's1',
+      cwd: process.cwd(),
+      proc: proc as any,
+      conn: asAgentConn(conn),
+      supportsTerminalOutputMeta: true
+    })
+    const prompt = session.prompt('one')
+    const outcome = prompt.then(
+      value => value,
+      () => 'rejected'
+    )
+    proc.emit({ type: 'agent_start' })
+    proc.emit({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'toolcall_start',
+        contentIndex: 0,
+        id: 'partial',
+        toolName: 'write'
+      }
+    })
+    proc.emit({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'toolcall_delta',
+        contentIndex: 0,
+        delta: '{"path":'
+      }
+    })
+    proc.emit({
+      type: 'tool_execution_start',
+      toolCallId: 'running',
+      toolName: 'bash',
+      args: { command: 'echo output' }
+    })
+    proc.emit({
+      type: 'tool_execution_update',
+      toolCallId: 'running',
+      toolName: 'bash',
+      partialResult: { content: [{ type: 'text', text: 'output' }] }
+    })
+    if (ending === 'error')
+      proc.emit({
+        type: 'message_update',
+        assistantMessageEvent: {
+          type: 'error',
+          reason: 'error',
+          error: { errorMessage: 'broken stream' }
+        }
+      })
+    if (ending === 'cancel') await session.cancel()
+    if (ending === 'exit') proc.emitTermination({ expected: false })
+    else proc.emit({ type: 'agent_settled' })
+    assert.equal(await outcome, ending === 'cancel' ? 'cancelled' : ending === 'success' ? 'end_turn' : 'rejected')
+    const terminal = conn.updates.map(item => item.update as any).filter(update => update.status === 'failed')
+    assert.deepEqual(
+      terminal.map(update => update.toolCallId),
+      ['partial', 'running']
+    )
+    assert.deepEqual(terminal[1]._meta.terminal_exit, {
+      terminal_id: 'running',
+      exit_code: 1,
+      signal: null
+    })
+    assert.equal(terminal[1]._meta.terminal_output, undefined, 'do not replay or erase accumulated bash output')
+    for (const name of [
+      'currentToolCalls',
+      'streamedToolCalls',
+      'fileSnapshots',
+      'fileMutationToolCallIds',
+      'bashToolCallIds',
+      'subagentToolCallIds',
+      'bashOutputSnapshots'
+    ])
+      assert.equal((session as any)[name].size, 0, name)
+    if (ending === 'exit') return
+    const before = conn.updates.length
+    proc.emit({
+      type: 'tool_execution_end',
+      toolCallId: 'running',
+      toolName: 'bash',
+      result: {}
+    })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(conn.updates.length, before, 'late terminal events cannot resurrect cards')
+    const next = session.prompt('two')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'toolcall_delta',
+        contentIndex: 0,
+        delta: 'stale index'
+      }
+    })
+    proc.emit({
+      type: 'tool_execution_start',
+      toolCallId: 'next',
+      toolName: 'read',
+      args: {}
+    })
+    proc.emit({
+      type: 'tool_execution_end',
+      toolCallId: 'next',
+      toolName: 'read',
+      result: {}
+    })
+    // Duplicate start/delta/end inside the turn cannot downgrade a finished call.
+    proc.emit({
+      type: 'tool_execution_start',
+      toolCallId: 'next',
+      toolName: 'read',
+      args: {}
+    })
+    proc.emit({
+      type: 'message_update',
+      assistantMessageEvent: {
+        type: 'toolcall_start',
+        contentIndex: 1,
+        id: 'next',
+        toolName: 'read'
+      }
+    })
+    proc.emit({ type: 'agent_settled' })
+    assert.equal(await next, 'end_turn')
+    assert.deepEqual(
+      conn.updates
+        .slice(before)
+        .map(item => item.update as any)
+        .filter(update => update.toolCallId)
+        .map(update => [update.toolCallId, update.status]),
+      [
+        ['next', 'in_progress'],
+        ['next', 'completed']
+      ]
+    )
+  })
+}

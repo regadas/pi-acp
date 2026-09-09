@@ -51,7 +51,7 @@ function isStoredSession(value: unknown): value is StoredSession {
   )
 }
 
-function parseRecord(path: string, raw: string, expectedSessionId: string): SessionRecordFile {
+function parseRecord(path: string, raw: string, expectedSessionId?: string): SessionRecordFile {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -65,7 +65,7 @@ function parseRecord(path: string, raw: string, expectedSessionId: string): Sess
   }
   if (record.deleted === true) {
     if (typeof record.sessionId !== 'string') throw new SessionStoreCorruptError(path, 'tombstone without sessionId')
-    if (record.sessionId !== expectedSessionId) {
+    if (expectedSessionId !== undefined && record.sessionId !== expectedSessionId) {
       throw new SessionStoreCorruptError(
         path,
         `tombstone sessionId ${record.sessionId} does not match ${expectedSessionId}`
@@ -79,13 +79,35 @@ function parseRecord(path: string, raw: string, expectedSessionId: string): Sess
   if (!isStoredSession(record.session)) {
     throw new SessionStoreCorruptError(path, 'live record without a valid session')
   }
-  if (record.session.sessionId !== expectedSessionId) {
+  if (expectedSessionId !== undefined && record.session.sessionId !== expectedSessionId) {
     throw new SessionStoreCorruptError(
       path,
       `live record sessionId ${record.session.sessionId} does not match ${expectedSessionId}`
     )
   }
   return { version: 1, session: record.session }
+}
+
+function parseLegacyMap(path: string, raw: string): LegacySessionMapFile {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (e) {
+    throw new SessionStoreCorruptError(path, `invalid JSON: ${String((e as Error)?.message ?? e)}`)
+  }
+  const map = parsed as LegacySessionMapFile | null
+  if (
+    !map ||
+    typeof map !== 'object' ||
+    map.version !== 1 ||
+    typeof map.sessions !== 'object' ||
+    !map.sessions ||
+    Array.isArray(map.sessions)
+  ) {
+    throw new SessionStoreCorruptError(path, 'unknown map shape or version')
+  }
+
+  return map
 }
 
 /** Reads that must distinguish "absent" (null) from corruption (throw). */
@@ -201,23 +223,7 @@ export class SessionStore {
     const raw = readFileOrNull(this.legacyMapPath)
     if (raw === null) return null
 
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(raw)
-    } catch (e) {
-      throw new SessionStoreCorruptError(this.legacyMapPath, `invalid JSON: ${String((e as Error)?.message ?? e)}`)
-    }
-    const map = parsed as LegacySessionMapFile | null
-    if (
-      !map ||
-      typeof map !== 'object' ||
-      map.version !== 1 ||
-      typeof map.sessions !== 'object' ||
-      !map.sessions ||
-      Array.isArray(map.sessions)
-    ) {
-      throw new SessionStoreCorruptError(this.legacyMapPath, 'unknown map shape or version')
-    }
+    const map = parseLegacyMap(this.legacyMapPath, raw)
 
     const entry = map.sessions[sessionId]
     if (entry === undefined) return null
@@ -249,16 +255,7 @@ export class SessionStore {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
     if (legacyRaw !== null) {
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(legacyRaw)
-      } catch (e) {
-        throw new SessionStoreCorruptError(this.legacyMapPath, `invalid JSON: ${String((e as Error)?.message ?? e)}`)
-      }
-      const legacy = parsed as LegacySessionMapFile
-      if (!legacy || legacy.version !== 1 || !legacy.sessions || typeof legacy.sessions !== 'object') {
-        throw new SessionStoreCorruptError(this.legacyMapPath, 'unknown map shape or version')
-      }
+      const legacy = parseLegacyMap(this.legacyMapPath, legacyRaw)
       for (const [id, session] of Object.entries(legacy.sessions)) {
         if (!isStoredSession(session) || session.sessionId !== id) {
           throw new SessionStoreCorruptError(this.legacyMapPath, `invalid legacy entry for ${id}`)
@@ -275,11 +272,11 @@ export class SessionStore {
     }
     for (const name of names) {
       const path = join(this.stateDir, name)
-      const raw = await readFile(path, 'utf8')
-      const parsed = JSON.parse(raw) as { deleted?: unknown; sessionId?: unknown; session?: unknown }
-      const id = parsed.deleted === true ? parsed.sessionId : (parsed.session as StoredSession | undefined)?.sessionId
-      if (typeof id !== 'string') throw new SessionStoreCorruptError(path, 'record without sessionId')
-      const record = parseRecord(path, raw, id)
+      const record = parseRecord(path, await readFile(path, 'utf8'))
+      const id = record.deleted ? record.sessionId : record.session.sessionId
+      if (path !== this.recordPath(id)) {
+        throw new SessionStoreCorruptError(path, `record filename does not match sessionId ${id}`)
+      }
       if (record.deleted) byId.delete(id)
       else byId.set(id, record.session)
     }

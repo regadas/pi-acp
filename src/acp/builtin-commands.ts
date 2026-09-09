@@ -56,7 +56,7 @@ export async function runBuiltinCommand(
     const customInstructions = args.join(' ').trim() || undefined
     const res = await session.proc.compact(customInstructions)
 
-    const r: any = res && typeof res === 'object' ? (res as any) : null
+    const r = res && typeof res === 'object' ? (res as { tokensBefore?: unknown; summary?: unknown }) : null
     const tokensBefore = typeof r?.tokensBefore === 'number' ? r.tokensBefore : null
     const summary = typeof r?.summary === 'string' ? r.summary : null
 
@@ -79,6 +79,7 @@ export async function runBuiltinCommand(
   }
 
   if (cmd === 'session') {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const stats = (await session.proc.getSessionStats()) as any
 
     const lines: string[] = []
@@ -128,8 +129,8 @@ export async function runBuiltinCommand(
 
     try {
       await session.proc.setSessionName(name)
-    } catch (e: any) {
-      const msg = String(e?.message ?? e)
+    } catch (e: unknown) {
+      const msg = String(e instanceof Error ? e.message : e)
       const hint = /set_session_name/i.test(msg)
         ? ' This requires a newer pi version that supports `set_session_name` in RPC mode.'
         : ''
@@ -164,6 +165,7 @@ export async function runBuiltinCommand(
 
   if (cmd === 'steering') {
     const modeRaw = String(args[0] ?? '').toLowerCase()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const state = (await session.proc.getState()) as any
     const current = String(state?.steeringMode ?? '')
 
@@ -214,6 +216,7 @@ export async function runBuiltinCommand(
 
   if (cmd === 'follow-up') {
     const modeRaw = String(args[0] ?? '').toLowerCase()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const state = (await session.proc.getState()) as any
     const current = String(state?.followUpMode ?? '')
 
@@ -265,6 +268,7 @@ export async function runBuiltinCommand(
     // IMPORTANT: pi's export_html reads the session JSONL file. If it doesn't exist yet
     // (no messages) or is empty, pi throws and RPC mode emits an uncorrelated parse error
     // (no id), which would otherwise hang our request. So we guard here.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const state = (await session.proc.getState()) as any
     const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
     const messageCount = typeof state?.messageCount === 'number' ? state.messageCount : 0
@@ -294,14 +298,14 @@ export async function runBuiltinCommand(
     try {
       const result = await session.proc.exportHtml(outputPath)
       resultPath = result.path
-    } catch (e: any) {
+    } catch (e: unknown) {
       await ctx.sendSessionUpdate({
         sessionId: session.sessionId,
         update: {
           sessionUpdate: 'agent_message_chunk',
           content: {
             type: 'text',
-            text: `Export failed: ${String(e?.message ?? e)}`
+            text: `Export failed: ${String(e instanceof Error ? e.message : e)}`
           }
         }
       })
@@ -363,6 +367,7 @@ export async function runBuiltinCommand(
     } else if (AUTOCOMPACT_OFF_ALIASES.has(mode)) {
       enabled = false
     } else if (mode === 'toggle') {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
       const state = (await session.proc.getState()) as any
       enabled = !state?.autoCompactionEnabled
     } else {

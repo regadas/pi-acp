@@ -50,7 +50,7 @@ switch (behavior) {
     process.exit(3)
     break
   case 'split-writes': {
-    const line = Buffer.from(JSON.stringify({ type: 'marker', text: 'héllo 🌍 world' }) + '\n', 'utf8')
+    const line = Buffer.from(JSON.stringify({ type: 'session_info_changed', text: 'héllo 🌍 world' }) + '\n', 'utf8')
     const mid = line.indexOf(Buffer.from('🌍', 'utf8')) + 2 // split inside the emoji
     process.stdout.write(line.subarray(0, mid))
     setTimeout(() => process.stdout.write(line.subarray(mid)), 30)
@@ -58,7 +58,7 @@ switch (behavior) {
   }
   case 'garbage-then-event':
     process.stdout.write('\u001b[1mstarting fake pi...\u001b[0m\n{not json\n')
-    send({ type: 'marker', ok: true })
+    send({ type: 'session_info_changed', ok: true })
     break
   case 'stderr-flood':
     process.stderr.write('x'.repeat(64 * 1024) + 'TAIL-END\n')

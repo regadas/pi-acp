@@ -339,8 +339,10 @@ export class SessionManager {
     // retried by sessionId, no store mapping exists, and `findPiSession` has no
     // id to match. A bare disposal is therefore correct -- the replacement
     // barrier is keyed by sessionId and would have nothing to key on.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     let state: any = null
     try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
       state = (await proc.getState()) as any
     } catch (e) {
       proc.dispose()
@@ -362,7 +364,7 @@ export class SessionManager {
     // commands that read the session file (e.g. export_html) cannot fail on a
     // missing parent directory. Best-effort: pi itself creates it on write.
     try {
-      mkdirSync(dirname(sessionFile), { recursive: true })
+      mkdirSync(dirname(sessionFile), { recursive: true, mode: 0o700 })
     } catch {
       // ignore
     }

@@ -1,54 +1,11 @@
-import { spawn } from 'node:child_process'
+import assert from 'node:assert/strict'
+import { withSmokeAgent, newSmokeSession } from './smoke-client.mjs'
 
-const p = spawn('node', ['dist/index.js'], { stdio: ['pipe', 'pipe', 'inherit'] })
-
-let buf = ''
-let sid = null
-let gotIntro = false
-
-p.stdout.on('data', d => {
-  buf += d.toString('utf8')
-  let idx
-  while ((idx = buf.indexOf('\n')) >= 0) {
-    const line = buf.slice(0, idx)
-    buf = buf.slice(idx + 1)
-    if (!line.trim()) continue
-    const msg = JSON.parse(line)
-
-    if (msg.id === 2) {
-      sid = msg.result?.sessionId
-      console.log(
-        'session/new response _meta.piAcp.startupInfo present:',
-        Boolean(msg.result?._meta?.piAcp?.startupInfo)
-      )
-    }
-
-    if (msg.method === 'session/update') {
-      const up = msg.params?.update
-      if (up?.sessionUpdate === 'agent_message_chunk' && up?.content?.type === 'text') {
-        const t = String(up.content.text)
-        if (t.includes('[Context]') && t.includes('[Skills]') && t.includes('[Extensions]')) {
-          gotIntro = true
-          console.log('OK: got intro via session/update (before any prompt)')
-          p.kill('SIGTERM')
-          process.exit(0)
-        }
-      }
-    }
-  }
+// Manual non-provider probe: new-session intro is metadata, not an out-of-turn message.
+await withSmokeAgent(async client => {
+  const session = await newSmokeSession(client)
+  // Current production sessions explicitly report no banner (null).
+  const intro = session._meta?.piAcp?.startupInfo
+  assert.ok(intro === null || (typeof intro === 'string' && intro.length > 0))
+  assert.ok(!client.updates.some(update => update.sessionUpdate === 'agent_message_chunk'))
 })
-
-function send(obj) {
-  p.stdin.write(JSON.stringify(obj) + '\n')
-}
-
-send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } })
-send({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: process.cwd(), mcpServers: [] } })
-
-setTimeout(() => {
-  if (!gotIntro) {
-    console.error('Did not receive intro before prompt. sessionId=', sid)
-    p.kill('SIGTERM')
-    process.exit(1)
-  }
-}, 1500)

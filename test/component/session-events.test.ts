@@ -506,7 +506,15 @@ test('PiAcpSession: synthesizes starts for progress-only tool events and keeps s
       kind: 'other',
       status: 'in_progress',
       rawInput: { prompt: 'investigate' }
-    }
+    },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'missing-read-start', status: 'failed' },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'missing-bash-start',
+      status: 'failed',
+      _meta: { terminal_exit: { terminal_id: 'missing-bash-start', exit_code: 1, signal: null } }
+    },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'missing-subagent-start', status: 'failed' }
   ])
 })
 

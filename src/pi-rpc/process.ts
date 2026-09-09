@@ -161,7 +161,16 @@ export class PiRpcProcess {
     })
 
     child.on('error', err => {
-      this.settleTermination({ reason: 'error', code: null, signal: null, error: err })
+      // A failed kill can emit error while the child still owns its session file.
+      // Even after exit, close must drain stdout before releasing ownership.
+      if (child.pid === undefined) {
+        this.settleTermination({
+          reason: 'error',
+          code: null,
+          signal: null,
+          error: err
+        })
+      }
     })
     child.on('exit', (code, signal) => {
       // Prefer settling on 'close' so stdout data already buffered in the pipe
@@ -507,26 +516,19 @@ export class PiRpcProcess {
   }
 
   async abort(): Promise<void> {
-    const res = await this.request({ type: 'abort' })
-    if (!res.success) throw new Error(`pi abort failed: ${res.error ?? JSON.stringify(res.data)}`)
+    await this.call({ type: 'abort' })
   }
 
   async getState(): Promise<unknown> {
-    const res = await this.request({ type: 'get_state' })
-    if (!res.success) throw new Error(`pi get_state failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    return this.call({ type: 'get_state' })
   }
 
   async getAvailableModels(): Promise<unknown> {
-    const res = await this.request({ type: 'get_available_models' })
-    if (!res.success) throw new Error(`pi get_available_models failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    return this.call({ type: 'get_available_models' })
   }
 
   async setModel(provider: string, modelId: string): Promise<unknown> {
-    const res = await this.request({ type: 'set_model', provider, modelId })
-    if (!res.success) throw new Error(`pi set_model failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    return this.call({ type: 'set_model', provider, modelId })
   }
 
   async getAvailableThinkingLevels(): Promise<unknown> {
@@ -542,40 +544,31 @@ export class PiRpcProcess {
   }
 
   async setThinkingLevel(level: PiThinkingLevel): Promise<void> {
-    const res = await this.request({ type: 'set_thinking_level', level })
-    if (!res.success) throw new Error(`pi set_thinking_level failed: ${res.error ?? JSON.stringify(res.data)}`)
+    await this.call({ type: 'set_thinking_level', level })
   }
 
   async setFollowUpMode(mode: 'all' | 'one-at-a-time'): Promise<void> {
-    const res = await this.request({ type: 'set_follow_up_mode', mode })
-    if (!res.success) throw new Error(`pi set_follow_up_mode failed: ${res.error ?? JSON.stringify(res.data)}`)
+    await this.call({ type: 'set_follow_up_mode', mode })
   }
 
   async setSteeringMode(mode: 'all' | 'one-at-a-time'): Promise<void> {
-    const res = await this.request({ type: 'set_steering_mode', mode })
-    if (!res.success) throw new Error(`pi set_steering_mode failed: ${res.error ?? JSON.stringify(res.data)}`)
+    await this.call({ type: 'set_steering_mode', mode })
   }
 
   async compact(customInstructions?: string): Promise<unknown> {
-    const res = await this.request({ type: 'compact', customInstructions })
-    if (!res.success) throw new Error(`pi compact failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    return this.call({ type: 'compact', customInstructions })
   }
 
   async setAutoCompaction(enabled: boolean): Promise<void> {
-    const res = await this.request({ type: 'set_auto_compaction', enabled })
-    if (!res.success) throw new Error(`pi set_auto_compaction failed: ${res.error ?? JSON.stringify(res.data)}`)
+    await this.call({ type: 'set_auto_compaction', enabled })
   }
 
   async getSessionStats(): Promise<unknown> {
-    const res = await this.request({ type: 'get_session_stats' })
-    if (!res.success) throw new Error(`pi get_session_stats failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    return this.call({ type: 'get_session_stats' })
   }
 
   async setSessionName(name: string): Promise<void> {
-    const res = await this.request({ type: 'set_session_name', name })
-    if (!res.success) throw new Error(`pi set_session_name failed: ${res.error ?? JSON.stringify(res.data)}`)
+    await this.call({ type: 'set_session_name', name })
   }
 
   async exportHtml(outputPath?: string): Promise<{ path: string }> {
@@ -596,13 +589,17 @@ export class PiRpcProcess {
   }
 
   async getCommands(): Promise<unknown> {
-    const res = await this.request({ type: 'get_commands' })
-    if (!res.success) throw new Error(`pi get_commands failed: ${res.error ?? JSON.stringify(res.data)}`)
-    return res.data
+    return this.call({ type: 'get_commands' })
   }
 
   async sendExtensionUiResponse(response: PiExtensionUiResponse): Promise<void> {
     await this.writeLine(`${JSON.stringify({ type: 'extension_ui_response', ...response })}\n`)
+  }
+
+  private async call(cmd: PiRpcCommand): Promise<unknown> {
+    const res = await this.request(cmd)
+    if (!res.success) throw new Error(`pi ${cmd.type} failed: ${res.error ?? JSON.stringify(res.data)}`)
+    return res.data
   }
 
   private request(

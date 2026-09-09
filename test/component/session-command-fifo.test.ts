@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
+import { runBuiltinCommand } from '../../src/acp/builtin-commands.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 // Adapter-handled slash commands share the session FIFO with ordinary prompts:
@@ -560,3 +561,147 @@ test('PiAcpAgent: a command cancelled after its pi RPC finished publishes no lat
   proc.emit({ type: 'agent_settled' })
   assert.equal((await next).stopReason, 'end_turn')
 })
+
+test('PiAcpSession: cancellation rechecks success and title inside the shared delivery queue', async () => {
+  const proc = new FakePiRpcProcess()
+  const conn = new GatedConnection()
+  const { session } = makeAgent(proc, conn)
+  const gate = deferred<void>()
+  const enqueued = deferred<void>()
+  conn.gateUpdates(gate.promise)
+  const earlier = session.sendSessionUpdate({
+    sessionId: 's1',
+    update: {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'Earlier' }
+    }
+  })
+  const command = session.runCommand(async ctx => {
+    const success = ctx.sendSessionUpdate({
+      sessionId: 's1',
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Cancelled success' }
+      }
+    })
+    const title = session.syncSessionInfo('Cancelled title', ctx.cancelled)
+    await tick()
+    enqueued.resolve()
+    await Promise.all([success, title])
+    return 'success'
+  })
+  await enqueued.promise
+  const cancelling = session.cancel()
+  gate.resolve()
+  await Promise.all([earlier, cancelling])
+  assert.equal(await command, null)
+  await tick()
+  assert.deepEqual(agentMessageTexts(conn), ['Earlier'])
+  assert.ok(!conn.updates.some(update => 'title' in update.update))
+  assert.deepEqual(queueStates(conn).at(-1), { queueDepth: 0, running: false })
+  await session.syncSessionInfo('Cancelled title')
+  assert.ok(
+    conn.updates.some(update => 'title' in update.update && update.update.title === 'Cancelled title'),
+    'skipped titles must not seed publication state'
+  )
+})
+
+for (const ending of ['cancel', 'failure']) {
+  test(`PiAcpSession: builtin /name echo queued before ${ending} cannot publish or seed its title`, async () => {
+    const proc = new FakePiRpcProcess()
+    const conn = new GatedConnection()
+    const { session } = makeAgent(proc, conn)
+    const gate = deferred<void>()
+    conn.gateUpdates(gate.promise)
+    const earlier = session.sendSessionUpdate({
+      sessionId: 's1',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Earlier' } }
+    })
+    Object.assign(proc, {
+      async setSessionName(name: string) {
+        // Installed pi emits this event synchronously, before the RPC success.
+        proc.emit({ type: 'session_info_changed', name })
+      }
+    })
+    const command = session.runCommand(ctx => runBuiltinCommand(session, 'name', ['Later'], ctx))
+    const failure = ending === 'failure' ? assert.rejects(command, /pi process exited unexpectedly/) : undefined
+    await tick()
+    assert.equal(proc.hasPendingRequests(), false)
+    const cancelling = ending === 'cancel' ? session.cancel() : undefined
+    if (ending === 'failure') proc.emitTermination({ expected: false, code: 1 })
+    gate.resolve()
+    await Promise.all([earlier, cancelling, failure])
+    if (ending === 'cancel') assert.equal(await command, null)
+    await tick()
+    assert.deepEqual(
+      conn.updates.filter(item => 'title' in item.update),
+      []
+    )
+    assert.deepEqual(agentMessageTexts(conn), ['Earlier'])
+
+    if (ending === 'cancel') {
+      // An independent authoritative event may republish the skipped title.
+      proc.emit({ type: 'session_info_changed', name: 'Later' })
+      await tick()
+      assert.deepEqual(
+        conn.updates.filter(item => 'title' in item.update).map(item => (item.update as { title?: string }).title),
+        ['Later']
+      )
+    }
+  })
+}
+
+test('PiAcpSession: successful builtin /name echo deduplicates and leaves idle title events independent', async () => {
+  const proc = new FakePiRpcProcess()
+  const { session, conn } = makeAgent(proc)
+  Object.assign(proc, {
+    async setSessionName(name: string) {
+      proc.emit({ type: 'session_info_changed', name })
+    }
+  })
+  const result = await session.runCommand(ctx => runBuiltinCommand(session, 'name', ['Named'], ctx))
+  assert.deepEqual(result, { stopReason: 'end_turn' })
+  await session.cancel()
+  proc.emit({ type: 'session_info_changed', name: 'Idle title' })
+  await tick()
+  assert.deepEqual(
+    conn.updates.filter(item => 'title' in item.update).map(item => (item.update as { title?: string }).title),
+    ['Named', 'Idle title']
+  )
+  assert.ok(agentMessageTexts(conn).includes('Session name set: Named'))
+})
+
+for (const waiting of ['queued', 'parked', 'admitting']) {
+  test(`PiAcpSession: title event while command is ${waiting} is not owned by that command`, async () => {
+    const proc = new FakePiRpcProcess()
+    const conn = new GatedConnection()
+    const { session } = makeAgent(proc, conn)
+    const gate = deferred<void>()
+    conn.gateUpdates(gate.promise)
+    const earlier = session.sendSessionUpdate({
+      sessionId: 's1',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Earlier' } }
+    })
+    const prompt = waiting === 'queued' ? session.prompt('active prompt') : undefined
+    if (waiting !== 'admitting') proc.emit({ type: 'agent_start' })
+    let ran = false
+    const command = session.runCommand(async ctx => {
+      ran = true
+      return runBuiltinCommand(session, 'name', ['Not run'], ctx)
+    })
+    if (waiting !== 'admitting') await tick()
+    proc.emit({ type: 'session_info_changed', name: 'Independent title' })
+    const cancelling = session.cancel()
+    gate.resolve()
+    await Promise.all([earlier, cancelling])
+    proc.emit({ type: 'agent_settled' })
+    if (prompt) assert.equal(await prompt, 'cancelled')
+    assert.equal(await command, null)
+    await tick()
+    assert.equal(ran, false)
+    assert.deepEqual(
+      conn.updates.filter(item => 'title' in item.update).map(item => (item.update as { title?: string }).title),
+      ['Independent title']
+    )
+  })
+}

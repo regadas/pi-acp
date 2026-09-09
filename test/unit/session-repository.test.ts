@@ -123,3 +123,57 @@ test('repository caps metadata scanning per file and uses mtime when truncated',
   assert.equal(session?.title, null)
   assert.equal(session?.updatedAt, mtime.toISOString())
 })
+
+test('repository.list: foreign metadata scan work is skipped except for competing duplicate IDs', async t => {
+  const { default: fs } = await import('node:fs')
+  const { syncBuiltinESMExports } = await import('node:module')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-cost-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  const local = join(root, 'local')
+  const foreign = join(root, 'foreign')
+  function add(name: string, id: string, cwd: string, timestamp: string) {
+    const path = join(sessions, name + '.jsonl')
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: 'session', id, cwd }),
+        JSON.stringify({
+          type: 'message',
+          timestamp,
+          message: { role: 'user', content: name }
+        })
+      ].join('\n') + '\n'
+    )
+    return path
+  }
+  add('old-local', 'duplicate', local, '2026-01-01T00:00:00Z')
+  add('new-foreign', 'duplicate', foreign, '2026-01-02T00:00:00Z')
+  const wanted = add('wanted', 'wanted', local, '2026-01-01T00:00:00Z')
+  for (let i = 0; i < 30; i++) add(`foreign-${i}`, `foreign-${i}`, foreign, '2026-01-01T00:00:00Z')
+  const scanned: string[] = []
+  const create = fs.createReadStream
+  t.mock.method(fs, 'createReadStream', (...args: Parameters<typeof fs.createReadStream>) => {
+    scanned.push(String(args[0]))
+    return create(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+  const repository = new SessionRepository(
+    new SessionStore(join(root, 'map.json')),
+    { PI_CODING_AGENT_SESSION_DIR: sessions },
+    join(root, 'agent')
+  )
+  assert.deepEqual(
+    (await repository.list(local)).map(record => record.sessionFile),
+    [wanted]
+  )
+  assert.equal(scanned.length, 3, 'only scoped records and their duplicate competitors require full metadata')
+  scanned.length = 0
+  assert.equal((await repository.list()).length, 32, 'unscoped cross-project discovery remains available')
+  assert.equal(scanned.length, 33)
+})

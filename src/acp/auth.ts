@@ -24,7 +24,11 @@ export function getAuthMethods(opts?: {
 
   if (!supportsTerminalAuth) return []
 
-  const method: any = {
+  const method: AuthMethod & {
+    type: 'terminal'
+    args: string[]
+    env: Record<string, string>
+  } = {
     id: PI_SETUP_METHOD_ID,
     name: 'Launch pi in the terminal',
     description: 'Start pi in an interactive terminal to configure API keys or login',
@@ -48,7 +52,7 @@ export function getAuthMethods(opts?: {
     }
   }
 
-  return [method as AuthMethod]
+  return [method]
 }
 
 function terminalAuthLaunchSpec(): { command: string; args: string[] } {

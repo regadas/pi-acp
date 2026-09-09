@@ -442,9 +442,9 @@ export class PiAcpAgent implements ACPAgent {
           sessionPath: stored.sessionFile,
           piCommand: process.env.PI_ACP_PI_COMMAND
         })
-      } catch (e: any) {
-        if (e?.name === 'PiRpcSpawnError') {
-          throw RequestError.internalError({ code: e?.code }, String(e?.message ?? e))
+      } catch (e: unknown) {
+        if (e instanceof Error && e.name === 'PiRpcSpawnError') {
+          throw RequestError.internalError({ code: (e as Error & { code?: string }).code }, e.message)
         }
         throw e
       }
@@ -463,8 +463,10 @@ export class PiAcpAgent implements ACPAgent {
       // actually be running the requested session. A pi that silently started
       // a different or fresh session (e.g. the stored file vanished) would
       // otherwise be installed under the wrong ACP sessionId.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
       let state: any = null
       try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
         state = (await proc.getState()) as any
       } catch (e) {
         this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
@@ -627,7 +629,9 @@ export class PiAcpAgent implements ACPAgent {
     let configOptions: Awaited<ReturnType<typeof getSessionConfiguration>>
     try {
       // Fetch state + models once (parallel) to reduce startup latency.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
       let state: any = null
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
       let availableModels: any = null
       let stateErr: unknown = null
       let availableModelsErr: unknown = null
@@ -636,6 +640,7 @@ export class PiAcpAgent implements ACPAgent {
         session.proc
           .getState()
           .then(s => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
             state = s as any
           })
           .catch(err => {
@@ -645,6 +650,7 @@ export class PiAcpAgent implements ACPAgent {
         session.proc
           .getAvailableModels()
           .then(m => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
             availableModels = m as any
           })
           .catch(err => {
@@ -1219,8 +1225,14 @@ function readNearestPackageJson(metaUrl: string): {
     for (let i = 0; i < 6; i++) {
       const p = join(dir, 'package.json')
       if (existsSync(p)) {
-        const json = JSON.parse(readFileSync(p, 'utf-8')) as any
-        return { name: json?.name, version: json?.version }
+        const json = JSON.parse(readFileSync(p, 'utf-8')) as {
+          name?: unknown
+          version?: unknown
+        } | null
+        return {
+          name: typeof json?.name === 'string' ? json.name : undefined,
+          version: typeof json?.version === 'string' ? json.version : undefined
+        }
       }
       dir = dirname(dir)
     }

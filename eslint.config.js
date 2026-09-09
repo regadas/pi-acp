@@ -21,11 +21,16 @@ export default [
   ...tseslint.configs.recommended,
 
   {
+    // Test doubles deliberately reach private seams. These two legacy parsers
+    // remain boundary-only exceptions; other production sites are line-scoped.
+    files: ['test/**/*.ts', 'src/acp/auth-required.ts', 'src/acp/pi-commands.ts'],
+    rules: { '@typescript-eslint/no-explicit-any': 'off' }
+  },
+
+  {
     rules: {
       // Keep console logs allowed for CLI adapter.
       'no-console': 'off',
-      // Temporary
-      '@typescript-eslint/no-explicit-any': 'off',
 
       // Common pattern in ACP handlers.
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }]

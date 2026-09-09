@@ -588,3 +588,109 @@ test(
     assert.ok(!agentMessageTexts(conn).includes('foreign text'))
   }
 )
+
+for (const late of [false, true]) {
+  test(`PiAcpSession: ${late ? 'late' : 'initial'} identical steering quarantines follow-up ownership`, async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+    proc.beforePromptAccepted = () => {
+      proc.emit({ type: 'agent_start' })
+      proc.emit({
+        type: 'queue_update',
+        steering: late ? [] : ['same'],
+        followUp: ['same']
+      })
+    }
+    const prompt = session.prompt('same')
+    const failed = assertInternalFailure(prompt, /steering text indistinguishable/)
+    if (late)
+      proc.emit({
+        type: 'queue_update',
+        steering: ['same'],
+        followUp: ['same']
+      })
+    // Installed pi removes steering before message_start; that removal must
+    // never erase evidence of the earlier collision.
+    proc.emit({ type: 'queue_update', steering: [], followUp: ['same'] })
+    proc.emit({
+      type: 'message_start',
+      message: { role: 'user', content: 'same' }
+    })
+    emitForeignTurnBoundEvents(proc)
+    proc.emit({
+      type: 'extension_ui_request',
+      id: 'foreign',
+      method: 'confirm',
+      title: 'Foreign?'
+    })
+    proc.emit({ type: 'agent_settled' })
+    await failed
+    assert.equal(turnBoundUpdateCount(conn), 0)
+    assert.equal(conn.permissionRequests.length, 0)
+    assert.deepEqual(proc.disposeOptions, [{ expected: false }])
+  })
+}
+
+for (const [timing, message, expanded] of [
+  ['during dispatch', 'same', 'same'],
+  ['during dispatch', '/template', 'expanded template'],
+  ['before dispatch', '/template', 'expanded template'],
+  ['before dispatch', '', '']
+]) {
+  test(`PiAcpSession: dequeued steering ${timing} cannot claim queued ${JSON.stringify(message)}`, async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+    const dequeueSteering = () => {
+      proc.emit({ type: 'queue_update', steering: [expanded], followUp: [] })
+      proc.emit({ type: 'queue_update', steering: [], followUp: [] })
+    }
+    if (timing === 'before dispatch') dequeueSteering()
+    proc.beforePromptAccepted = () => {
+      proc.emit({ type: 'agent_start' })
+      if (timing === 'during dispatch') dequeueSteering()
+      proc.emit({ type: 'queue_update', steering: [], followUp: [expanded] })
+    }
+    const prompt = session.prompt(message)
+    const failed = assertInternalFailure(prompt, /steering text indistinguishable/)
+    // Pi awaits extension handlers between dequeue and public message_start.
+    proc.emit({ type: 'message_start', message: { role: 'user', content: [{ type: 'text', text: expanded }] } })
+    emitForeignTurnBoundEvents(proc)
+    proc.emit({ type: 'extension_ui_request', id: 'delayed-steering', method: 'confirm', title: 'Foreign?' })
+    proc.emit({ type: 'agent_settled' })
+    await failed
+    assert.equal(turnBoundUpdateCount(conn), 0)
+    assert.equal(conn.permissionRequests.length, 0)
+    assert.deepEqual(proc.disposeOptions, [{ expected: false }])
+  })
+}
+
+test('PiAcpSession: steering evidence ends at settlement, not the next ACP dispatch', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+  const first = session.prompt('first')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'queue_update', steering: ['same'], followUp: [] })
+  proc.emit({ type: 'queue_update', steering: [], followUp: [] })
+  proc.emit({ type: 'message_start', message: { role: 'user', content: 'same' } })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await first, 'end_turn')
+
+  proc.beforePromptAccepted = () => {
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'queue_update', steering: [], followUp: ['same', 'same'] })
+  }
+  const second = session.prompt('same')
+  proc.emit({ type: 'queue_update', steering: [], followUp: ['same'] })
+  proc.emit({ type: 'message_start', message: { role: 'user', content: 'same' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'foreign duplicate' } })
+  proc.emit({ type: 'queue_update', steering: [], followUp: [] })
+  proc.emit({ type: 'message_start', message: { role: 'user', content: 'same' } })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'owned duplicate' } })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await second, 'end_turn')
+  assert.deepEqual(agentMessageTexts(conn), ['owned duplicate'])
+  assert.equal(proc.disposeCount, 0)
+})

@@ -60,7 +60,7 @@ async function readBounded(path: string, maxBytes: number, position = 0): Promis
   let handle
   try {
     handle = await open(path, 'r')
-    const buffer = Buffer.alloc(maxBytes)
+    const buffer = Buffer.allocUnsafe(maxBytes)
     const { bytesRead } = await handle.read(buffer, 0, maxBytes, position)
     return buffer.subarray(0, bytesRead).toString('utf8')
   } catch (error) {
@@ -194,8 +194,12 @@ function isNewer(candidate: SessionRecord, previous: SessionRecord): boolean {
   return timestampOrder > 0 || (timestampOrder === 0 && candidate.sessionFile.localeCompare(previous.sessionFile) > 0)
 }
 
-async function project(path: string, requestedId?: string): Promise<SessionRecord | null> {
-  const header = await validatedHeader(path, requestedId)
+async function project(
+  path: string,
+  requestedId?: string,
+  knownHeader?: { sessionId: string; cwd: string }
+): Promise<SessionRecord | null> {
+  const header = knownHeader ?? (await validatedHeader(path, requestedId))
   if (!header) return null
   let mtime: Date | null = null
   try {
@@ -313,9 +317,20 @@ export class SessionRepository {
       addStoredDiscoveryRoot(roots, stored, this.env, this.agentDir)
     }
     for (const root of roots) for (const file of await jsonlFiles(root)) paths.add(file)
-    const records: SessionRecord[] = []
+    // Filter identities, not records: a newer foreign duplicate must still win
+    // deduplication, rather than resurrecting an older cwd-scoped copy.
+    const headers = new Map<string, { sessionId: string; cwd: string }>()
+    const scopedIds = new Set<string>()
     for (const path of paths) {
-      const record = await project(path)
+      const header = await validatedHeader(path)
+      if (!header) continue
+      headers.set(path, header)
+      if (!cwd || sessionCwdsEquivalent(header.cwd, cwd)) scopedIds.add(header.sessionId)
+    }
+    const records: SessionRecord[] = []
+    for (const [path, header] of headers) {
+      if (!scopedIds.has(header.sessionId)) continue
+      const record = await project(path, undefined, header)
       if (record) records.push(record)
     }
     const byId = new Map<string, SessionRecord>()

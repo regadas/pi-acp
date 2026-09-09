@@ -400,3 +400,39 @@ test('PiAcpAgent: teardown during the restore state probe disposes the child, ne
     }
   )
 })
+
+test(
+  'SessionManager.create: newly created session directories are private; existing modes are unchanged',
+  { skip: process.platform === 'win32' },
+  async () => {
+    const { statSync, chmodSync, rmSync } = await import('node:fs')
+    const root = mkdtempSync(join(tmpdir(), 'pi-acp-private-sessions-'))
+    try {
+      await withEnv({ PI_ACP_DIR: join(root, 'acp') }, async () => {
+        for (const existing of [false, true]) {
+          const directory = join(root, existing ? 'existing' : 'new')
+          if (existing) {
+            mkdirSync(directory)
+            chmodSync(directory, 0o755)
+          }
+          const proc = new FakePiRpcProcess()
+          proc.state = {
+            sessionId: String(existing),
+            sessionFile: join(directory, 'session.jsonl')
+          }
+          await withMockSpawn(
+            async () => proc,
+            async () => {
+              const manager = new SessionManager()
+              await manager.create(baseParams() as any)
+              assert.equal(statSync(directory).mode & 0o777, existing ? 0o755 : 0o700)
+              manager.disposeAll()
+            }
+          )
+        }
+      })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+)

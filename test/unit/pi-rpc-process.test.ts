@@ -483,3 +483,122 @@ test('PiRpcProcess: an unresponsive but live child cannot hang requests or abort
   const termination = await withTimeout(terminationPromise, 2_000, 'silent fixture termination')
   assert.equal(termination.expected, false, 'a timeout quarantine is an unexpected fault')
 })
+
+test('PiRpcProcess: live child error retains termination ownership and kill escalation until close', async () => {
+  const mock = Object.assign(new MockChild(), {
+    pid: 12345,
+    exitCode: null,
+    signalCode: null
+  })
+  const proc = PiRpcProcess.fromChild(asChild(mock), { killGraceMs: 20 })
+  let terminated = false
+  const done = proc.whenTerminated().then(() => {
+    terminated = true
+  })
+  const events: PiRpcEvent[] = []
+  proc.onEvent(event => events.push(event))
+  mock.emit('error', Object.assign(new Error('kill EPERM'), { code: 'EPERM' }))
+  await tick()
+  assert.equal(terminated, false, 'error alone does not release the live writer')
+  mock.stdout.write('{"type":"agent_end"}\n')
+  await tick()
+  assert.deepEqual(
+    events.map(event => event.type),
+    ['agent_end']
+  )
+  proc.dispose()
+  mock.emit('error', new Error('SIGTERM failed'))
+  await sleep(50)
+  assert.deepEqual(mock.kills, ['SIGTERM', 'SIGKILL'])
+  assert.equal(terminated, false)
+  mock.emit('exit', null, 'SIGKILL')
+  mock.emit('close', null, 'SIGKILL')
+  await done
+})
+
+test('PiRpcProcess: error after proven exit still drains stdout before close', async () => {
+  const mock = Object.assign(new MockChild(), {
+    pid: 12345,
+    exitCode: 1,
+    signalCode: null
+  })
+  const proc = PiRpcProcess.fromChild(asChild(mock), { closeFallbackMs: 100 })
+  const order: string[] = []
+  proc.onEvent(event => order.push(event.type))
+  proc.onTermination(() => order.push('terminated'))
+  mock.emit('exit', 1, null)
+  mock.emit('error', new Error('late error'))
+  mock.stdout.write('{"type":"agent_end"}\n')
+  mock.emit('close', 1, null)
+  await tick()
+  assert.deepEqual(order, ['agent_end', 'terminated'])
+})
+
+for (const behavior of ['split-writes', 'garbage-then-event', 'stderr-flood', 'late-response']) {
+  test(`PiRpcProcess: ${behavior} fixture exercises real pipes`, async t => {
+    const child = spawnFixture(behavior)
+    const proc = PiRpcProcess.fromChild(child, {
+      requestTimeoutMs: behavior === 'late-response' ? 100 : 2_000,
+      killGraceMs: 50
+    })
+    const termination = new Promise<PiRpcTermination>(resolve => proc.onTermination(resolve))
+    t.after(() => cleanupFixture(child, proc, termination, behavior))
+    if (behavior === 'late-response') {
+      await assert.rejects(proc.getState(), PiRpcRequestTimeoutError)
+      await withTimeout(termination, 2_000, behavior)
+      await assert.rejects(proc.getState(), PiRpcClosedError)
+    } else if (behavior === 'stderr-flood') {
+      await proc.getState()
+      assert.ok(proc.stderrTail().length <= 8192)
+      // stdout and stderr are independent OS pipes; wait for the observed tail.
+      const deadline = Date.now() + 2_000
+      while (!proc.stderrTail().endsWith('TAIL-END\n')) {
+        assert.ok(Date.now() < deadline, 'stderr tail deadline')
+        await tick()
+      }
+    } else {
+      const event = await withTimeout(new Promise<PiRpcEvent>(resolve => proc.onEvent(resolve)), 2_000, behavior)
+      assert.equal(event.type, 'session_info_changed')
+      if (behavior === 'split-writes') assert.equal(event.text, 'héllo 🌍 world')
+      else assert.equal(event.ok, true)
+    }
+  })
+}
+
+test('PiRpcProcess: shared wrappers preserve errors, void returns and specialized response hooks', async () => {
+  const mock = new MockChild()
+  const proc = PiRpcProcess.fromChild(asChild(mock))
+  const lines = collectStdin(mock)
+  async function respond(run: () => Promise<unknown>, success: boolean, data: unknown, error?: string) {
+    const result = run()
+    const command = JSON.parse(lines.at(-1)!)
+    mock.stdout.write(
+      JSON.stringify({ type: 'response', id: command.id, command: command.type, success, data, error }) + '\n'
+    )
+    return result
+  }
+  assert.deepEqual(await respond(() => proc.getState(), true, { isStreaming: false }), { isStreaming: false })
+  assert.equal(await respond(() => proc.abort(), true, { ignored: true }), undefined)
+  await assert.rejects(
+    respond(() => proc.getCommands(), false, { detail: 'failed' }),
+    /pi get_commands failed: {"detail":"failed"}/
+  )
+  await assert.rejects(
+    respond(() => proc.getAvailableThinkingLevels(), false, null, 'Unknown command'),
+    (error: unknown) => {
+      assert.equal((error as Error & { unsupportedCommand?: boolean }).unsupportedCommand, true)
+      return true
+    }
+  )
+  assert.deepEqual(await respond(() => proc.exportHtml(), true, { path: 123 }), { path: '123' })
+  const order: string[] = []
+  proc.onEvent(event => order.push(event.type))
+  const entries = proc.getEntries(() => order.push('snapshot'))
+  const command = JSON.parse(lines.at(-1)!)
+  mock.stdout.write(
+    JSON.stringify({ type: 'response', id: command.id, command: 'get_entries', success: true, data: { entries: [] } }) +
+      '\n{"type":"agent_start"}\n'
+  )
+  await entries
+  assert.deepEqual(order, ['snapshot', 'agent_start'])
+})

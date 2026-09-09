@@ -216,3 +216,48 @@ test('SessionStore: concurrent multi-process upserts lose no records and keep th
   assert.match(shared!.cwd, /^\/tmp\/tag-\d$/)
   assert.deepEqual(tempFilesUnder(`${mapPath}.d`), [], 'no temp files remain after concurrent writes')
 })
+
+test('SessionStore.list: corruption and legacy shape checks match get, including filename identity', async t => {
+  const { dir, mapPath, store } = makeStore()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  for (const raw of ['{broken', '{"version":1,"sessions":[]}', '{"version":1,"sessions":{"s1":{}}}']) {
+    writeFileSync(mapPath, raw)
+    assert.throws(() => store.get('s1'), SessionStoreCorruptError)
+    await assert.rejects(store.list(), SessionStoreCorruptError)
+  }
+  rmSync(mapPath)
+  store.upsert({
+    sessionId: 's1',
+    cwd: dir,
+    sessionFile: join(dir, 's1.jsonl')
+  })
+  const path = join(`${mapPath}.d`, readdirSync(`${mapPath}.d`)[0])
+  for (const raw of ['{broken', '{"version":99}', '{"version":1,"deleted":true,"sessionId":"other"}']) {
+    writeFileSync(path, raw)
+    await assert.rejects(store.list(), error => {
+      assert.ok(error instanceof SessionStoreCorruptError)
+      assert.match(error.message, /Repair or delete the file manually/)
+      return true
+    })
+  }
+})
+
+test('SessionStore.list: tombstones hide legacy entries and long IDs retain hashed filename validation', async t => {
+  const { dir, mapPath, store } = makeStore()
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const legacy = {
+    sessionId: 'legacy',
+    cwd: dir,
+    sessionFile: join(dir, 'legacy.jsonl'),
+    updatedAt: new Date().toISOString()
+  }
+  writeFileSync(mapPath, JSON.stringify({ version: 1, sessions: { legacy } }))
+  assert.deepEqual(await store.list(), [legacy])
+  store.delete('legacy')
+  const sessionId = 'long'.repeat(100)
+  store.upsert({ sessionId, cwd: dir, sessionFile: join(dir, 'long.jsonl') })
+  assert.deepEqual(
+    (await store.list()).map(record => record.sessionId),
+    [sessionId]
+  )
+})

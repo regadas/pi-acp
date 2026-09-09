@@ -19,7 +19,7 @@ if (process.argv.includes('--terminal-login')) {
     windowsVerbatimArguments: invocation.windowsVerbatimArguments
   })
 
-  if ((res as any).error && (res as any).error.code === 'ENOENT') {
+  if ((res.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
     process.stderr.write(
       `pi-acp: could not start pi (command not found: ${cmd}). Install it via \`npm install -g @earendil-works/pi-coding-agent\` or ensure \`pi\` is on your PATH.\n`
     )
@@ -32,7 +32,7 @@ if (process.argv.includes('--terminal-login')) {
 const input = new WritableStream<Uint8Array>({
   write(chunk) {
     return new Promise<void>(resolve => {
-      if ((process.stdout as any).destroyed || !process.stdout.writable) return resolve()
+      if (process.stdout.destroyed || !process.stdout.writable) return resolve()
 
       try {
         process.stdout.write(chunk, err => {

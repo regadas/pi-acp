@@ -98,7 +98,9 @@ type ThoughtLevelState = {
   current: ThinkingLevel
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
 async function getThoughtLevelState(proc: PiRpcProcess, pre?: { state?: any | null }): Promise<ThoughtLevelState> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
   const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
 
   const available = await availableThinkingLevels(proc, state)
@@ -117,6 +119,7 @@ async function getThoughtLevelState(proc: PiRpcProcess, pre?: { state?: any | nu
 
 export async function getSessionConfiguration(
   proc: PiRpcProcess,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
   pre?: { state?: any | null; availableModels?: any | null }
 ): Promise<SessionConfigOption[]> {
   // Resolve each health probe once. Missing prefetches are real RPC calls and
@@ -181,6 +184,7 @@ function buildConfigOptions(state: {
 
 async function getModelState(
   proc: PiRpcProcess,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
   pre?: { state?: any | null; availableModels?: any | null }
 ): Promise<{
   availableModels: AdvertisedModel[]
@@ -191,8 +195,10 @@ async function getModelState(
 
   const data = Object.prototype.hasOwnProperty.call(pre ?? {}, 'availableModels')
     ? pre?.availableModels
-    : ((await proc.getAvailableModels()) as any)
+    : // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
+      ((await proc.getAvailableModels()) as any)
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
   const models: any[] = Array.isArray(data?.models) ? data.models : []
   availableModels = models
     .map(m => {
@@ -212,11 +218,14 @@ async function getModelState(
   // Ask pi what model is currently active.
   let currentModelId: string | null = null
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
   const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
 
   const model = state?.model
   if (model && typeof model === 'object') {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const provider = String((model as any).provider ?? '').trim()
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const id = String((model as any).id ?? '').trim()
     if (provider && id) currentModelId = `${provider}/${id}`
   }
@@ -245,6 +254,7 @@ export async function emitConfigOptionsUpdate(
   sink: SessionUpdateSink,
   sessionId: string,
   proc: PiRpcProcess,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
   pre?: { state?: any | null }
 ): Promise<SessionConfigOption[]> {
   const configOptions = await getSessionConfiguration(proc, pre)
@@ -281,7 +291,9 @@ export async function applySessionModel(proc: PiRpcProcess, requestedModelId: st
   }
 
   if (!provider) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const data = (await proc.getAvailableModels()) as any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const models: any[] = Array.isArray(data?.models) ? data.models : []
     const found = models.find(m => String(m?.id) === modelId)
     if (found) {
