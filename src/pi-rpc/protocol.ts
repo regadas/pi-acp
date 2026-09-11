@@ -88,6 +88,15 @@ export function decodePiRecord(value: unknown): DecodedPiRecord | null {
       error: typeof record.error === 'string' ? record.error : undefined
     }
   }
+  if (record.type === 'extension_error') {
+    if (
+      typeof record.extensionPath !== 'string' ||
+      typeof record.event !== 'string' ||
+      typeof record.error !== 'string'
+    )
+      return null
+    return { type: 'extension_error', extensionPath: record.extensionPath, event: record.event, error: record.error }
+  }
   if (typeof record.type !== 'string') return null
   if (!KNOWN_EVENTS.has(record.type)) return { type: 'ignored', originalType: record.type }
   return record as PiRpcEvent

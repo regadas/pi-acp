@@ -47,13 +47,19 @@ test('PiAcpAgent: /autocompact rejects an unknown argument without mutating the 
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess() as any
 
-  let stateReads = 0
+  const effects: string[] = []
   proc.getState = async () => {
-    stateReads += 1
+    effects.push('state')
     return { autoCompactionEnabled: false }
+  }
+  const getAvailableModels = proc.getAvailableModels.bind(proc)
+  proc.getAvailableModels = async () => {
+    effects.push('models')
+    return getAvailableModels()
   }
   const applied: boolean[] = []
   proc.setAutoCompaction = async (enabled: boolean) => {
+    effects.push(`set:${enabled}`)
     applied.push(enabled)
   }
 
@@ -68,7 +74,7 @@ test('PiAcpAgent: /autocompact rejects an unknown argument without mutating the 
   assert.equal(res.stopReason, 'end_turn')
   assert.equal(proc.prompts.length, 0)
   assert.deepEqual(applied, [], 'a typo must never flip the setting')
-  assert.equal(stateReads, 0, 'an unknown argument is not a toggle')
+  assert.deepEqual(effects, ['state', 'models'], 'only completion reconciliation reads state; no toggle mutation')
   assert.match(lastAgentMessageText(conn), /Unknown argument: onn\. Usage: \/autocompact on \| off \| toggle/)
 })
 
@@ -76,13 +82,19 @@ test('PiAcpAgent: /autocompact applies explicit aliases and toggles the current 
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess() as any
 
-  let stateReads = 0
+  const effects: string[] = []
   proc.getState = async () => {
-    stateReads += 1
+    effects.push('state')
     return { autoCompactionEnabled: true }
+  }
+  const getAvailableModels = proc.getAvailableModels.bind(proc)
+  proc.getAvailableModels = async () => {
+    effects.push('models')
+    return getAvailableModels()
   }
   const applied: boolean[] = []
   proc.setAutoCompaction = async (enabled: boolean) => {
+    effects.push(`set:${enabled}`)
     applied.push(enabled)
   }
 
@@ -93,10 +105,18 @@ test('PiAcpAgent: /autocompact applies explicit aliases and toggles the current 
 
   assert.equal((await prompt('/autocompact disabled')).stopReason, 'end_turn')
   assert.equal((await prompt('/autocompact ENABLE')).stopReason, 'end_turn')
-  assert.equal(stateReads, 0, 'explicit aliases never need pi state')
+  assert.deepEqual(
+    effects,
+    ['set:false', 'state', 'models', 'set:true', 'state', 'models'],
+    'aliases mutate before the completion metadata probes'
+  )
 
   assert.equal((await prompt('/autocompact')).stopReason, 'end_turn')
-  assert.equal(stateReads, 1, 'only the bare toggle reads pi state')
+  assert.deepEqual(
+    effects.slice(6),
+    ['state', 'set:false', 'state', 'models'],
+    'the bare toggle reads state before mutation, then reconciles configuration'
+  )
 
   assert.deepEqual(applied, [false, true, false])
 })

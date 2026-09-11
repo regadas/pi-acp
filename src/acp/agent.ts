@@ -1078,7 +1078,7 @@ export class PiAcpAgent implements ACPAgent {
     try {
       const pi = await session.proc.getCommands()
       const { commands } = toAvailableCommandsFromPiGetCommands(pi)
-      availableCommands = mergeCommands(commands, builtinAvailableCommands())
+      availableCommands = mergeCommands(builtinAvailableCommands(), commands)
     } catch {
       availableCommands = builtinAvailableCommands()
     }

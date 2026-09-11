@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import type { SessionNotification } from '@agentclientprotocol/sdk'
+import { getSessionConfiguration } from '../../src/acp/session-config.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
@@ -136,6 +137,9 @@ async function runFixture(fixture: GoldenFixture): Promise<{ pi: PiEffect[]; acp
     fileCommands: [],
     supportsTerminalOutputMeta: fixture.session.supportsTerminalOutputMeta ?? false
   })
+
+  // Production session/new seeds the configuration returned in its response.
+  session.seedSessionConfiguration(await getSessionConfiguration(proc as unknown as PiRpcProcess))
 
   const settledPromptIds = new Set<string>()
   const seenPromptIds = new Set<string>()

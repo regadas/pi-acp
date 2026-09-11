@@ -196,3 +196,68 @@ test('PiAcpSession: shutdown still settles when abort rejects (e.g. abort timeou
   await shutdown
   assert.equal(proc.abortCount, 1)
 })
+
+for (const history of ['none', 'idle-cancel', 'active-cancel', 'intervening-success']) {
+  test(`PiAcpSession: fresh parked and queued work rejects death after ${history}`, async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+    if (history === 'idle-cancel') await session.cancel()
+    if (history === 'active-cancel' || history === 'intervening-success') {
+      const old = session.prompt('old')
+      proc.emit({ type: 'agent_start' })
+      await session.cancel()
+      proc.emit({ type: 'agent_settled' })
+      assert.equal(await old, 'cancelled')
+      assert.equal(proc.disposed, false)
+    }
+    if (history === 'intervening-success') {
+      proc.state = { isStreaming: false }
+      assert.equal(await session.prompt('success'), 'end_turn')
+    }
+    proc.emit({ type: 'agent_start' })
+    let ran = false
+    const parked = session.runCommand(async () => {
+      ran = true
+      return 'unexpected'
+    })
+    const queuedCommand = session.runCommand(async () => {
+      ran = true
+      return 'unexpected'
+    })
+    const queuedPrompt = session.prompt('queued')
+    const resultsPromise = Promise.allSettled([parked, queuedCommand, queuedPrompt])
+    await tick()
+    assert.equal(ran, false)
+    proc.emitTermination({ code: 7, stderrTail: 'fatal audit crash' })
+    for (const result of await resultsPromise) {
+      assert.equal(result.status, 'rejected')
+      if (result.status === 'rejected') {
+        assert.equal(result.reason.code, -32603)
+        assert.match(result.reason.message, /code=7.*fatal audit crash/s)
+      }
+    }
+    assert.equal(ran, false)
+    session.dispose()
+  })
+}
+
+test('PiAcpSession: current command cancellation still dominates a subsequent unexpected exit', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+  let release!: () => void
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const command = session.runCommand(async () => {
+    await gate
+    return 'late'
+  })
+  await tick()
+  await session.cancel()
+  proc.emitTermination({ code: 7 })
+  release()
+  assert.equal(await command, null)
+  session.dispose()
+})

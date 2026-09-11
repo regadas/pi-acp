@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { SessionUpdate } from '@agentclientprotocol/sdk'
 import { PiAcpSession } from '../../src/acp/session.js'
+import { decodePiRecord } from '../../src/pi-rpc/protocol.js'
 import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -1865,4 +1866,87 @@ test('PiAcpSession: omits only zero-length assistant chunks including extension 
     { id: 'notify-5', cancelled: true },
     { id: 'notify-2', cancelled: true }
   ])
+})
+
+test('PiAcpSession: extension error before successful prompt acknowledgment stays visible and ordered without an agent run', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.state = { isStreaming: false }
+  proc.beforePromptAccepted = () => {
+    const record = decodePiRecord({
+      type: 'extension_error',
+      extensionPath: 'command:deploy',
+      event: 'command',
+      error: 'deployment failed'
+    })
+    assert.ok(record)
+    proc.emit(record)
+  }
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: TEST_CWD,
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn)
+  })
+  let release!: () => void
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const deliver = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async msg => {
+    if (msg.update.sessionUpdate === 'agent_message_chunk') await gate
+    await deliver(msg)
+  }
+  let settled = false
+  const prompt = session.prompt('/deploy').then(result => {
+    settled = true
+    return result
+  })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(settled, false)
+  release()
+  assert.equal(await prompt, 'end_turn', 'uncorrelated diagnostics do not reject the prompt RPC')
+  assert.ok(
+    conn.updates.some(
+      ({ update }) =>
+        update.sessionUpdate === 'agent_message_chunk' &&
+        update.content.type === 'text' &&
+        /command:deploy, command.*deployment failed/.test(update.content.text)
+    )
+  )
+  session.dispose()
+})
+
+test('PiAcpSession: autonomous extension errors are deferred context, not attributed to a parked command', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.state = { isStreaming: false }
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: TEST_CWD,
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn)
+  })
+  proc.emit({ type: 'agent_start' })
+  const command = session.runCommand(async () => 'done')
+  proc.emit({ type: 'extension_error', extensionPath: 'background.ts', event: 'agent_end', error: 'background failed' })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(conn.updates.length, 0)
+  await session.cancel()
+  assert.equal(await command, null)
+  assert.equal(
+    conn.updates.some(({ update }) => update.sessionUpdate === 'agent_message_chunk'),
+    false
+  )
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await session.prompt('next'), 'end_turn')
+  const diagnostics = conn.updates.filter(
+    ({ update }) =>
+      update.sessionUpdate === 'agent_message_chunk' &&
+      update.content.type === 'text' &&
+      update.content.text.includes('background failed')
+  )
+  assert.equal(diagnostics.length, 1)
+  assert.match(JSON.stringify(diagnostics), /Deferred pi extension error/)
+  session.dispose()
 })

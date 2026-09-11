@@ -347,7 +347,7 @@ export class PiAcpSession {
 
     // One classification for every kind of work that can no longer finish:
     // the running command, queued requests, and a parked admission.
-    const failure = this.terminalFailure(termination)
+    const failure = this.terminalFailure(termination, this.activeCommand?.cancelled)
 
     // A command already past admission must be marked *before* any slot or
     // queue state is handed on: it may be sitting on an await inside its body
@@ -395,7 +395,7 @@ export class PiAcpSession {
    */
   private commandTerminalFailure(command: ActiveCommand): Error | null {
     if (command.terminalFailure) return command.terminalFailure
-    const failure = this.terminalFailure(this.procTermination)
+    const failure = this.terminalFailure(this.procTermination, command.cancelled)
     if (failure) command.terminalFailure = failure
     return failure
   }
@@ -433,8 +433,8 @@ export class PiAcpSession {
    * adapter-driven teardown). One classification for queued work and for a
    * command parked on the out-of-band admission gate.
    */
-  private terminalFailure(termination: PiRpcTermination | null): Error | null {
-    if (this.cancelRequested) return null
+  private terminalFailure(termination: PiRpcTermination | null, cancelled = false): Error | null {
+    if (cancelled || termination?.expected || this.closing || this.disposalExpected) return null
     if (termination) return this.toTurnFailure(terminationError(termination))
 
     // Fault quarantine (`dispose({ expected: false })`) kills the channel
@@ -466,7 +466,7 @@ export class PiAcpSession {
     // (`expected: false`, e.g. lifecycle ambiguity or a timed-out RPC) rejects
     // the work it kills instead of reporting a benign cancellation for a
     // request pi never ran. An expected disposal keeps cancellation semantics.
-    const failure = this.terminalFailure(null)
+    const failure = this.terminalFailure(null, this.activeCommand?.cancelled)
     this.failActiveCommand(failure)
     // A held dispatch must never fire into a disposed channel.
     this.clearDeferredDispatch()
@@ -692,13 +692,6 @@ export class PiAcpSession {
       return null
     }
 
-    // This command is now proven admitted, un-cancelled, and on a live channel,
-    // so it is safe to clear a cancellation that predates it: an idle
-    // `session/cancel` must not later classify this command's own crash as a
-    // benign cancellation. A cancellation that landed while it waited is
-    // preserved by the checks above and never reaches this line.
-    this.cancelRequested = false
-
     // A terminal failure is as final as a cancellation for publication: nothing
     // computed against a dead or quarantined channel may reach the client.
     const settled = () => command.cancelled || Boolean(this.commandTerminalFailure(command))
@@ -710,7 +703,14 @@ export class PiAcpSession {
 
     const finishAdapterPromptTurn = this.beginAdapterPromptTurn()
     try {
-      const result = await run(ctx)
+      const result = await (async () => {
+        try {
+          return await run(ctx)
+        } finally {
+          // Completed pi work can persist model changes even when its adapter result is cancelled.
+          await this.syncSessionConfiguration(undefined, undefined, () => this.isClosing()).catch(() => {})
+        }
+      })()
       // Termination can land while the body ran: its result was computed against
       // a child that is gone, so it must not be returned as a success.
       const failure = this.commandTerminalFailure(command)
@@ -1171,14 +1171,19 @@ export class PiAcpSession {
     await this.syncSessionConfiguration(undefined, level).catch(() => {})
   }
 
-  syncSessionConfiguration(pre?: { state?: unknown }, expectedThoughtLevel?: string): Promise<SessionConfigOption[]> {
+  syncSessionConfiguration(
+    pre?: { state?: unknown },
+    expectedThoughtLevel?: string,
+    isCancelled?: () => boolean
+  ): Promise<SessionConfigOption[]> {
     // Captured at invocation rather than inside the queued callback: a probe
     // requested before an ACP mutation must be discarded even when it only
     // starts (and therefore reads pi) after that mutation bumped the epoch.
     // Publishing such an answer would resurrect the pre-mutation configuration.
     const epoch = this.configurationEpoch
+    const isStale = () => this.isUnavailable() || this.configurationEpoch !== epoch || Boolean(isCancelled?.())
     const operation = this.configurationSyncTail.then(async () => {
-      if (this.disposed || this.configurationEpoch !== epoch) return this.publishedConfigOptions
+      if (isStale()) return this.publishedConfigOptions
       if (
         expectedThoughtLevel !== undefined &&
         this.publishedThoughtLevel === expectedThoughtLevel &&
@@ -1188,15 +1193,18 @@ export class PiAcpSession {
       }
 
       const configOptions = await getSessionConfiguration(this.proc, pre)
-      if (this.disposed || this.configurationEpoch !== epoch) return this.publishedConfigOptions
+      if (isStale()) return this.publishedConfigOptions
       const fingerprint = JSON.stringify(configOptions)
 
       if (this.publishedConfigFingerprint !== fingerprint) {
-        await this.enqueueUpdate({
-          sessionUpdate: 'config_option_update',
-          configOptions
-        })
-        if (this.configurationEpoch !== epoch) return this.publishedConfigOptions
+        await this.enqueueUpdate(
+          {
+            sessionUpdate: 'config_option_update',
+            configOptions
+          },
+          isStale
+        )
+        if (isStale()) return this.publishedConfigOptions
         // A sync's own publication is not an ACP mutation: it must not
         // invalidate probes that were already requested by later pi events.
         this.applyPublishedConfiguration(configOptions)
@@ -1561,6 +1569,10 @@ export class PiAcpSession {
 
     void (async () => {
       try {
+        if (turn.promptDispatched) {
+          // Cancelling a live owned run does not undo its settlement hooks' model changes.
+          await this.syncSessionConfiguration(undefined, undefined, () => this.isClosing()).catch(() => {})
+        }
         await this.flushEmits()
         if (turn.promptDispatched) await turn.beforeRelease?.()
       } catch {
@@ -1575,7 +1587,7 @@ export class PiAcpSession {
     })()
   }
 
-  private failTurn(turn: PendingTurn, err: unknown): void {
+  private failTurn(turn: PendingTurn, err: unknown, piSettled = false): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
     this.terminalizeToolCalls()
@@ -1585,46 +1597,51 @@ export class PiAcpSession {
     // concurrent prompts queue rather than leapfrog it. Once that first flush
     // completes, JS run-to-completion makes the queue drain + pendingTurn clear
     // atomic with respect to new prompt requests.
-    void this.flushEmits().finally(() => {
-      const cancelled = this.cancelRequested
-      const queued = this.turnQueue.splice(0, this.turnQueue.length)
-      this.pendingTurn = null
+    const reconcile = piSettled
+      ? this.syncSessionConfiguration(undefined, undefined, () => this.isClosing()).catch(() => {})
+      : Promise.resolve()
+    void reconcile
+      .then(() => this.flushEmits())
+      .finally(() => {
+        const cancelled = this.cancelRequested
+        const queued = this.turnQueue.splice(0, this.turnQueue.length)
+        this.pendingTurn = null
 
-      // Queue notifications may have been appended while the first flush was
-      // blocked. Capture and flush them after closing the queue, before settling
-      // either the failed request or any drained queued requests.
-      void this.flushEmits().finally(() => {
-        const failQueued = (error: unknown) => {
-          for (const entry of queued) {
-            if (entry.kind === 'prompt') entry.reject(error)
-            else entry.fail(error)
+        // Queue notifications may have been appended while the first flush was
+        // blocked. Capture and flush them after closing the queue, before settling
+        // either the failed request or any drained queued requests.
+        void this.flushEmits().finally(() => {
+          const failQueued = (error: unknown) => {
+            for (const entry of queued) {
+              if (entry.kind === 'prompt') entry.reject(error)
+              else entry.fail(error)
+            }
           }
-        }
 
-        if (cancelled) {
-          // ACP cancellation semantics dominate all underlying failures,
-          // including auth-looking stderr from a process being torn down.
-          turn.resolve('cancelled')
-          this.settleCancelledQueue(queued)
-        } else {
-          // Non-auth, non-cancel failures must reject the ACP request rather
-          // than masquerade as a successful end_turn.
-          const failure = this.toTurnFailure(err)
-          turn.reject(failure)
-          failQueued(failure)
-        }
+          if (cancelled) {
+            // ACP cancellation semantics dominate all underlying failures,
+            // including auth-looking stderr from a process being torn down.
+            turn.resolve('cancelled')
+            this.settleCancelledQueue(queued)
+          } else {
+            // Non-auth, non-cancel failures must reject the ACP request rather
+            // than masquerade as a successful end_turn.
+            const failure = this.toTurnFailure(err)
+            turn.reject(failure)
+            failQueued(failure)
+          }
 
-        // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
-        // new prompt can start after the atomic queue close above; in that case
-        // its own running metadata is authoritative and must not be overwritten.
-        if (!this.isBusy()) {
-          this.emit({
-            sessionUpdate: 'session_info_update',
-            _meta: { piAcp: { queueDepth: 0, running: false } }
-          })
-        }
+          // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
+          // new prompt can start after the atomic queue close above; in that case
+          // its own running metadata is authoritative and must not be overwritten.
+          if (!this.isBusy()) {
+            this.emit({
+              sessionUpdate: 'session_info_update',
+              _meta: { piAcp: { queueDepth: 0, running: false } }
+            })
+          }
+        })
       })
-    })
   }
 
   isUnavailable(): boolean {
@@ -1806,6 +1823,31 @@ export class PiAcpSession {
           ? () => command.cancelled || Boolean(this.commandTerminalFailure(command))
           : undefined
         void this.syncSessionInfo(name, isCancelled).catch(() => {})
+        break
+      }
+
+      case 'extension_error': {
+        // Diagnostics have no request ID. Keep unowned errors as explicitly
+        // deferred context, never as a failure of whichever request is open.
+        const owned =
+          (ownsPiTurn && !this.cancelRequested) ||
+          (this.activeAdapterPromptTurns > 0 &&
+            !this.activeCommand?.cancelled &&
+            !this.piBusyOutOfBand &&
+            !this.lifecycleAmbiguity)
+        const blocks: TranslatedUserBlock[] = [
+          {
+            kind: 'text',
+            text: `${owned ? 'Pi extension error' : 'Deferred pi extension error'} (${ev.extensionPath}, ${ev.event}): ${ev.error}`
+          }
+        ]
+        if (owned) this.emitCustomMessageBlocks(blocks)
+        else
+          this.pendingCustomMessages.push({
+            blocks,
+            identity: JSON.stringify(ev),
+            sequence: ++this.customMessageSequence
+          })
         break
       }
 
@@ -2339,7 +2381,7 @@ export class PiAcpSession {
         // retry, or queued continuation remains. This is the safe boundary to
         // resolve (or fail) the ACP `session/prompt`.
         if (this.turnFailure && !this.cancelRequested) {
-          this.failTurn(activeTurn, this.turnFailure)
+          this.failTurn(activeTurn, this.turnFailure, true)
         } else {
           this.completeTurn(activeTurn)
         }

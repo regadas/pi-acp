@@ -26,3 +26,20 @@ test('promptToPiMessage rejects malformed and unsupported binary content before 
   )
   assert.throws(() => promptToPiMessage([{ type: 'audio', mimeType: 'audio/wav', data: 'AA==' }] as any), /Audio/)
 })
+
+test('promptToPiMessage delimits resource links without separating ordinary text chunks', () => {
+  assert.equal(
+    promptToPiMessage([
+      { type: 'resource_link', name: 'a', uri: 'file:///tmp/a.txt' },
+      { type: 'text', text: 'Summarize this file.' }
+    ]).message,
+    '\n[Context] file:///tmp/a.txt\nSummarize this file.'
+  )
+  assert.equal(
+    promptToPiMessage([
+      { type: 'text', text: 'sum' },
+      { type: 'text', text: 'marize' }
+    ]).message,
+    'summarize'
+  )
+})

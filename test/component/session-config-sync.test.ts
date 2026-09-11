@@ -372,3 +372,352 @@ test('PiAcpSession: a sync invoked while another is publishing still reports new
     ['medium', 'high']
   )
 })
+
+for (const boundary of ['handled', 'agent-settled', 'failed-agent-settled', 'compact', 'failed-compact']) {
+  for (const change of ['same-thinking', 'unchanged', 'thinking-event']) {
+    test(`PiAcpSession: ${boundary} reconciles ${change} before releasing the FIFO`, async () => {
+      const conn = new FakeAgentSideConnection()
+      const proc = new FakePiRpcProcess()
+      const model = (id: string) => ({ provider: 'test', id, reasoning: true })
+      proc.state = { isStreaming: false, thinkingLevel: 'medium', model: model('A') }
+      proc.getAvailableModels = async () => ({ models: [model('A'), model('B')] })
+      proc.availableThinkingLevels = ['off', 'medium', 'high']
+      const session = makeSession(conn, proc)
+      const agent = new PiAcpAgent(asAgentConn(conn))
+      ;(agent as unknown as { sessions: FakeSessions }).sessions = new FakeSessions(session)
+      await session.syncSessionConfiguration()
+      const switchModel = () => {
+        if (change !== 'unchanged') proc.state = { ...proc.state, model: model('B') }
+        if (change === 'thinking-event') {
+          proc.state = { ...proc.state, thinkingLevel: 'high' }
+          proc.emit({ type: 'thinking_level_changed', level: 'high' })
+        }
+      }
+      const options = () =>
+        configUpdates(conn).flatMap(update =>
+          update.sessionUpdate === 'config_option_update' ? [update.configOptions] : []
+        )
+      const expectedModel = change === 'unchanged' ? 'test/A' : 'test/B'
+      const compactStarted = deferred()
+      const compactRelease = deferred()
+      let first: Promise<unknown>
+      if (boundary.includes('compact')) {
+        Object.assign(proc, {
+          compact: async () => {
+            compactStarted.resolve()
+            await compactRelease.promise
+            switchModel() // pi awaits session_before_compact/session_compact extension hooks.
+            if (boundary === 'failed-compact') throw new Error('compaction failed')
+            return { summary: 'compacted' }
+          }
+        })
+        first = agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: '/compact' }] })
+      } else {
+        proc.beforePromptAccepted = switchModel
+        first = session.prompt('/switch')
+        if (boundary !== 'handled') {
+          proc.emit({ type: 'agent_start' })
+          if (boundary === 'failed-agent-settled')
+            proc.emit({
+              type: 'message_update',
+              assistantMessageEvent: { type: 'error', error: { errorMessage: 'run failed' } }
+            })
+          proc.emit({ type: 'agent_settled' })
+        }
+      }
+      const firstResult = first.then(
+        () => 'success',
+        () => 'failed'
+      )
+      if (boundary.includes('compact')) await compactStarted.promise
+      const later = session.runCommand(async () => {
+        assert.equal(
+          options()
+            .at(-1)
+            ?.find(option => option.id === 'model')?.currentValue,
+          expectedModel
+        )
+        return 'next'
+      })
+      const laterResult = later.then(
+        value => ({ value }),
+        error => ({ error })
+      )
+      compactRelease.resolve()
+      assert.equal(await firstResult, boundary.startsWith('failed-') ? 'failed' : 'success')
+      if (boundary === 'failed-agent-settled') assert.ok('error' in (await laterResult))
+      else assert.deepEqual(await laterResult, { value: 'next' })
+      assert.equal(
+        options()
+          .at(-1)
+          ?.find(option => option.id === 'model')?.currentValue,
+        expectedModel
+      )
+      assert.equal(
+        options().length,
+        change === 'unchanged' ? 1 : 2,
+        'unchanged fingerprint and thinking echoes must dedupe'
+      )
+      session.dispose()
+    })
+  }
+}
+
+test('PiAcpSession: completion config probe is best-effort and does not strand later work', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  proc.state = { isStreaming: false }
+  proc.getAvailableModels = async () => {
+    throw new Error('metadata unavailable')
+  }
+  const session = makeSession(conn, proc)
+  const prompt = session.prompt('handled')
+  const command = session.runCommand(async () => 'next')
+  assert.equal(await prompt, 'end_turn')
+  assert.equal(await command, 'next')
+  session.dispose()
+})
+
+test('PiAcpSession: a cancelled undispatched prompt does not probe autonomous configuration', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  let probes = 0
+  proc.getState = async () => {
+    probes++
+    return proc.state
+  }
+  const session = makeSession(conn, proc)
+  proc.emit({ type: 'agent_start' })
+  const prompt = session.prompt('held')
+  await session.cancel()
+  assert.equal(await prompt, 'cancelled')
+  assert.equal(probes, 0)
+  assert.equal(proc.prompts.length, 0)
+  session.dispose()
+})
+
+test('PiAcpSession: cancellation during a pending command completion RPC quarantines and suppresses config/result', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+  const gate = deferred()
+  let probed = false
+  proc.getState = async () => {
+    probed = true
+    return proc.pendingRequest(gate.promise.then(() => proc.state))
+  }
+  const command = session.runCommand(async () => 'late success')
+  await tick()
+  assert.equal(probed, true)
+  assert.equal(proc.hasPendingRequests(), true)
+  await session.cancel()
+  assert.equal(session.isUnavailable(), true, 'a real outstanding RPC triggers existing quarantine policy')
+  gate.resolve()
+  assert.equal(await command, null)
+  assert.equal(configUpdates(conn).length, 0)
+  session.dispose()
+})
+
+test('PiAcpSession: owned cancelled settlement publishes the effective model before usage and the next dispatch', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const model = (id: string) => ({ provider: 'test', id, reasoning: true })
+  proc.state = { isStreaming: true, thinkingLevel: 'medium', model: model('A') }
+  proc.getAvailableModels = async () => ({ models: [model('A'), model('B')] })
+  proc.availableThinkingLevels = ['off', 'medium']
+  const session = makeSession(conn, proc)
+  await session.syncSessionConfiguration()
+  const selector = () =>
+    configUpdates(conn).flatMap(update =>
+      update.sessionUpdate === 'config_option_update'
+        ? [update.configOptions.find(option => option.id === 'model')?.currentValue]
+        : []
+    )
+  const order: string[] = []
+  const first = session.prompt('active', [], async () => {
+    order.push(`usage:${selector().at(-1)}`)
+  })
+  proc.emit({ type: 'agent_start' })
+  await session.cancel()
+  assert.equal(proc.abortCount, 1)
+  assert.equal(session.isUnavailable(), false, 'owned cancellation must leave the child reusable')
+
+  // Pi awaits settlement hooks, including same-thinking model switches, before this event.
+  proc.state = { ...proc.state, isStreaming: false, model: model('B') }
+  proc.beforePromptAccepted = message => {
+    order.push(`dispatch:${message}:${selector().at(-1)}`)
+  }
+  const next = session.prompt('next')
+  proc.emit({ type: 'agent_settled' })
+  assert.deepEqual(await Promise.all([first, next]), ['cancelled', 'end_turn'])
+  assert.deepEqual(order, ['usage:test/B', 'dispatch:next:test/B'])
+  assert.deepEqual(selector(), ['test/A', 'test/B'], 'the next completion must dedupe the effective model')
+  session.dispose()
+})
+
+for (const completion of ['shutdown', 'abort-failure', 'preflight-cancel']) {
+  test(`PiAcpSession: ${completion} completion does not start a configuration probe`, async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+    let probes = 0
+    proc.getAvailableModels = async () => {
+      probes++
+      return { models: [] }
+    }
+    const acceptance = deferred()
+    if (completion === 'preflight-cancel') {
+      proc.prompt = async () => {
+        await acceptance.promise
+      }
+    }
+    const prompt = session.prompt('active')
+    if (completion !== 'preflight-cancel') proc.emit({ type: 'agent_start' })
+    if (completion === 'abort-failure')
+      proc.abort = async () => {
+        throw new Error('abort failed')
+      }
+    if (completion === 'shutdown') await session.shutdown()
+    else await session.cancel()
+    acceptance.resolve()
+    assert.equal(await prompt, 'cancelled')
+    assert.equal(probes, 0)
+    assert.equal(configUpdates(conn).length, 0)
+    session.dispose()
+  })
+}
+
+for (const boundary of ['prompt', 'failed-prompt', 'compact']) {
+  for (const cancelAt of ['probe', 'queued-publication', ...(boundary === 'compact' ? ['completed-output'] : [])]) {
+    test(
+      `PiAcpSession: ${boundary} cancellation at ${cancelAt} preserves reusable configuration`,
+      { timeout: 2000 },
+      async () => {
+        const conn = new FakeAgentSideConnection()
+        const proc = new FakePiRpcProcess()
+        const model = (id: string) => ({ provider: 'test', id, reasoning: true })
+        proc.state = { isStreaming: true, thinkingLevel: 'medium', model: model('A') }
+        proc.getAvailableModels = async () => ({ models: [model('A'), model('B')] })
+        proc.availableThinkingLevels = ['off', 'medium']
+        const session = makeSession(conn, proc)
+        const agent = new PiAcpAgent(asAgentConn(conn))
+        ;(agent as unknown as { sessions: FakeSessions }).sessions = new FakeSessions(session)
+        await session.syncSessionConfiguration()
+        const selector = () =>
+          configUpdates(conn).flatMap(update =>
+            update.sessionUpdate === 'config_option_update'
+              ? [update.configOptions.find(option => option.id === 'model')?.currentValue]
+              : []
+          )
+        const reached = deferred()
+        const release = deferred()
+        let gated = false
+        let probes = 0
+        const deliver = conn.sessionUpdate.bind(conn)
+        conn.sessionUpdate = async notification => {
+          const update = notification.update
+          if (
+            update.sessionUpdate === 'agent_message_chunk' &&
+            update.content.type === 'text' &&
+            (update.content.text === 'delivery barrier' ||
+              (cancelAt === 'completed-output' && update.content.text.startsWith('Compaction completed.')))
+          ) {
+            reached.resolve()
+            await release.promise
+          }
+          await deliver(notification)
+        }
+        proc.getState = async () => {
+          probes++
+          if (!gated) {
+            gated = true
+            if (cancelAt === 'probe') {
+              const response = proc.pendingRequest(release.promise.then(() => proc.state))
+              reached.resolve()
+              return response
+            }
+            if (cancelAt === 'queued-publication') {
+              void session.sendSessionUpdate({
+                sessionId: 's1',
+                update: {
+                  sessionUpdate: 'agent_message_chunk',
+                  content: { type: 'text', text: 'delivery barrier' }
+                }
+              })
+            }
+          }
+          return proc.pendingRequest(Promise.resolve(proc.state))
+        }
+        const switchModel = () => {
+          proc.state = { ...proc.state, isStreaming: false, model: model('B') }
+        }
+        let work: Promise<string>
+        if (boundary === 'compact') {
+          Object.assign(proc, {
+            compact: () =>
+              proc.pendingRequest(
+                Promise.resolve().then(() => {
+                  switchModel() // Awaited session_compact hook precedes the completed RPC response.
+                  return { summary: 'done' }
+                })
+              ),
+            getSessionStats: async () => ({ sessionId: 's1', totalMessages: 2 })
+          })
+          work = agent
+            .prompt({ sessionId: 's1', prompt: [{ type: 'text', text: '/compact' }] })
+            .then(result => result.stopReason)
+        } else {
+          work = session.prompt('active')
+          proc.emit({ type: 'agent_start' })
+          if (boundary === 'failed-prompt')
+            proc.emit({
+              type: 'message_update',
+              assistantMessageEvent: {
+                type: 'error',
+                error: { errorMessage: 'run failed' }
+              }
+            })
+          switchModel()
+          proc.emit({ type: 'agent_settled' })
+        }
+        // Attach a handler immediately: failed-turn regression must not create an unhandled rejection.
+        const outcome = work.then(
+          value => ({ value }),
+          error => ({ error })
+        )
+        try {
+          await reached.promise
+          if (cancelAt === 'queued-publication') await tick() // All answered RPC microtasks enqueue behind the barrier.
+          assert.equal(proc.hasPendingRequests(), cancelAt === 'probe')
+          if (cancelAt === 'completed-output')
+            assert.equal(probes, 0, 'compact RPC has completed before reconciliation starts')
+          assert.deepEqual(selector(), ['test/A'])
+          const cancelling = session.cancel()
+          const quarantined = boundary === 'compact' && cancelAt === 'probe'
+          assert.equal(session.isUnavailable(), quarantined)
+          assert.equal(proc.abortCount, 0, 'completion cancellation must not abort an unrelated run')
+          release.resolve()
+          await cancelling
+          assert.deepEqual(await outcome, { value: boundary === 'prompt' ? 'end_turn' : 'cancelled' })
+          if (quarantined) {
+            assert.deepEqual(selector(), ['test/A'], 'quarantined RPC results never publish')
+            assert.equal(await session.prompt('not sent'), 'cancelled')
+          } else {
+            let selectorAtDispatch: unknown
+            proc.beforePromptAccepted = () => {
+              selectorAtDispatch = selector().at(-1)
+            }
+            assert.equal(await session.prompt('next'), 'end_turn')
+            assert.equal(selectorAtDispatch, 'test/B', 'persistent model must precede the next fresh dispatch')
+            assert.deepEqual(selector(), ['test/A', 'test/B'], 'later completion dedupes')
+            assert.equal(session.isUnavailable(), false)
+          }
+        } finally {
+          release.resolve()
+          session.dispose()
+          await outcome
+        }
+      }
+    )
+  }
+}

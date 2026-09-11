@@ -25,3 +25,18 @@ test('wire decoder ignores malformed records and marks future events explicitly'
     originalType: 'future_event'
   })
 })
+
+test('wire decoder preserves validated extension diagnostics', () => {
+  const event = {
+    type: 'extension_error',
+    extensionPath: 'command:deploy',
+    event: 'command',
+    error: 'deployment failed'
+  }
+  assert.deepEqual(decodePiRecord(event), event)
+  for (const field of ['extensionPath', 'event', 'error']) {
+    for (const value of [undefined, null, 17, {}, []]) {
+      assert.equal(decodePiRecord({ ...event, [field]: value }), null)
+    }
+  }
+})

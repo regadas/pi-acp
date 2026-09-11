@@ -1,11 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
-import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
+import { PiAcpSession } from '../../src/acp/session.js'
+import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
 // Isolated workspace: repository-local .pi settings/commands must not leak in.
@@ -437,5 +438,52 @@ test('PiAcpAgent: loadSession replays an empty session (null leaf) without updat
     assert.deepEqual(replayKinds, [])
   } finally {
     PiRpcProcess.spawn = originalSpawn
+  }
+})
+
+test('PiAcpAgent: history tool locations match live read/write navigation with guarded missing/error targets', async () => {
+  writeFileSync(join(TEST_CWD, 'navigation.txt'), 'hello\n')
+  for (const [toolName, path, isError] of [
+    ['read', 'navigation.txt', false],
+    ['write', 'navigation.txt', false],
+    ['read', 'missing-navigation.txt', true],
+    ['write', '.', true]
+  ] as const) {
+    const args = { path }
+    const result = { content: [{ type: 'text', text: isError ? 'file error' : 'hello\n' }] }
+    const live = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = new PiAcpSession({
+      sessionId: 's1',
+      cwd: TEST_CWD,
+      proc: proc as unknown as PiRpcProcess,
+      conn: asAgentConn(live)
+    })
+    const prompt = session.prompt('file')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'tool_execution_start', toolCallId: 'navigation', toolName, args })
+    proc.emit({ type: 'tool_execution_end', toolCallId: 'navigation', toolName, result, isError })
+    proc.emit({ type: 'agent_settled' })
+    await prompt
+    const loaded = await loadWith(
+      chainToEntries([
+        {
+          type: 'message',
+          message: {
+            role: 'assistant',
+            content: [{ type: 'toolCall', id: 'navigation', name: toolName, arguments: args }]
+          }
+        },
+        { type: 'message', message: { role: 'toolResult', toolCallId: 'navigation', toolName, ...result, isError } }
+      ])
+    )
+    const liveCall = live.updates.find(({ update }) => update.sessionUpdate === 'tool_call')?.update
+    const replayCall = loaded.updates.find(({ update }) => update.sessionUpdate === 'tool_call')?.update
+    assert.ok(liveCall?.sessionUpdate === 'tool_call' && replayCall?.sessionUpdate === 'tool_call')
+    const expected = isError ? undefined : [{ path: join(TEST_CWD, path) }]
+    assert.deepEqual(liveCall.locations, expected)
+    assert.deepEqual(replayCall.locations, expected)
+    assert.deepEqual(replayCall.rawInput, args)
+    session.dispose()
   }
 })

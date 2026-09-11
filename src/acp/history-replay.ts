@@ -8,7 +8,7 @@ import {
 } from './translate/pi-messages.js'
 import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
 import { PiSessionEntriesError, walkActiveEntryBranch } from './translate/entry-walk.js'
-import { toToolKind } from './translate/tool-calls.js'
+import { toToolCallLocations, toToolKind } from './translate/tool-calls.js'
 import {
   bashCommand,
   bashExitCode,
@@ -153,6 +153,7 @@ export async function replaySessionHistory({
             kind: isBash ? 'execute' : toToolKind(block.toolName),
             status: 'pending',
             rawInput: block.rawInput,
+            locations: toToolCallLocations(block.toolName, block.rawInput, cwd),
             ...(isBash && supportsTerminalOutputMeta
               ? {
                   content: bashTerminalContent(block.toolCallId),

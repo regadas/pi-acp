@@ -34,7 +34,7 @@ export function promptToPiMessage(blocks: ContentBlock[]): {
         text.push(block.text)
         break
       case 'resource_link':
-        text.push(`\n[Context] ${block.uri}`)
+        text.push(`\n[Context] ${block.uri}\n`)
         break
       case 'image':
         images.push(validatedImage(block.mimeType, block.data, 'Image block'))
