@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { SessionUpdate } from '@agentclientprotocol/sdk'
 import { PiAcpSession } from '../../src/acp/session.js'
 import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
@@ -1829,4 +1830,39 @@ test('PiAcpSession: forwards non-adapter slash commands to pi unchanged', async 
 
   const reason = await p
   assert.equal(reason, 'end_turn')
+})
+
+test('PiAcpSession: omits only zero-length assistant chunks including extension notifications', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({ sessionId: 'empty', cwd: TEST_CWD, proc: proc as any, conn: asAgentConn(conn) })
+  for (const delta of ['', 'hello', ' \n']) {
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta } })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta } })
+    proc.emit({ type: 'extension_ui_request', id: `notify-${delta.length}`, method: 'notify', message: delta })
+  }
+  const preserved: SessionUpdate[] = [
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'image', data: 'aW1n', mimeType: 'image/png' } },
+    { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: '' } },
+    { sessionUpdate: 'tool_call_update', toolCallId: 'real-tool', content: [], status: 'completed' },
+    { sessionUpdate: 'session_info_update', title: null },
+    { sessionUpdate: 'config_option_update', configOptions: [] }
+  ]
+  for (const update of preserved) await session.sendSessionUpdate({ sessionId: 'empty', update })
+  assert.deepEqual(
+    conn.updates.map(notification => notification.update),
+    [
+      ...['hello', ' \n'].flatMap(text => [
+        { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+        { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } },
+        { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } }
+      ]),
+      ...preserved
+    ]
+  )
+  assert.deepEqual(proc.extensionUiResponses, [
+    { id: 'notify-0', cancelled: true },
+    { id: 'notify-5', cancelled: true },
+    { id: 'notify-2', cancelled: true }
+  ])
 })

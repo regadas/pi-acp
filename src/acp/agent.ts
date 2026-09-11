@@ -734,7 +734,7 @@ export class PiAcpAgent implements ACPAgent {
 
         const response = await this.runPrompt(params, cancellationEpoch, signal)
         return this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)
-          ? { stopReason: 'cancelled' }
+          ? { ...response, stopReason: 'cancelled' }
           : response
       } catch (error) {
         if (this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)) {
@@ -1205,7 +1205,7 @@ export async function runPromptWithCancellation(
 
   try {
     const response = await prompt
-    return signal.aborted ? { stopReason: 'cancelled' } : response
+    return signal.aborted ? { ...response, stopReason: 'cancelled' } : response
   } catch (error) {
     if (signal.aborted) return { stopReason: 'cancelled' }
     throw error

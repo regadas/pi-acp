@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import type { PromptRequest } from '@agentclientprotocol/sdk'
+import type { PromptRequest, PromptResponse } from '@agentclientprotocol/sdk'
 import { PiAcpAgent, runPromptWithCancellation } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
@@ -33,6 +33,46 @@ function deferredRestore(agent: PiAcpAgent, conn: FakeAgentSideConnection, proc:
   ;((agent as any).restoringSessions as Map<string, Promise<PiAcpSession>>).set(sessionId, restore.promise)
   return { restore, session }
 }
+
+test('runPromptWithCancellation: cancellation preserves returned usage and metadata', async () => {
+  const response: PromptResponse = {
+    stopReason: 'end_turn',
+    usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+    _meta: { captured: true }
+  }
+  const result = deferred<PromptResponse>()
+  const agent = { prompt: () => result.promise, cancel: async () => {} }
+  const controller = new AbortController()
+  const pending = runPromptWithCancellation(agent, promptParams('s1'), controller.signal)
+  controller.abort()
+  result.resolve(response)
+
+  assert.deepEqual(await pending, { ...response, stopReason: 'cancelled' })
+  assert.equal(response.stopReason, 'end_turn', 'normalization does not mutate the returned response')
+})
+
+test('PiAcpAgent.prompt: cancellation preserves returned usage and metadata', async () => {
+  const response: PromptResponse = {
+    stopReason: 'end_turn',
+    usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 },
+    _meta: { captured: true }
+  }
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  const started = deferred<void>()
+  const result = deferred<PromptResponse>()
+  ;(agent as unknown as { runPrompt: () => Promise<PromptResponse> }).runPrompt = () => {
+    started.resolve()
+    return result.promise
+  }
+  const controller = new AbortController()
+  const pending = agent.prompt(promptParams('s1'), controller.signal)
+  await started.promise
+  controller.abort()
+  result.resolve(response)
+
+  assert.deepEqual(await pending, { ...response, stopReason: 'cancelled' })
+  assert.equal(response.stopReason, 'end_turn')
+})
 
 test('runPromptWithCancellation: request abort routes into agent.cancel', async () => {
   const cancelled: string[] = []
@@ -87,7 +127,7 @@ test('runPromptWithCancellation: request abort remains sticky across deferred re
   controller.abort()
   restore.resolve(session)
 
-  assert.equal((await pending).stopReason, 'cancelled')
+  assert.deepEqual(await pending, { stopReason: 'cancelled' })
   assert.equal(proc.prompts.length, 0, 'cancelled startup never sent work to pi')
 })
 
@@ -101,7 +141,7 @@ test('PiAcpAgent: session/cancel remains sticky across deferred restore', async 
   await agent.cancel({ sessionId: 's-restore-session' })
   restore.resolve(session)
 
-  assert.equal((await pending).stopReason, 'cancelled')
+  assert.deepEqual(await pending, { stopReason: 'cancelled' })
   assert.equal(proc.prompts.length, 0, 'cancelled startup never sent work to pi')
 })
 
@@ -211,7 +251,16 @@ test('PiAcpAgent: stale cancel completion does not evict a replacement session',
 
 test('runPromptWithCancellation: generic cancellation settles the session prompt as cancelled after final updates', async () => {
   const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
+  let statsCalls = 0
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: async () => {
+      statsCalls += 1
+      return {
+        tokens: { input: 10, output: 5, total: 15 },
+        contextUsage: { tokens: 7, contextWindow: 100 }
+      }
+    }
+  })
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
@@ -236,6 +285,10 @@ test('runPromptWithCancellation: generic cancellation settles the session prompt
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'partial output' } })
 
+  const queued = runPromptWithCancellation(agent, promptParams('s1'), new AbortController().signal)
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(proc.prompts.length, 1)
+
   let updatesAtResolve = -1
   const tracked = pending.then(res => {
     updatesAtResolve = conn.updates.length
@@ -253,6 +306,18 @@ test('runPromptWithCancellation: generic cancellation settles the session prompt
 
   const res = await tracked
   assert.equal(res.stopReason, 'cancelled')
+  assert.deepEqual(res.usage, {
+    inputTokens: 10,
+    outputTokens: 5,
+    totalTokens: 15,
+    cachedReadTokens: undefined,
+    cachedWriteTokens: undefined
+  })
+  const queuedResponse = await queued
+  assert.equal(queuedResponse.stopReason, 'cancelled')
+  assert.equal(queuedResponse.usage, undefined, 'never-run queue entries do not inherit active cumulative usage')
+  assert.equal(statsCalls, 1)
+  assert.equal(proc.prompts.length, 1)
 
   const delivered = conn.updates.map(u => u.update)
   const deltaIndex = delivered.findIndex(
@@ -260,4 +325,32 @@ test('runPromptWithCancellation: generic cancellation settles the session prompt
   )
   assert.ok(deltaIndex >= 0, 'streamed update was delivered')
   assert.ok(updatesAtResolve > deltaIndex, 'updates flushed before the prompt response settled')
+  const usageIndex = delivered.findIndex(u => u.sessionUpdate === 'usage_update')
+  assert.ok(usageIndex > deltaIndex && usageIndex < updatesAtResolve, 'usage flushes before settlement')
+})
+
+test('PiAcpAgent.prompt: cancellation before held dispatch never captures unrelated usage', async () => {
+  const conn = new FakeAgentSideConnection()
+  let statsCalls = 0
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: async () => {
+      statsCalls += 1
+      return { tokens: { input: 10, output: 5, total: 15 } }
+    }
+  })
+  const session = new PiAcpSession({ sessionId: 'held', cwd: '/tmp', proc: proc as any, conn: asAgentConn(conn) })
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
+  proc.emit({ type: 'agent_start' })
+  const pending = agent.prompt(promptParams('held'))
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(proc.prompts.length, 0)
+  await session.cancel()
+  const response = await pending
+  assert.equal(response.stopReason, 'cancelled')
+  assert.equal(response.usage, undefined)
+  assert.equal(statsCalls, 0)
+  assert.equal(proc.abortCount, 0)
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(proc.prompts.length, 0)
 })

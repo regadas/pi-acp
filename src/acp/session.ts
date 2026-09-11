@@ -132,7 +132,7 @@ type PendingCustomMessage = {
 
 type PermissionResponse = Awaited<ReturnType<AcpClient['requestPermission']>>
 type PiUiResponse = { id: string; value: string } | { id: string; confirmed: boolean } | { id: string; cancelled: true }
-type PendingUiRequest = { id: string; controller: AbortController }
+type PendingUiRequest = { id: string; controller: AbortController; toolCallId?: string }
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
@@ -1080,6 +1080,12 @@ export class PiAcpSession {
   private enqueueUpdate(update: SessionUpdate, isStale?: () => boolean): Promise<void> {
     const delivery = this.lastEmit.then(() => {
       if (isStale?.()) return
+      if (
+        (update.sessionUpdate === 'agent_message_chunk' || update.sessionUpdate === 'agent_thought_chunk') &&
+        update.content.type === 'text' &&
+        update.content.text.length === 0
+      )
+        return
       return this.conn.sessionUpdate({
         sessionId: this.sessionId,
         update
@@ -1556,7 +1562,7 @@ export class PiAcpSession {
     void (async () => {
       try {
         await this.flushEmits()
-        await turn.beforeRelease?.()
+        if (turn.promptDispatched) await turn.beforeRelease?.()
       } catch {
         // Usage capture/publication is best-effort and must not strand the FIFO.
       } finally {
@@ -2390,6 +2396,9 @@ export class PiAcpSession {
     if (this.pendingUiRequests.get(pending.id) !== pending) return
     this.pendingUiRequests.delete(pending.id)
     pending.controller.abort()
+    if (pending.toolCallId) {
+      this.emit({ sessionUpdate: 'tool_call_update', toolCallId: pending.toolCallId, status: 'completed' })
+    }
     void this.proc.sendExtensionUiResponse(response).catch(() => {})
   }
 
@@ -2520,9 +2529,11 @@ export class PiAcpSession {
   ): Promise<{ pending: PendingUiRequest; response: PermissionResponse } | null> {
     const pending = this.beginUiRequest(id)
     if (!pending) return null
+    const toolCall = extensionUiToolCall(id, ev)
+    pending.toolCallId = toolCall.toolCallId
     try {
       const response = await this.conn.requestPermission(
-        { sessionId: this.sessionId, toolCall: extensionUiToolCall(id, ev), options },
+        { sessionId: this.sessionId, toolCall, options },
         { cancellationSignal: pending.controller.signal }
       )
       return this.pendingUiRequests.get(id) === pending ? { pending, response } : null
