@@ -19,6 +19,7 @@ const METADATA_RECORD_LIMIT = 1024 * 1024
 // ponytail: cap each history scan at 8 MiB; add an on-disk metadata index if exact deep-history titles matter.
 const METADATA_FILE_LIMIT = 8 * 1024 * 1024
 const TITLE_LIMIT = 80
+const LOOKUP_CONCURRENCY = 16
 const RESOURCE_EXHAUSTION_CODES = new Set(['EMFILE', 'ENFILE', 'ENOMEM'])
 
 function rethrowResourceExhaustion(error: unknown): void {
@@ -284,10 +285,13 @@ export class SessionRepository {
     if (cwd || !stored) roots.add(sessionDiscoveryRoot(cwd ?? process.cwd(), this.env, this.agentDir))
     for (const root of roots) for (const file of await jsonlFiles(root)) paths.add(file)
 
+    const files = [...paths]
     const records: SessionRecord[] = []
-    for (const path of paths) {
-      const candidate = await project(path, sessionId)
-      if (candidate) records.push(candidate)
+    for (let offset = 0; offset < files.length; offset += LOOKUP_CONCURRENCY) {
+      const candidates = await Promise.all(
+        files.slice(offset, offset + LOOKUP_CONCURRENCY).map(path => project(path, sessionId))
+      )
+      for (const candidate of candidates) if (candidate) records.push(candidate)
     }
     return records
   }

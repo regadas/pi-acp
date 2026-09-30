@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, utimesSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
+import { syncBuiltinESMExports } from 'node:module'
 import { join, resolve } from 'node:path'
 import { SessionRepository, resolveSessionDirectory } from '../../src/acp/session-repository.js'
 import { SessionStore } from '../../src/acp/session-store.js'
@@ -66,6 +67,105 @@ test('repository uses the newest duplicate consistently for find, list, and dele
   )
 })
 
+test('repository.find overlaps header reads with bounded concurrency', async t => {
+  const { default: fs } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-concurrent-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  for (let i = 0; i < 64; i++) {
+    writeFileSync(join(sessions, `${i}.jsonl`), `${JSON.stringify({ type: 'session', id: `id-${i}`, cwd: root })}\n`)
+  }
+
+  const realOpen = fs.promises.open
+  let pending = 0
+  let maxPending = 0
+  let opened!: () => void
+  const firstOpen = new Promise<void>(resolve => (opened = resolve))
+  let release!: () => void
+  const allowOpens = new Promise<void>(resolve => (release = resolve))
+  t.mock.method(fs.promises, 'open', async (...args: Parameters<typeof realOpen>) => {
+    pending++
+    maxPending = Math.max(maxPending, pending)
+    opened()
+    await allowOpens
+    pending--
+    return realOpen(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+
+  const repository = new SessionRepository(
+    new SessionStore(join(root, 'map.json')),
+    { PI_CODING_AGENT_SESSION_DIR: sessions },
+    join(root, 'agent')
+  )
+  const found = repository.find('id-63', root)
+  await firstOpen
+  await new Promise<void>(resolve => setImmediate(resolve))
+  const opensBeforeRelease = maxPending
+  release()
+  assert.equal((await found)?.sessionId, 'id-63')
+  assert.ok(opensBeforeRelease > 1, 'header reads must overlap')
+  assert.ok(opensBeforeRelease <= 16, 'header reads must not create unbounded open requests')
+})
+
+test('repository.find selects a duplicate across roots deterministically when timestamps tie', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-roots-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const storedDir = join(root, 'a-stored')
+  const discoveryDir = join(root, 'z-discovery')
+  mkdirSync(storedDir)
+  mkdirSync(discoveryDir)
+  const storedFile = join(storedDir, 'duplicate.jsonl')
+  const discoveredFile = join(discoveryDir, 'duplicate.jsonl')
+  for (const path of [storedFile, discoveredFile]) {
+    writeFileSync(
+      path,
+      `${JSON.stringify({ type: 'session', id: 'duplicate', cwd: root })}\n${JSON.stringify({ type: 'message', timestamp: '2026-01-01T00:00:00Z', message: { role: 'user', content: path } })}\n`
+    )
+  }
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'duplicate', cwd: root, sessionFile: storedFile })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: discoveryDir }, join(root, 'agent'))
+  assert.equal((await repository.find('duplicate', root))?.sessionFile, discoveredFile)
+  assert.equal(store.get('duplicate')?.sessionFile, discoveredFile)
+})
+
+test('repository.delete fails closed on a file descriptor exhaustion error', async t => {
+  const { default: fs } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-exhaustion-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  const storedFile = join(sessions, 'stored.jsonl')
+  const blockedFile = join(sessions, 'blocked.jsonl')
+  for (const path of [storedFile, blockedFile]) {
+    writeFileSync(path, `${JSON.stringify({ type: 'session', id: 'wanted', cwd: root })}\n`)
+  }
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'wanted', cwd: root, sessionFile: storedFile })
+  const realOpen = fs.promises.open
+  t.mock.method(fs.promises, 'open', (...args: Parameters<typeof realOpen>) => {
+    if (args[0] === blockedFile) return Promise.reject(Object.assign(new Error('open failed'), { code: 'EMFILE' }))
+    return realOpen(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+  await assert.rejects(repository.delete('wanted'), { code: 'EMFILE' })
+  assert.equal(existsSync(storedFile), true)
+  assert.equal(existsSync(blockedFile), true)
+  assert.equal(store.get('wanted')?.sessionFile, storedFile)
+})
+
 test('repository validates stored headers before deletion and tombstones tampered paths', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-delete-'))
   const map = join(root, 'session-map.json')
@@ -126,7 +226,6 @@ test('repository caps metadata scanning per file and uses mtime when truncated',
 
 test('repository.list: foreign metadata scan work is skipped except for competing duplicate IDs', async t => {
   const { default: fs } = await import('node:fs')
-  const { syncBuiltinESMExports } = await import('node:module')
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-cost-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const sessions = join(root, 'sessions')
