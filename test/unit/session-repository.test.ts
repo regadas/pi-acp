@@ -29,7 +29,7 @@ test('session directory precedence preserves pi env, project, tilde, and cwd-rel
   }
 })
 
-test('repository uses the newest duplicate consistently for find, list, and delete', async () => {
+test('repository keeps a mapped duplicate canonical for find and list while delete removes both', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-duplicates-'))
   const sessions = join(root, 'sessions')
   const oldFile = join(sessions, 'old.jsonl')
@@ -51,10 +51,10 @@ test('repository uses the newest duplicate consistently for find, list, and dele
   store.upsert({ sessionId: 'duplicate', cwd: root, sessionFile: oldFile })
   const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
 
-  assert.equal((await repository.find('duplicate', root))?.sessionFile, newFile)
+  assert.equal((await repository.find('duplicate', root))?.sessionFile, oldFile)
   assert.deepEqual(
-    (await repository.list(root)).map(record => record.sessionFile),
-    [newFile]
+    (await repository.list(root)).map(record => [record.sessionFile, record.title]),
+    [[oldFile, 'Old']]
   )
   assert.equal(await repository.delete('duplicate'), newFile)
   assert.equal(existsSync(newFile), false)
@@ -65,6 +65,65 @@ test('repository uses the newest duplicate consistently for find, list, and dele
     (await repository.list(root)).some(record => record.sessionId === 'duplicate'),
     false
   )
+})
+
+test('repository.find uses a validated mapped file without enumerating or scanning metadata', async t => {
+  const { default: fs } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-mapped-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  const sessionFile = join(sessions, 'wanted.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 'wanted', cwd: root })}\n`)
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'wanted', cwd: '/stale/cwd', sessionFile })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  const realReaddir = fs.promises.readdir
+  const realCreateReadStream = fs.createReadStream
+  let enumerations = 0
+  let metadataScans = 0
+  t.mock.method(fs.promises, 'readdir', (...args: Parameters<typeof realReaddir>) => {
+    enumerations++
+    return realReaddir(...args)
+  })
+  t.mock.method(fs, 'createReadStream', (...args: Parameters<typeof realCreateReadStream>) => {
+    metadataScans++
+    return realCreateReadStream(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+
+  const record = await repository.find('wanted', root)
+  assert.equal(record?.sessionFile, sessionFile)
+  assert.equal(record?.cwd, root, 'the JSONL header, not stale store metadata, owns cwd')
+  assert.equal(enumerations, 0, 'mapped lookup must not enumerate directories')
+  assert.equal(metadataScans, 0, 'mapped lookup must not scan transcript metadata')
+})
+
+test('repository.find repairs missing and mismatched stored paths through discovery', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-repair-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  const store = new SessionStore(join(root, 'map.json'))
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  for (const kind of ['missing', 'mismatched']) {
+    const id = `wanted-${kind}`
+    const stale = join(sessions, `stale-${kind}.jsonl`)
+    const actual = join(sessions, `${id}.jsonl`)
+    if (kind === 'mismatched') writeFileSync(stale, `${JSON.stringify({ type: 'session', id: 'other', cwd: root })}\n`)
+    writeFileSync(actual, `${JSON.stringify({ type: 'session', id, cwd: root })}\n`)
+    store.upsert({ sessionId: id, cwd: root, sessionFile: stale })
+
+    assert.equal((await repository.find(id, root))?.sessionFile, actual)
+    assert.equal(store.get(id)?.sessionFile, actual)
+  }
 })
 
 test('repository.find overlaps header reads with bounded concurrency', async t => {
@@ -113,7 +172,7 @@ test('repository.find overlaps header reads with bounded concurrency', async t =
   assert.ok(opensBeforeRelease <= 16, 'header reads must not create unbounded open requests')
 })
 
-test('repository.find selects a duplicate across roots deterministically when timestamps tie', async t => {
+test('repository.find sticks to a valid mapped duplicate across roots', async t => {
   const { rmSync } = await import('node:fs')
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-roots-'))
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -132,8 +191,64 @@ test('repository.find selects a duplicate across roots deterministically when ti
   const store = new SessionStore(join(root, 'map.json'))
   store.upsert({ sessionId: 'duplicate', cwd: root, sessionFile: storedFile })
   const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: discoveryDir }, join(root, 'agent'))
-  assert.equal((await repository.find('duplicate', root))?.sessionFile, discoveredFile)
-  assert.equal(store.get('duplicate')?.sessionFile, discoveredFile)
+  assert.equal((await repository.find('duplicate', root))?.sessionFile, storedFile)
+  assert.equal(store.get('duplicate')?.sessionFile, storedFile)
+  assert.equal(await repository.delete('duplicate'), discoveredFile)
+  assert.equal(existsSync(storedFile), false)
+  assert.equal(existsSync(discoveredFile), false)
+  assert.equal(await repository.find('duplicate', root), null)
+})
+
+test('repository.find repairs stale stored cwd for cwd-relative duplicate discovery on delete', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-stale-cwd-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const cwd = join(root, 'actual')
+  const sessions = join(cwd, 'sessions')
+  const nested = join(sessions, 'nested')
+  mkdirSync(nested, { recursive: true })
+  const mappedFile = join(nested, 'duplicate.jsonl')
+  const siblingFile = join(sessions, 'duplicate.jsonl')
+  for (const path of [mappedFile, siblingFile]) {
+    writeFileSync(path, `${JSON.stringify({ type: 'session', id: 'duplicate', cwd })}\n`)
+  }
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'duplicate', cwd: join(root, 'stale'), sessionFile: mappedFile })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: 'sessions' }, join(root, 'agent'))
+
+  assert.equal((await repository.find('duplicate', cwd))?.sessionFile, mappedFile)
+  assert.equal(store.get('duplicate')?.cwd, cwd)
+  assert.equal(store.get('duplicate')?.sessionFile, mappedFile)
+  assert.notEqual(await repository.delete('duplicate'), null)
+  assert.equal(existsSync(mappedFile), false)
+  assert.equal(existsSync(siblingFile), false)
+  assert.equal(await repository.find('duplicate', cwd), null)
+})
+
+test('repository.find propagates file descriptor exhaustion from the mapped file', async t => {
+  const { default: fs } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-find-exhaustion-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  const sessionFile = join(sessions, 'wanted.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 'wanted', cwd: root })}\n`)
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'wanted', cwd: root, sessionFile })
+  const realOpen = fs.promises.open
+  t.mock.method(fs.promises, 'open', (...args: Parameters<typeof realOpen>) => {
+    if (args[0] === sessionFile) return Promise.reject(Object.assign(new Error('open failed'), { code: 'EMFILE' }))
+    return realOpen(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+  await assert.rejects(repository.find('wanted', root), { code: 'EMFILE' })
+  assert.equal(store.get('wanted')?.sessionFile, sessionFile)
 })
 
 test('repository.delete fails closed on a file descriptor exhaustion error', async t => {

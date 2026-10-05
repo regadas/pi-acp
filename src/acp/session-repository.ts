@@ -229,8 +229,9 @@ function addStoredDiscoveryRoot(
   agentDir: string
 ): void {
   const configuredRoot = sessionDiscoveryRoot(stored.cwd, env, agentDir)
+  roots.add(configuredRoot)
   const fromRoot = relative(resolve(configuredRoot), resolve(stored.sessionFile))
-  roots.add(!fromRoot.startsWith('..') && !isAbsolute(fromRoot) ? configuredRoot : dirname(stored.sessionFile))
+  if (fromRoot.startsWith('..') || isAbsolute(fromRoot)) roots.add(dirname(stored.sessionFile))
 }
 
 async function jsonlFiles(root: string): Promise<string[]> {
@@ -303,6 +304,15 @@ export class SessionRepository {
     if (stored && !(this.store instanceof SessionStore)) {
       return { ...stored, title: null, updatedAt: stored.updatedAt ?? null }
     }
+    if (stored) {
+      const header = await validatedHeader(stored.sessionFile, sessionId)
+      if (header) {
+        if (stored.cwd !== header.cwd) {
+          this.store.upsert({ sessionId: header.sessionId, cwd: header.cwd, sessionFile: stored.sessionFile })
+        }
+        return { ...header, title: null, updatedAt: stored.updatedAt, sessionFile: stored.sessionFile }
+      }
+    }
 
     let newest: SessionRecord | null = null
     for (const candidate of await this.matchingRecords(sessionId, cwd)) {
@@ -315,14 +325,16 @@ export class SessionRepository {
 
   async list(cwd?: string): Promise<SessionRecord[]> {
     const paths = new Set<string>()
+    const mappedPaths = new Map<string, string>()
     const roots = new Set([sessionDiscoveryRoot(cwd ?? process.cwd(), this.env, this.agentDir)])
     for (const stored of await this.store.list()) {
       paths.add(stored.sessionFile)
+      mappedPaths.set(stored.sessionId, stored.sessionFile)
       addStoredDiscoveryRoot(roots, stored, this.env, this.agentDir)
     }
     for (const root of roots) for (const file of await jsonlFiles(root)) paths.add(file)
-    // Filter identities, not records: a newer foreign duplicate must still win
-    // deduplication, rather than resurrecting an older cwd-scoped copy.
+    // Filter identities, not records: a mapped foreign duplicate (or the newest
+    // foreign duplicate without a mapping) must not expose an older local copy.
     const headers = new Map<string, { sessionId: string; cwd: string }>()
     const scopedIds = new Set<string>()
     for (const path of paths) {
@@ -340,7 +352,13 @@ export class SessionRepository {
     const byId = new Map<string, SessionRecord>()
     for (const record of records) {
       const previous = byId.get(record.sessionId)
-      if (!previous || isNewer(record, previous)) byId.set(record.sessionId, record)
+      const mapped = mappedPaths.get(record.sessionId)
+      if (
+        !previous ||
+        (previous.sessionFile !== mapped && (record.sessionFile === mapped || isNewer(record, previous)))
+      ) {
+        byId.set(record.sessionId, record)
+      }
     }
     return [...byId.values()]
       .filter(record => !cwd || sessionCwdsEquivalent(record.cwd, cwd))
