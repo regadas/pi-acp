@@ -49,6 +49,7 @@ import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { assertValidSessionCwd, sessionCwdsEquivalent } from './session-cwd.js'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 
@@ -109,6 +110,9 @@ const pkg = readNearestPackageJson(import.meta.url)
 // close fallback, so an ordinary replacement never trips the barrier while a
 // child that ignores SIGTERM is still being escalated.
 const REPLACEMENT_TERMINATION_TIMEOUT_MS = 5_000
+const LIST_PAGE_SIZE = 50
+const LIST_SNAPSHOT_TTL_MS = 5 * 60_000
+const MAX_LIST_SNAPSHOTS = 16
 
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AcpClient
@@ -134,6 +138,10 @@ export class PiAcpAgent implements ACPAgent {
   // write cannot slip between another write's support check and its
   // post-write verification.
   private readonly configMutationQueues = new Map<string, Promise<void>>()
+  private readonly listSnapshots = new Map<
+    string,
+    { cwd: string | null; sessions: SessionInfo[]; firstOffset: number; expiresAt: number }
+  >()
   // Test seam: bound for the pre-spawn wait on a retired pi child's exit.
   private replacementTerminationTimeoutMs = REPLACEMENT_TERMINATION_TIMEOUT_MS
   private disposed = false
@@ -156,6 +164,7 @@ export class PiAcpAgent implements ACPAgent {
     // its next await boundary dispose its fresh process instead of
     // registering it; disposeAll then closes everything already registered.
     this.disposed = true
+    this.listSnapshots.clear()
     this.sessions.disposeAll()
   }
 
@@ -166,6 +175,7 @@ export class PiAcpAgent implements ACPAgent {
    */
   async disposeAndWait(timeoutMs: number): Promise<void> {
     this.disposed = true
+    this.listSnapshots.clear()
     await this.sessions.disposeAllAndWait(timeoutMs)
   }
 
@@ -843,33 +853,71 @@ export class PiAcpAgent implements ACPAgent {
       throw RequestError.invalidParams({}, `cwd must be an absolute path: ${params.cwd}`)
     }
 
-    // Stable ACP semantics: no cwd filter means all known sessions.
-    const filtered = await this.sessionRepository().list(params.cwd ?? undefined)
-
-    // Cursors are opaque numeric offsets issued by this agent in `nextCursor`;
-    // anything else is malformed and rejected rather than treated as page 0.
+    // Preserve path segments: collapsing `..` can conflate distinct paths through symlinks.
+    // Continuations must compare cwd without filesystem metadata reads.
+    const cwd = params.cwd == null ? null : params.cwd.replace(/\/+$/, '') || '/'
+    const cursor = params.cursor
     let start = 0
-    if (params.cursor != null) {
-      const parsed = /^\d+$/.test(params.cursor) ? Number.parseInt(params.cursor, 10) : Number.NaN
-      if (!Number.isSafeInteger(parsed)) {
-        throw RequestError.invalidParams({}, `Invalid cursor: ${params.cursor}`)
+    if (cursor != null) {
+      const snapshotCursor = /^s:([A-Za-z0-9_-]{24}):(\d+)$/.exec(cursor)
+      if (snapshotCursor) {
+        const snapshot = this.listSnapshots.get(snapshotCursor[1]!)
+        const now = Date.now()
+        start = Number(snapshotCursor[2])
+        if (
+          !snapshot ||
+          snapshot.expiresAt <= now ||
+          snapshot.cwd !== cwd ||
+          !Number.isSafeInteger(start) ||
+          snapshotCursor[2] !== String(start) ||
+          start < snapshot.firstOffset ||
+          (start - snapshot.firstOffset) % LIST_PAGE_SIZE !== 0 ||
+          start >= snapshot.sessions.length
+        ) {
+          if (snapshot && snapshot.expiresAt <= now) this.listSnapshots.delete(snapshotCursor[1]!)
+          throw RequestError.invalidParams({}, `Invalid cursor: ${cursor}`)
+        }
+        const next = start + LIST_PAGE_SIZE
+        return {
+          sessions: snapshot.sessions.slice(start, next),
+          nextCursor: next < snapshot.sessions.length ? `s:${snapshotCursor[1]}:${next}` : null,
+          _meta: {}
+        }
       }
-      start = parsed
+      start = /^\d+$/.test(cursor) ? Number.parseInt(cursor, 10) : Number.NaN
+      if (!Number.isSafeInteger(start)) {
+        throw RequestError.invalidParams({}, `Invalid cursor: ${cursor}`)
+      }
     }
 
-    const PAGE_SIZE = 50
-    const page = filtered.slice(start, start + PAGE_SIZE)
-
-    const sessions: SessionInfo[] = page.map(s => ({
+    // No cursor (or a legacy numeric offset) discovers current sessions again.
+    const filtered = await this.sessionRepository().list(params.cwd ?? undefined)
+    const sessions: SessionInfo[] = filtered.map(s => ({
       sessionId: s.sessionId,
       cwd: s.cwd,
       title: s.title,
       updatedAt: s.updatedAt
     }))
 
-    const nextCursor = start + PAGE_SIZE < filtered.length ? String(start + PAGE_SIZE) : null
+    const next = start + LIST_PAGE_SIZE
+    if (next >= sessions.length) {
+      return { sessions: sessions.slice(start, next), nextCursor: null, _meta: {} }
+    }
 
-    return { sessions, nextCursor, _meta: {} }
+    if (this.disposed) throw RequestError.internalError({}, 'pi-acp agent is disposed')
+    const now = Date.now()
+    for (const [token, snapshot] of this.listSnapshots) {
+      if (snapshot.expiresAt <= now) this.listSnapshots.delete(token)
+    }
+    while (this.listSnapshots.size >= MAX_LIST_SNAPSHOTS) {
+      this.listSnapshots.delete(this.listSnapshots.keys().next().value!)
+    }
+    let token: string
+    do {
+      token = randomBytes(18).toString('base64url')
+    } while (this.listSnapshots.has(token))
+    this.listSnapshots.set(token, { cwd, sessions, firstOffset: next, expiresAt: now + LIST_SNAPSHOT_TTL_MS })
+    return { sessions: sessions.slice(start, next), nextCursor: `s:${token}:${next}`, _meta: {} }
   }
 
   /**
