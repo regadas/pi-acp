@@ -237,9 +237,7 @@ test('newSession: unknown model state advertises only the conservative off level
       async getState() {
         return { thinkingLevel: 'medium' }
       }
-    },
-    setStartupInfo() {},
-    sendStartupInfoIfPending() {}
+    }
   }
   const { agent } = makeAgent(session)
   // Local seam: swallow deferred notifications instead of patching timers.
@@ -268,9 +266,7 @@ test('newSession: non-reasoning models advertise only off with a valid currentVa
       async getState() {
         return { thinkingLevel: 'medium', model: { provider: 'test', id: 'plain', reasoning: false } }
       }
-    },
-    setStartupInfo() {},
-    sendStartupInfoIfPending() {}
+    }
   }
   const { agent } = makeAgent(session)
   ;(agent as any).scheduleDeferred = () => {}

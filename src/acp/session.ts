@@ -137,7 +137,12 @@ type PendingCustomMessage = {
 
 type PermissionResponse = Awaited<ReturnType<AcpClient['requestPermission']>>
 type PiUiResponse = { id: string; value: string } | { id: string; confirmed: boolean } | { id: string; cancelled: true }
-type PendingUiRequest = { id: string; controller: AbortController; toolCallId?: string }
+type PendingUiRequest = {
+  id: string
+  controller: AbortController
+  toolCallId?: string
+  timer?: ReturnType<typeof setTimeout>
+}
 
 const CONFIRM_PERMISSION_OPTIONS: PermissionOption[] = [
   { optionId: 'yes', name: 'Yes', kind: 'allow_once' },
@@ -193,8 +198,6 @@ export class PiAcpSession {
   readonly sessionId: string
   readonly cwd: string
 
-  private startupInfo: string | null = null
-  private startupInfoSent = false
   private activeAdapterPromptTurns = 0
   private customMessageSequence = 0
   private readonly pendingCustomMessages: PendingCustomMessage[] = []
@@ -233,7 +236,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
-  private readonly streamedToolCalls = new Map<number, { id: string; name: string; argumentsText: string }>()
+  private readonly streamedToolCalls = new Map<number, { id: string; name: string | null; argumentsText: string }>()
   // Tool calls already reported as completed/failed in the current turn.
   private readonly settledToolCallIds = new Set<string>()
 
@@ -489,30 +492,8 @@ export class PiAcpSession {
     }
   }
 
-  setStartupInfo(text: string) {
-    this.startupInfo = text
-    this.startupInfoSent = false
-  }
-
-  /**
-   * Emit the deferred startup info as an `agent_message_chunk`, if not yet
-   * sent. Must be called while a `session/prompt` turn is active (i.e. from
-   * `startTurn`): ACP forbids turn-bound updates outside an active prompt
-   * (https://github.com/svkozak/pi-acp/issues/59).
-   */
-  sendStartupInfoIfPending(): void {
-    if (this.startupInfoSent || !this.startupInfo) return
-    this.startupInfoSent = true
-
-    this.emit({
-      sessionUpdate: 'agent_message_chunk',
-      content: { type: 'text', text: this.startupInfo }
-    })
-  }
-
   beginAdapterPromptTurn(): () => Promise<void> {
     this.activeAdapterPromptTurns += 1
-    this.sendStartupInfoIfPending()
     this.sendPendingCustomMessages()
 
     let active = true
@@ -691,8 +672,7 @@ export class PiAcpSession {
 
     // Cancellation or termination can land between admission and this
     // resumption. Release the held FIFO slot without opening an adapter turn: a
-    // command that never runs must not flush the deferred startup banner or
-    // buffered custom messages.
+    // command that never runs must not flush buffered custom messages.
     const admissionFailure = this.commandTerminalFailure(command)
     if (admissionFailure) {
       this.releaseCommandSlotFor(command)
@@ -1268,6 +1248,7 @@ export class PiAcpSession {
     this.emit({
       sessionUpdate: params.sessionUpdate,
       toolCallId: params.toolCallId,
+      ...(params.sessionUpdate === 'tool_call' ? { name: params.toolName } : {}),
       title: bashCommand(params.args) ?? params.toolName,
       kind: 'execute',
       status: params.status,
@@ -1330,7 +1311,8 @@ export class PiAcpSession {
    * so synthesize one from the reporting event. Returns false once the call
    * settled so a duplicate or late event cannot resurrect a finished card.
    */
-  private ensureToolCallStarted(toolCallId: string, toolName: string, args: unknown): boolean {
+  private ensureToolCallStarted(toolCallId: string, name: string | null, args: unknown): boolean {
+    const toolName = name ?? 'tool'
     if (this.settledToolCallIds.has(toolCallId)) return false
     if (this.currentToolCalls.has(toolCallId)) return true
 
@@ -1354,6 +1336,7 @@ export class PiAcpSession {
     this.emit({
       sessionUpdate: 'tool_call',
       toolCallId,
+      ...(name ? { name } : {}),
       title: toolName,
       kind: toToolKind(toolName),
       status: 'in_progress',
@@ -1421,12 +1404,6 @@ export class PiAcpSession {
       beforeRelease: t.beforeRelease
     }
     this.pendingTurn = turn
-
-    // Flush the deferred startup banner (pi version / context / skills) as the
-    // first agent_message_chunk of this turn. ACP only allows turn-bound
-    // updates while a `session/prompt` is active, so the banner must not be
-    // emitted right after session/new (https://github.com/svkozak/pi-acp/issues/59).
-    this.sendStartupInfoIfPending()
 
     // Custom messages can arrive while pi is idle. Flush them now on the
     // normal idle path. If an out-of-band run owns the Pi event stream, keep
@@ -1942,7 +1919,7 @@ export class PiAcpSession {
           if (ame.type === 'toolcall_start') {
             const id = typeof ame.id === 'string' ? ame.id : typeof whole?.id === 'string' ? whole.id : ''
             const name =
-              typeof ame.toolName === 'string' ? ame.toolName : typeof whole?.name === 'string' ? whole.name : 'tool'
+              typeof ame.toolName === 'string' ? ame.toolName : typeof whole?.name === 'string' ? whole.name : null
             if (this.settledToolCallIds.has(id)) break
             if (id)
               this.streamedToolCalls.set(contentIndex, {
@@ -1965,6 +1942,12 @@ export class PiAcpSession {
           }
 
           const toolCallId = String(whole?.id ?? ame.id ?? buffered?.id ?? '')
+          const name =
+            typeof whole?.name === 'string'
+              ? whole.name
+              : typeof ame.toolName === 'string'
+                ? ame.toolName
+                : buffered?.name
           const toolName = String(whole?.name ?? ame.toolName ?? buffered?.name ?? 'tool')
 
           if (toolCallId) {
@@ -2009,6 +1992,7 @@ export class PiAcpSession {
               this.emit({
                 sessionUpdate: 'tool_call',
                 toolCallId,
+                ...(name ? { name } : {}),
                 title: toolName,
                 kind: toToolKind(toolName),
                 status,
@@ -2144,6 +2128,7 @@ export class PiAcpSession {
           this.emit({
             sessionUpdate: 'tool_call',
             toolCallId,
+            ...(typeof ev.toolName === 'string' && ev.toolName ? { name: ev.toolName } : {}),
             title: toolName,
             kind: toToolKind(toolName),
             status: 'in_progress',
@@ -2167,7 +2152,7 @@ export class PiAcpSession {
       case 'tool_execution_update': {
         const toolCallId = String(ev.toolCallId ?? '')
         if (!toolCallId) break
-        if (!this.ensureToolCallStarted(toolCallId, String(ev.toolName ?? 'tool'), ev.args)) break
+        if (!this.ensureToolCallStarted(toolCallId, stringProp(ev, 'toolName'), ev.args)) break
 
         const partial = ev.partialResult
         if (this.bashToolCallIds.has(toolCallId)) {
@@ -2192,8 +2177,7 @@ export class PiAcpSession {
         const toolCallId = String(ev.toolCallId ?? '')
         if (!toolCallId) break
 
-        const toolName = String(ev.toolName ?? 'tool')
-        if (!this.ensureToolCallStarted(toolCallId, toolName, ev.args)) break
+        if (!this.ensureToolCallStarted(toolCallId, stringProp(ev, 'toolName'), ev.args)) break
 
         const result = ev.result
         const isError = Boolean(ev.isError)
@@ -2501,25 +2485,33 @@ export class PiAcpSession {
     }
   }
 
-  private beginUiRequest(id: string): PendingUiRequest | null {
+  private beginUiRequest(id: string, timeout: unknown): PendingUiRequest | null {
     const duplicate = this.pendingUiRequests.get(id)
     if (duplicate) {
       this.settleUiRequest(duplicate, { id, cancelled: true })
       return null
     }
-    const pending = { id, controller: new AbortController() }
+    const pending: PendingUiRequest = { id, controller: new AbortController() }
     this.pendingUiRequests.set(id, pending)
+    if (typeof timeout === 'number' && Number.isFinite(timeout) && timeout !== 0) {
+      // Native pi uses truthy numeric Node timers. Nonfinite numbers arrive as
+      // JSON null; finite negative/overflow delays expire at 1 ms, not never.
+      const delay = timeout < 1 || timeout > 2 ** 31 - 1 ? 1 : Math.trunc(timeout)
+      pending.timer = setTimeout(() => this.settleUiRequest(pending), delay)
+    }
     return pending
   }
 
-  private settleUiRequest(pending: PendingUiRequest, response: PiUiResponse): void {
+  private settleUiRequest(pending: PendingUiRequest, response?: PiUiResponse): void {
     if (this.pendingUiRequests.get(pending.id) !== pending) return
     this.pendingUiRequests.delete(pending.id)
+    if (pending.timer !== undefined) clearTimeout(pending.timer)
     pending.controller.abort()
     if (pending.toolCallId) {
       this.emit({ sessionUpdate: 'tool_call_update', toolCallId: pending.toolCallId, status: 'completed' })
     }
-    void this.proc.sendExtensionUiResponse(response).catch(() => {})
+    // Natural expiry already resolved pi's default and removed its dialog.
+    if (response) void this.proc.sendExtensionUiResponse(response).catch(() => {})
   }
 
   private drainPendingUiRequests(): void {
@@ -2574,9 +2566,9 @@ export class PiAcpSession {
     const belongsToPrompt = this.turnOwnsPiRun(activeTurn)
     if (!belongsToPrompt && (this.piBusyOutOfBand || Boolean(activeTurn) || Boolean(this.lifecycleAmbiguity))) {
       if (method === 'notify') return
-      // ACP permission requests and visible UI updates are turn-bound. An
-      // observed autonomous extension run has no client request to attach
-      // them to, so unblock pi by cancelling without contacting the client.
+      // Our attribution policy keeps unowned UI out of the active prompt.
+      // An observed autonomous extension run has no client request to attach
+      // it to, so unblock pi by cancelling without contacting the client.
       // The no-lifecycle branch remains as a translator-test seam.
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
@@ -2642,7 +2634,7 @@ export class PiAcpSession {
       await this.proc.sendExtensionUiResponse({ id, cancelled: true })
       return
     }
-    const pending = this.beginUiRequest(id)
+    const pending = this.beginUiRequest(id, ev.timeout)
     if (!pending) return
     try {
       const response = await this.conn.createElicitation(
@@ -2682,7 +2674,7 @@ export class PiAcpSession {
     ev: PiRpcEvent,
     options: PermissionOption[]
   ): Promise<{ pending: PendingUiRequest; response: PermissionResponse } | null> {
-    const pending = this.beginUiRequest(id)
+    const pending = this.beginUiRequest(id, ev.timeout)
     if (!pending) return null
     const toolCall = extensionUiToolCall(id, ev)
     pending.toolCallId = toolCall.toolCallId

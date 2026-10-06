@@ -203,6 +203,13 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       ctx.ui.notify(`CONFIRMED:${value}`, 'info')
     }
   })
+  pi.registerCommand('eval-timeout', {
+    description: 'Evaluation native dialog expiry',
+    handler: async (_args, ctx) => {
+      const value = await ctx.ui.confirm('Harness timeout', 'Do not answer', { timeout: 100 })
+      ctx.ui.notify(`TIMEOUT_DEFAULT:${value}`, 'info')
+    }
+  })
   pi.registerCommand('eval-input', {
     description: 'Evaluation input',
     handler: async (_args, ctx) => {

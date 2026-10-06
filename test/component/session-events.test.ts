@@ -391,6 +391,7 @@ test('PiAcpSession: synthesizes starts before prompt-owned completion-only tool 
     {
       sessionUpdate: 'tool_call',
       toolCallId: 'missing-read-start',
+      name: 'read',
       title: 'read',
       kind: 'read',
       status: 'in_progress'
@@ -405,6 +406,7 @@ test('PiAcpSession: synthesizes starts before prompt-owned completion-only tool 
     {
       sessionUpdate: 'tool_call',
       toolCallId: 'missing-bash-start',
+      name: 'bash',
       title: 'bash',
       kind: 'execute',
       status: 'in_progress',
@@ -472,6 +474,7 @@ test('PiAcpSession: synthesizes starts for progress-only tool events and keeps s
     {
       sessionUpdate: 'tool_call',
       toolCallId: 'missing-read-start',
+      name: 'read',
       title: 'read',
       kind: 'read',
       status: 'in_progress',
@@ -487,6 +490,7 @@ test('PiAcpSession: synthesizes starts for progress-only tool events and keeps s
     {
       sessionUpdate: 'tool_call',
       toolCallId: 'missing-bash-start',
+      name: 'bash',
       title: 'ls',
       kind: 'execute',
       status: 'in_progress',
@@ -504,6 +508,7 @@ test('PiAcpSession: synthesizes starts for progress-only tool events and keeps s
       // The subagent's own transcript stays hidden, but the card still exists.
       sessionUpdate: 'tool_call',
       toolCallId: 'missing-subagent-start',
+      name: 'subagent',
       title: 'subagent',
       kind: 'other',
       status: 'in_progress',
@@ -657,6 +662,7 @@ test('PiAcpSession: suppresses cumulative subagent progress snapshots but preser
   assert.deepEqual(conn.updates[0]!.update, {
     sessionUpdate: 'tool_call',
     toolCallId: 'subagent-1',
+    name: 'subagent',
     title: 'subagent',
     kind: 'other',
     status: 'in_progress',
@@ -1647,58 +1653,58 @@ test('PiAcpSession: prompt resolves end_turn only at agent_settled, not agent_en
   assert.equal(reason, 'end_turn')
 })
 
-test('PiAcpSession: emits startup info once, in-turn, on the first prompt only', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-
-  const session = new PiAcpSession({
-    sessionId: 's1',
-    cwd: TEST_CWD,
-    mcpServers: [],
-    proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
-  })
-
-  const notice = 'New version available: v0.74.0 (installed v0.73.1).'
-  session.setStartupInfo(notice)
-
-  // No prompt is active yet: nothing may be emitted out-of-turn.
-  await new Promise(r => setTimeout(r, 0))
-  assert.equal(conn.updates.length, 0)
-
-  const startupUpdates = () =>
-    conn.updates.filter(
-      entry =>
-        entry.update.sessionUpdate === 'agent_message_chunk' &&
-        (entry.update as any).content?.type === 'text' &&
-        (entry.update as any).content?.text === notice
-    )
-
-  const first = session.prompt('hello')
-  proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'turn_end' })
-  proc.emit({ type: 'agent_end' })
-  proc.emit({ type: 'agent_settled' })
-  assert.equal(await first, 'end_turn')
-
-  assert.equal(proc.prompts.length, 1)
-  assert.equal(proc.prompts[0]!.message, 'hello')
-  assert.equal(startupUpdates().length, 1)
-
-  // The banner must be the first turn-bound chunk of the first turn.
-  const firstChunk = conn.updates.find(entry => entry.update.sessionUpdate === 'agent_message_chunk')
-  assert.equal((firstChunk!.update as any).content.text, notice)
-
-  const second = session.prompt('again')
-  proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'turn_end' })
-  proc.emit({ type: 'agent_end' })
-  proc.emit({ type: 'agent_settled' })
-  assert.equal(await second, 'end_turn')
-
-  assert.equal(startupUpdates().length, 1)
-})
+for (const source of ['stream', 'execution', 'orphan-progress', 'orphan-end'] as const) {
+  for (const toolName of ['read', 'bash', 'tool', undefined]) {
+    test(`PiAcpSession: ${source} first report carries only a known canonical name (${String(toolName)})`, async () => {
+      const conn = new FakeAgentSideConnection()
+      const proc = new FakePiRpcProcess()
+      const session = new PiAcpSession({
+        sessionId: 'name',
+        cwd: TEST_CWD,
+        proc: proc as unknown as PiRpcProcess,
+        conn: asAgentConn(conn)
+      })
+      try {
+        const args = { command: 'echo hello' }
+        if (source === 'stream') {
+          proc.emit({
+            type: 'message_update',
+            assistantMessageEvent: { type: 'toolcall_start', id: 'named', toolName }
+          })
+          proc.emit({
+            type: 'message_update',
+            assistantMessageEvent: { type: 'toolcall_delta', id: 'named', toolName, argumentsDelta: '{}' }
+          })
+        } else {
+          proc.emit({
+            type:
+              source === 'execution'
+                ? 'tool_execution_start'
+                : source === 'orphan-progress'
+                  ? 'tool_execution_update'
+                  : 'tool_execution_end',
+            toolCallId: 'named',
+            toolName,
+            args,
+            result: {},
+            partialResult: {}
+          })
+        }
+        await new Promise<void>(resolve => setImmediate(resolve))
+        const start = conn.updates[0]!.update
+        assert.equal(start.sessionUpdate, 'tool_call')
+        if (start.sessionUpdate !== 'tool_call') throw new Error('missing initial tool report')
+        assert.equal(start.name, toolName)
+        assert.equal(start.title, toolName === 'bash' && source !== 'stream' ? 'echo hello' : (toolName ?? 'tool'))
+        assert.equal(Object.hasOwn(start, 'name'), toolName !== undefined, 'unknown fallback must not invent a name')
+        for (const { update } of conn.updates.slice(1))
+          assert.equal('name' in update, false, 'updates do not redefine identity')
+      } finally {
+        session.dispose()
+      }
+    })
+  }
+}
 
 test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
   const conn = new FakeAgentSideConnection()

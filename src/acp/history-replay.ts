@@ -144,11 +144,21 @@ export async function replaySessionHistory({
         replayedToolCallIds.add(block.toolCallId)
         const isBash = isBashTool(block.toolName)
         openToolCalls.set(block.toolCallId, { isBash })
+        // The translator's display fallback is not a canonical backend name.
+        const source = (
+          Array.isArray(m.content)
+            ? m.content.find((raw: unknown) => {
+                const call = raw as { type?: unknown; id?: unknown } | null
+                return call?.type === 'toolCall' && call.id === block.toolCallId
+              })
+            : undefined
+        ) as { name?: unknown } | undefined
         await sendUpdate({
           sessionId: session.sessionId,
           update: {
             sessionUpdate: 'tool_call',
             toolCallId: block.toolCallId,
+            ...(typeof source?.name === 'string' && source.name ? { name: source.name } : {}),
             title: isBash ? (bashCommand(block.rawInput) ?? block.toolName) : block.toolName,
             kind: isBash ? 'execute' : toToolKind(block.toolName),
             status: 'pending',
@@ -198,6 +208,7 @@ export async function replaySessionHistory({
             update: {
               sessionUpdate: 'tool_call',
               toolCallId,
+              name: toolName,
               title: bashCommand(m) ?? toolName,
               kind: 'execute',
               status: 'in_progress',
@@ -251,6 +262,7 @@ export async function replaySessionHistory({
           update: {
             sessionUpdate: 'tool_call',
             toolCallId,
+            ...(typeof m.toolName === 'string' && m.toolName ? { name: m.toolName } : {}),
             title: toolName,
             kind: toToolKind(toolName),
             status: 'in_progress',
@@ -287,6 +299,7 @@ export async function replaySessionHistory({
         update: {
           sessionUpdate: 'tool_call',
           toolCallId,
+          name: 'bash',
           title: bashCommand(m) ?? 'bash',
           kind: 'execute',
           status: 'in_progress',

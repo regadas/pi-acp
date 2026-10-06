@@ -137,6 +137,45 @@ try {
         'fresh preflight-only session survives quarantine and restore',
         restoredIdentity.file === identity.file && restoredIdentity.pid !== identity.pid
       )
+      holdPermission = true
+      const timeoutSeen = new Promise(resolve => {
+        permissionSeen = resolve
+      })
+      const timeoutStart = (await trace()).length
+      const timed = prompt('/eval-timeout')
+      await timeoutSeen
+      const expiredPermission = lastPermission
+      assert.equal((await timed).stopReason, 'end_turn')
+      assert.ok(texts().includes('TIMEOUT_DEFAULT:false'), 'real Pi resolves the timed confirm to its native default')
+      const expiredCard = expiredPermission.params.toolCall.toolCallId
+      const completedCards = () =>
+        client.updates.filter(
+          u => u.sessionUpdate === 'tool_call_update' && u.toolCallId === expiredCard && u.status === 'completed'
+        )
+      // The adapter's deadline begins at event receipt, after native transport.
+      const expiryDeadline = Date.now() + 5000
+      while (
+        !client.messages.some(m => m.method === '$/cancel_request' && m.params.requestId === expiredPermission.id) ||
+        completedCards().length === 0
+      ) {
+        assert.ok(Date.now() < expiryDeadline, 'native dialog expiry must cancel ACP and complete its card')
+        await sleep(5)
+      }
+      assert.equal(completedCards().length, 1)
+      client.respond(expiredPermission.id, { outcome: { outcome: 'selected', optionId: 'yes' } })
+      holdPermission = false
+      assert.equal((await prompt('/eval-display')).stopReason, 'end_turn')
+      const timeoutRecords = (await trace()).slice(timeoutStart)
+      const nativeDialog = timeoutRecords.find(e => e.type === 'extension_ui_request' && e.title === 'Harness timeout')
+      assert.ok(nativeDialog)
+      assert.ok(
+        !timeoutRecords.some(
+          e => e.direction === 'in' && e.type === 'extension_ui_response' && e.id === nativeDialog.id
+        ),
+        'expiry and late acceptance must not write to an expired native dialog'
+      )
+      assert.equal(completedCards().length, 1, 'late acceptance does not complete the card twice')
+      check('native timeout defaults, cancels ACP and suppresses late answers without stale Pi replies', true)
       const native = prompt('native queue')
       const queueDeadline = Date.now() + 5000
       while (!(await trace()).some(e => e.type === 'queue_update' && e.followUp?.includes('NATIVE_QUEUED'))) {

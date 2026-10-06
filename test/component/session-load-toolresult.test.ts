@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
-import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
+import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
+import { PiAcpSession } from '../../src/acp/session.js'
+import { replaySessionHistory } from '../../src/acp/history-replay.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 
 // Isolated workspace: repository-local .pi settings/commands must not leak in.
@@ -17,6 +19,72 @@ class FakeStore {
   }
   upsert() {}
 }
+
+test('replaySessionHistory reports canonical first names for assistant, orphan and shell records without inventing unknown names', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const messages = [
+    {
+      role: 'assistant',
+      content: [
+        { type: 'toolCall', id: 'read', name: 'read', arguments: {} },
+        { type: 'toolCall', id: 'bash', name: 'bash', arguments: { command: 'echo hello' } },
+        { type: 'toolCall', id: 'unknown', arguments: {} },
+        { type: 'toolCall', id: 'literal-tool', name: 'tool', arguments: {} }
+      ]
+    },
+    { role: 'toolResult', toolCallId: 'orphan-read', toolName: 'read', content: [] },
+    { role: 'toolResult', toolCallId: 'orphan-bash', toolName: 'bash', args: { command: 'pwd' }, content: [] },
+    { role: 'toolResult', toolCallId: 'orphan-unknown', content: [] },
+    { role: 'bashExecution', command: 'ls', output: '', exitCode: 0 }
+  ]
+  proc.entrySnapshot = {
+    entries: messages.map((message, i) => ({
+      type: 'message',
+      id: `e${i}`,
+      parentId: i ? `e${i - 1}` : null,
+      message
+    })),
+    leafId: 'e4'
+  }
+  const session = new PiAcpSession({
+    sessionId: 'replay',
+    cwd: TEST_CWD,
+    proc: proc as unknown as PiRpcProcess,
+    conn: asAgentConn(conn)
+  })
+  try {
+    await replaySessionHistory({
+      session,
+      cwd: TEST_CWD,
+      supportsTerminalOutputMeta: false,
+      assertActive() {},
+      sendUpdate: update => session.sendSessionUpdate(update)
+    })
+    const starts = conn.updates.map(n => n.update).filter(u => u.sessionUpdate === 'tool_call')
+    assert.deepEqual(
+      starts.map(u => [u.toolCallId, u.name, u.title]),
+      [
+        ['read', 'read', 'read'],
+        ['bash', 'bash', 'echo hello'],
+        ['unknown', undefined, 'tool'],
+        ['literal-tool', 'tool', 'tool'],
+        ['orphan-read', 'read', 'read'],
+        ['orphan-bash', 'bash', 'pwd'],
+        ['orphan-unknown', undefined, 'tool'],
+        ['pi-bash-e4', 'bash', 'ls']
+      ]
+    )
+    assert.ok(starts.filter(u => u.toolCallId.includes('unknown')).every(u => !Object.hasOwn(u, 'name')))
+    assert.ok(
+      conn.updates
+        .filter(n => n.update.sessionUpdate === 'tool_call_update')
+        .every(n => !Object.hasOwn(n.update, 'name'))
+    )
+  } finally {
+    session.dispose()
+  }
+})
 
 const bashResultSnapshot = {
   entries: [
@@ -67,12 +135,14 @@ test('PiAcpAgent: loadSession replays toolResult with negotiated Zed terminal me
       protocolVersion: 1,
       clientCapabilities: { _meta: { terminal_output: true } }
     } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
+    const loaded = await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
+    assert.deepEqual(loaded._meta, { piAcp: { startupInfo: null } })
 
-    const updates = conn.updates.map(u => (u as any).update)
+    const updates = conn.updates.map(u => u.update)
 
-    const toolCall = updates.find(u => u?.sessionUpdate === 'tool_call')
+    const toolCall = updates.find(u => u.sessionUpdate === 'tool_call')
     assert.ok(toolCall)
+    assert.equal(toolCall.name, 'bash')
     assert.equal(toolCall.toolCallId, 'call_1')
     assert.equal(toolCall.title, 'echo hello')
     assert.equal(toolCall.kind, 'execute')

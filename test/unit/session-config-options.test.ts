@@ -51,9 +51,7 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
             model: { provider: 'test', id: 'beta', reasoning: true, thinkingLevelMap: { xhigh: 'xhigh' } }
           }
         }
-      },
-      setStartupInfo() {},
-      sendStartupInfoIfPending() {}
+      }
     }
 
     const agent = new PiAcpAgent(asAgentConn(conn))
@@ -62,6 +60,8 @@ test('PiAcpAgent: newSession returns configOptions for model and thinking select
     ;(agent as any).scheduleDeferred = () => {}
 
     const result = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] } as any)
+    assert.deepEqual(result._meta, { piAcp: { startupInfo: null } })
+    assert.deepEqual(conn.updates, [], 'setup emits no unsolicited assistant inventory')
 
     // Model and thinking state are exposed only through standard
     // configOptions; the legacy custom root `models` field and the legacy

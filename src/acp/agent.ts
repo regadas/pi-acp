@@ -582,8 +582,8 @@ export class PiAcpAgent implements ACPAgent {
       | undefined
     this.supportsTerminalOutputMeta = clientCapabilities?._meta?.['terminal_output'] === true
     this.supportsElicitationForm = clientCapabilities?.elicitation?.form != null
-    // Terminal auth methods are advertised only against the standard
-    // (unstable-SDK) `auth.terminal` capability; the Zed `_meta["terminal-auth"]`
+    // Terminal auth methods are advertised only against the stable v1
+    // `auth.terminal` capability; the Zed `_meta["terminal-auth"]`
     // launch spec is added only when the client also declared its meta flag.
     this.authMethods = getAuthMethods({
       supportsTerminalAuth: clientCapabilities?.auth?.terminal === true,
@@ -701,14 +701,6 @@ export class PiAcpAgent implements ACPAgent {
       configOptions,
       _meta: { piAcp: { startupInfo: null } }
     }
-
-    // NOTE: The startup banner is intentionally NOT emitted here. ACP only
-    // allows agent_message_chunk updates while a `session/prompt` is active;
-    // emitting one right after session/new is an out-of-turn protocol
-    // violation (https://github.com/svkozak/pi-acp/issues/59). The banner is
-    // flushed as the first chunk of the first prompt turn instead (see
-    // PiAcpSession.startTurn), and clients can also read it out-of-band from
-    // `_meta.piAcp.startupInfo` above.
 
     // Advertise slash commands (ACP: available_commands_update) after the
     // session/new response has been delivered.

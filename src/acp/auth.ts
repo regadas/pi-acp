@@ -4,7 +4,7 @@ export const PI_SETUP_METHOD_ID = 'pi_terminal_login'
 
 /**
  * Terminal login methods for the negotiating client:
- *  - The SDK's unstable terminal AuthMethod (`type`/`args`/`env`) is advertised
+ *  - The stable v1 terminal AuthMethod (`type`/`args`/`env`) is advertised
  *    only when the client declared `clientCapabilities.auth.terminal`.
  *  - Zed additionally reads `_meta["terminal-auth"]` (launch spec) to render
  *    its "Authenticate" banner; included only when the client also declared

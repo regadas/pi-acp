@@ -48,6 +48,7 @@
         "update": {
           "sessionUpdate": "tool_call",
           "toolCallId": "t1",
+          "name": "bash",
           "title": "ls",
           "kind": "execute",
           "status": "in_progress",

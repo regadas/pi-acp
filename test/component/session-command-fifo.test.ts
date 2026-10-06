@@ -446,10 +446,10 @@ test('PiAcpAgent: cancelling an in-flight /export publishes neither a failure no
   assert.deepEqual(queueStates(conn).at(-1), { queueDepth: 0, running: false })
 })
 
-test('PiAcpSession: a command cancelled before it starts publishes no deferred startup output', async () => {
-  const proc = new FakePiRpcProcess() as any
+test('PiAcpSession: a command cancelled before it starts preserves buffered custom output and releases the FIFO', async () => {
+  const proc = new FakePiRpcProcess()
   const { session, conn } = makeAgent(proc)
-  session.setStartupInfo('pi v0.0.0 startup banner')
+  proc.emit({ type: 'message_end', message: { role: 'custom', display: true, content: 'Buffered extension result' } })
 
   let ran = false
   // Admission resolves immediately, so the command body only resumes in a
@@ -462,19 +462,13 @@ test('PiAcpSession: a command cancelled before it starts publishes no deferred s
 
   assert.equal(await command, null, 'the command settles as cancelled')
   assert.equal(ran, false, 'a cancelled command never runs')
-  assert.deepEqual(
-    agentMessageTexts(conn).filter(text => text.includes('startup banner')),
-    [],
-    'the deferred startup banner must not escape for a command that never ran'
-  )
+  assert.deepEqual(agentMessageTexts(conn), [], 'buffered custom output must not escape for a command that never ran')
   assert.deepEqual(queueStates(conn).at(-1), { queueDepth: 0, running: false }, 'the FIFO slot is released')
 
-  // The banner was deferred, not dropped: the next command still flushes it.
   assert.equal(await session.runCommand(async () => 'ok'), 'ok')
-  assert.ok(
-    agentMessageTexts(conn).some(text => text.includes('startup banner')),
-    'a command that actually runs publishes the deferred startup info'
-  )
+  assert.deepEqual(agentMessageTexts(conn), ['Buffered extension result'], 'the next command flushes buffered output')
+  assert.equal(await session.runCommand(async () => 'again'), 'again')
+  assert.deepEqual(agentMessageTexts(conn), ['Buffered extension result'], 'buffered output is emitted only once')
 })
 
 test('PiAcpAgent: a /name title queued behind other work is not published after cancellation', async () => {

@@ -1,11 +1,242 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import type { RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk'
+import type {
+  CreateElicitationResponse,
+  RequestPermissionRequest,
+  RequestPermissionResponse
+} from '@agentclientprotocol/sdk'
+import type { AcpClient } from '../../src/acp/client.js'
 import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 0))
+const flush = () => new Promise<void>(resolve => setImmediate(resolve))
+
+function pendingDialog(method: 'select' | 'confirm' | 'input' | 'editor') {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const signals: AbortSignal[] = []
+  let answer!: () => void
+  const client: AcpClient = {
+    sessionUpdate: notification => conn.sessionUpdate(notification),
+    requestPermission: (params, options) => {
+      conn.permissionRequests.push(params)
+      signals.push(options!.cancellationSignal!)
+      return new Promise<RequestPermissionResponse>(resolve => {
+        answer = () => resolve({ outcome: { outcome: 'selected', optionId: method === 'select' ? 'choice-0' : 'yes' } })
+      })
+    },
+    createElicitation: (_params, options) => {
+      signals.push(options!.cancellationSignal!)
+      return new Promise<CreateElicitationResponse>(resolve => {
+        answer = () => resolve({ action: 'accept', content: { value: 'typed' } })
+      })
+    }
+  }
+  const session = new PiAcpSession({
+    sessionId: 'deadline',
+    cwd: '/tmp',
+    proc: proc as unknown as PiRpcProcess,
+    conn: client,
+    supportsElicitationForm: true
+  })
+  return {
+    conn,
+    proc,
+    session,
+    signals,
+    answer: () => answer(),
+    emit: (timeout: unknown = 25) =>
+      proc.emit({ type: 'extension_ui_request', id: 'dialog', method, options: ['a'], timeout }),
+    pendingCount: () => (session as unknown as { pendingUiRequests: Map<string, unknown> }).pendingUiRequests.size
+  }
+}
+
+for (const method of ['select', 'confirm', 'input', 'editor'] as const) {
+  test(`native ${method} expiry cancels ACP, forgets the dialog and ignores a late answer without writing to pi`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const h = pendingDialog(method)
+    t.after(() => h.session.dispose())
+    h.emit()
+    await flush()
+    assert.equal(h.signals.length, 1)
+    assert.equal(h.signals[0]!.aborted, false)
+    t.mock.timers.tick(25)
+    await flush()
+    assert.equal(h.signals[0]!.aborted, true, 'native deadline aborts the client request')
+    assert.equal(h.pendingCount(), 0)
+    assert.deepEqual(h.proc.extensionUiResponses, [], 'native expiry already resolved its default')
+    const expected =
+      method === 'select' || method === 'confirm'
+        ? [{ sessionUpdate: 'tool_call_update', toolCallId: 'pi-ui-dialog', status: 'completed' }]
+        : []
+    const completed = () => h.conn.updates.filter(n => n.update.sessionUpdate === 'tool_call_update').map(n => n.update)
+    assert.deepEqual(completed(), expected)
+    h.answer()
+    await flush()
+    assert.deepEqual(completed(), expected)
+    assert.deepEqual(h.proc.extensionUiResponses, [])
+  })
+
+  test(`${method} answer before native deadline settles once and clears expiry`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const h = pendingDialog(method)
+    t.after(() => h.session.dispose())
+    h.emit()
+    await flush()
+    h.answer()
+    await flush()
+    const expected =
+      method === 'select'
+        ? { id: 'dialog', value: 'a' }
+        : method === 'confirm'
+          ? { id: 'dialog', confirmed: true }
+          : { id: 'dialog', value: 'typed' }
+    assert.deepEqual(h.proc.extensionUiResponses, [expected])
+    assert.equal(h.pendingCount(), 0)
+    const delivered = h.conn.updates.length
+    t.mock.timers.tick(100)
+    await flush()
+    assert.equal(h.conn.updates.length, delivered)
+    assert.deepEqual(h.proc.extensionUiResponses, [expected])
+  })
+}
+
+test('native expiry while the permission announcement is blocked never opens a late request', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const h = pendingDialog('confirm')
+  t.after(() => h.session.dispose())
+  let release!: () => void
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const deliver = h.conn.sessionUpdate.bind(h.conn)
+  h.conn.sessionUpdate = async notification => {
+    if (notification.update.sessionUpdate === 'tool_call') await gate
+    await deliver(notification)
+  }
+  h.emit()
+  await flush()
+  t.mock.timers.tick(25)
+  await flush()
+  assert.equal(h.pendingCount(), 0)
+  assert.equal(h.conn.permissionRequests.length, 0)
+  release()
+  await flush()
+  assert.equal(h.conn.permissionRequests.length, 0)
+  assert.deepEqual(
+    h.conn.updates.map(n => [n.update.sessionUpdate, 'status' in n.update ? n.update.status : null]),
+    [
+      ['tool_call', 'pending'],
+      ['tool_call_update', 'completed']
+    ]
+  )
+  assert.deepEqual(h.proc.extensionUiResponses, [])
+})
+
+for (const timeout of [undefined, null, 0, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, '25']) {
+  test(`unrepresentable or disabled native timeout ${String(timeout)} leaves the dialog pending`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const h = pendingDialog('confirm')
+    t.after(() => h.session.dispose())
+    // Nonfinite native numbers are serialized as null on the JSON wire.
+    h.proc.emit(JSON.parse(JSON.stringify({ type: 'extension_ui_request', id: 'dialog', method: 'confirm', timeout })))
+    await flush()
+    t.mock.timers.tick(100)
+    await flush()
+    assert.equal(h.pendingCount(), 1)
+    assert.equal(h.signals[0]!.aborted, false)
+    assert.deepEqual(h.proc.extensionUiResponses, [])
+    await h.session.cancel()
+    assert.deepEqual(h.proc.extensionUiResponses, [{ id: 'dialog', cancelled: true }])
+  })
+}
+
+for (const timeout of [-25, 2 ** 31, 0.5, 1.9]) {
+  test(`native Node timeout ${timeout} expires after one millisecond`, async t => {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    const h = pendingDialog('confirm')
+    t.after(() => h.session.dispose())
+    h.emit(timeout)
+    await flush()
+    t.mock.timers.tick(1)
+    await flush()
+    assert.equal(h.pendingCount(), 0)
+    assert.equal(h.signals[0]!.aborted, true)
+    assert.deepEqual(h.proc.extensionUiResponses, [])
+  })
+}
+
+for (const settlement of ['cancel', 'dispose', 'duplicate', 'termination', 'shutdown'] as const) {
+  for (const expiredFirst of [false, true]) {
+    test(`native expiry and ${settlement} settle once (${expiredFirst ? 'expiry first' : 'explicit first'})`, async t => {
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      const h = pendingDialog('confirm')
+      t.after(() => h.session.dispose())
+      h.emit()
+      await flush()
+      if (expiredFirst) t.mock.timers.tick(25)
+      if (settlement === 'cancel') await h.session.cancel()
+      else if (settlement === 'dispose') h.session.dispose()
+      else if (settlement === 'termination') h.proc.emitTermination()
+      else if (settlement === 'shutdown') await h.session.shutdown()
+      else h.emit()
+      t.mock.timers.tick(25)
+      await flush()
+      h.answer()
+      await flush()
+      // A duplicate received after expiry is a new request, which expires independently.
+      const count = settlement === 'duplicate' && expiredFirst ? 2 : 1
+      assert.equal(h.conn.updates.filter(n => n.update.sessionUpdate === 'tool_call_update').length, count)
+      assert.equal(h.pendingCount(), 0)
+      assert.deepEqual(h.proc.extensionUiResponses, expiredFirst ? [] : [{ id: 'dialog', cancelled: true }])
+    })
+  }
+}
+
+test('expired permission completes before normal prompt settlement without waiting for a client answer', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const h = pendingDialog('confirm')
+  t.after(() => h.session.dispose())
+  const prompt = h.session.prompt('hello')
+  h.proc.emit({ type: 'agent_start' })
+  h.emit()
+  await flush()
+  t.mock.timers.tick(25)
+  await flush()
+  assert.equal(h.pendingCount(), 0)
+  assert.ok(h.conn.updates.some(n => n.update.sessionUpdate === 'tool_call_update' && n.update.status === 'completed'))
+  h.proc.emit({ type: 'agent_end' })
+  h.proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  const delivered = h.conn.updates.length
+  h.answer()
+  await flush()
+  assert.equal(h.conn.updates.length, delivered)
+  assert.deepEqual(h.proc.extensionUiResponses, [])
+})
+
+test('normal prompt and command completion preserve unrelated idle nontimed dialogs', async () => {
+  const h = pendingDialog('confirm')
+  try {
+    h.emit(0)
+    await flush()
+    const prompt = h.session.prompt('hello')
+    h.proc.emit({ type: 'agent_start' })
+    h.proc.emit({ type: 'agent_settled' })
+    assert.equal(await prompt, 'end_turn')
+    assert.equal(await h.session.runCommand(async () => 'done'), 'done')
+    assert.equal(h.pendingCount(), 1)
+    assert.equal(h.signals[0]!.aborted, false)
+    assert.deepEqual(h.proc.extensionUiResponses, [])
+    h.answer()
+    await flush()
+    assert.deepEqual(h.proc.extensionUiResponses, [{ id: 'dialog', confirmed: true }])
+  } finally {
+    h.session.dispose()
+  }
+})
 
 test('pending extension permissions cancel exactly once and ignore late replies', async () => {
   const conn = new FakeAgentSideConnection()
