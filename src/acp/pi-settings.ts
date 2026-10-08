@@ -27,13 +27,16 @@ function readJsonFile(path: string): Record<string, unknown> {
   }
 }
 
-export function getMergedPiSettings(cwd: string): Record<string, unknown> {
-  const globalSettingsPath = join(getAgentDir(), 'settings.json')
-  const projectSettingsPath = resolve(cwd, '.pi', 'settings.json')
+export function getGlobalPiSettings(): Record<string, unknown> {
+  return readJsonFile(join(getAgentDir(), 'settings.json'))
+}
 
-  const global = readJsonFile(globalSettingsPath)
-  const project = readJsonFile(projectSettingsPath)
-  return deepMerge(global, project)
+export function getMergedPiSettings(
+  cwd: string,
+  globalSettings: Record<string, unknown> = getGlobalPiSettings()
+): Record<string, unknown> {
+  const project = readJsonFile(resolve(cwd, '.pi', 'settings.json'))
+  return deepMerge(globalSettings, project)
 }
 
 export function getAgentDir(): string {

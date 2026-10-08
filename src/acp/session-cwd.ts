@@ -45,11 +45,12 @@ function physicalPath(path: string): string | null {
  * directories in `session/list` — and callers that pass an explicit flavor
  * fall back to deterministic lexical comparison.
  */
+export function resolveCwdForComparison(cwd: string, flavor?: PathFlavor): string {
+  return normalizeCwdForComparison(flavor ? cwd : (physicalPath(cwd) ?? cwd), flavor)
+}
+
 export function sessionCwdsEquivalent(left: string, right: string, flavor?: PathFlavor): boolean {
-  if (flavor) return normalizeCwdForComparison(left, flavor) === normalizeCwdForComparison(right, flavor)
-  return (
-    normalizeCwdForComparison(physicalPath(left) ?? left) === normalizeCwdForComparison(physicalPath(right) ?? right)
-  )
+  return resolveCwdForComparison(left, flavor) === resolveCwdForComparison(right, flavor)
 }
 
 export function assertValidSessionCwd(cwd: string): void {
