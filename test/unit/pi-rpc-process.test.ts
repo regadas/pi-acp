@@ -244,7 +244,7 @@ test('PiRpcProcess: prompt timeout quarantines the channel and suppresses late r
   assert.equal(terminations[0]?.expected, false, 'fault quarantine is not an ACP cancellation')
 })
 
-test('PiRpcProcess: prompt wires followUp streaming behavior and resolves on success', async () => {
+test('PiRpcProcess: prompt omits unwithdrawable native queue fallback and resolves on success', async () => {
   const mock = new MockChild()
   const proc = PiRpcProcess.fromChild(asChild(mock), { requestTimeoutMs: 5_000 })
   const stdinLines = collectStdin(mock)
@@ -263,9 +263,9 @@ test('PiRpcProcess: prompt wires followUp streaming behavior and resolves on suc
   assert.deepEqual(request.images, images)
   assert.equal(typeof request.id, 'string')
   assert.ok((request.id as string).length > 0)
-  // Non-interrupting TOCTOU backstop: pi only consults streamingBehavior when
-  // already streaming, where a bare prompt would be rejected outright.
-  assert.equal(request.streamingBehavior, 'followUp')
+  // A busy race must reject before acceptance, not insert unwithdrawable text
+  // into a foreign native queue. Owned adapter prompts can then re-admit safely.
+  assert.equal(request.streamingBehavior, undefined)
 
   // A success response (immediate acceptance or queued as follow-up) resolves.
   // The synchronous callback is the exact ownership boundary: records already
@@ -885,3 +885,171 @@ for (const boundary of ['clear_queue', 'abort']) {
     })
   }
 }
+
+for (const ending of ['settlement', 'channel-death', 'ordinary-read-timeout']) {
+  test(`PiRpcProcess: only admission response budget excludes native unsettled hook time: ${ending}`, async t => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] })
+    const mock = new MockChild()
+    const proc = PiRpcProcess.fromChild(asChild(mock))
+    t.after(() => mock.emit('close', 0, null))
+    const lines = collectStdin(mock)
+    mock.stdin.on('data', chunk => {
+      const command = JSON.parse(String(chunk))
+      if (command.type === 'get_commands')
+        mock.stdout.write(
+          JSON.stringify({
+            type: 'response',
+            id: command.id,
+            command: command.type,
+            success: true,
+            data: { commands: [{ name: 'pi-acp-control' }] }
+          }) + '\n'
+        )
+    })
+    mock.stdout.write('{"type":"agent_start"}\n{"type":"agent_end"}\n')
+    const stage = proc.stagePrompt('11111111-1111-4111-8111-111111111111').then(
+      () => undefined,
+      error => error
+    )
+    await tick()
+    t.mock.timers.tick(600_001)
+    await tick()
+    assert.deepEqual(mock.kills, [], 'unsettled native hook cannot consume admission ACK budget')
+    assert.equal(proc.hasPendingRequests(), false, 'admission bookkeeping is not uncancellable foreground/manual work')
+    if (ending === 'channel-death') {
+      mock.emit('close', 23, null)
+      assert.ok((await stage) instanceof PiRpcClosedError)
+    } else if (ending === 'ordinary-read-timeout') {
+      const read = proc.getState().catch(error => error)
+      t.mock.timers.tick(30_001)
+      await tick()
+      assert.ok((await read) instanceof PiRpcRequestTimeoutError, 'ordinary reads retain their wall-clock deadline')
+      assert.ok((await stage) instanceof PiRpcClosedError)
+      assert.deepEqual(mock.kills, ['SIGTERM'])
+    } else {
+      mock.stdout.write('{"type":"agent_settled"}\n')
+      t.mock.timers.tick(29_999)
+      await tick()
+      assert.deepEqual(mock.kills, [])
+      t.mock.timers.tick(2)
+      await tick()
+      assert.ok(
+        (await stage) instanceof PiRpcRequestTimeoutError,
+        'unanswered admission after idle remains fail-closed'
+      )
+      assert.deepEqual(mock.kills, ['SIGTERM'])
+    }
+    assert.ok(lines.some(line => JSON.parse(line).message?.includes('begin')))
+  })
+}
+
+test('PiRpcProcess: a run starting before ready response prevents raw preacceptance delivery', async t => {
+  const mock = new MockChild()
+  const proc = PiRpcProcess.fromChild(asChild(mock))
+  t.after(() => mock.emit('close', 0, null))
+  const lines = collectStdin(mock)
+  mock.stdin.on('data', chunk => {
+    const command = JSON.parse(String(chunk))
+    if (command.type === 'get_commands')
+      mock.stdout.write(
+        JSON.stringify({
+          type: 'response',
+          id: command.id,
+          command: command.type,
+          success: true,
+          data: { commands: [{ name: 'pi-acp-control' }] }
+        }) + '\n'
+      )
+    else if (command.message?.includes('begin')) {
+      const owner = command.message.split(' ')[2]
+      mock.stdout.write(
+        [
+          {
+            type: 'extension_ui_request',
+            id: 'widget',
+            method: 'setWidget',
+            widgetKey: 'pi-acp-lifecycle',
+            widgetLines: [JSON.stringify({ version: 1, owner, state: 'ready' })]
+          },
+          { type: 'agent_start' },
+          { type: 'response', id: command.id, command: command.type, success: true }
+        ]
+          .map(record => JSON.stringify(record))
+          .join('\n') + '\n'
+      )
+    }
+  })
+  mock.stdin.on('data', chunk => {
+    const command = JSON.parse(String(chunk))
+    if (command.message === 'must remain locally staged')
+      mock.stdout.write(
+        JSON.stringify({
+          type: 'response',
+          id: command.id,
+          command: 'prompt',
+          success: true,
+          data: { disposition: 'started' }
+        }) + '\n'
+      )
+  })
+  const result = await proc
+    .prompt('must remain locally staged', [], undefined, '11111111-1111-4111-8111-111111111111')
+    .catch(error => error)
+  assert.ok(result instanceof Error)
+  assert.equal(result.constructor.name, 'PiRpcPromptDeferredError')
+  assert.equal(lines.filter(line => JSON.parse(line).message === 'must remain locally staged').length, 0)
+  assert.deepEqual(mock.kills, [])
+})
+
+test('PiRpcProcess: live admission timer pauses and resumes only its remaining idle budget', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] })
+  const mock = new MockChild()
+  const proc = PiRpcProcess.fromChild(asChild(mock))
+  t.after(() => mock.emit('close', 0, null))
+  const lines = collectStdin(mock)
+  mock.stdin.on('data', chunk => {
+    const command = JSON.parse(String(chunk))
+    if (command.type === 'get_commands')
+      mock.stdout.write(
+        JSON.stringify({
+          type: 'response',
+          id: command.id,
+          command: command.type,
+          success: true,
+          data: { commands: [{ name: 'pi-acp-control' }] }
+        }) + '\n'
+      )
+  })
+  let outcome: unknown
+  const stage = proc.stagePrompt('11111111-1111-4111-8111-111111111111').then(
+    () => {
+      outcome = 'accepted'
+    },
+    (error: unknown) => {
+      outcome = error
+      return error
+    }
+  )
+  await tick()
+  assert.ok(
+    lines.some(line => JSON.parse(line).message?.includes('begin')),
+    'idle begin has an armed response timer'
+  )
+  t.mock.timers.tick(20_000)
+  mock.stdout.write('{"type":"agent_start"}\n{"type":"agent_end"}\n')
+  t.mock.timers.tick(600_001)
+  await tick()
+  assert.deepEqual(mock.kills, [], 'new native work pauses the already-live timer through awaited settlement hooks')
+  assert.equal(outcome, undefined)
+  mock.stdout.write('{"type":"agent_settled"}\n')
+  t.mock.timers.tick(9_999)
+  await tick()
+  assert.deepEqual(mock.kills, [], 'remaining idle budget has not expired')
+  assert.equal(outcome, undefined)
+  t.mock.timers.tick(2)
+  await tick()
+  assert.deepEqual(mock.kills, ['SIGTERM'], 'resume must not reset admission to a fresh thirty-second budget')
+  const error = await stage
+  assert.ok(error instanceof PiRpcRequestTimeoutError)
+  assert.equal(proc.hasPendingRequests(), false)
+})

@@ -15,6 +15,7 @@ function harness() {
   const ctx = {
     isIdle: () => true,
     hasPendingMessages: () => false,
+    waitForIdle: async () => {},
     sessionManager: { getSessionId: () => 'session', getSessionFile: () => '/session' },
     ui: { setWidget: (_key: string, lines: string[]) => updates.push(JSON.parse(lines[0]!)) }
   }
@@ -301,8 +302,7 @@ test('pre-existing same-session work is not adopted; ordinary Pi needs no option
   let busy = true
   h.register({ name: 'pi-subagents', sessionId: 'session', isActive: () => busy })
   await h.command(`begin ${owner}`)
-  assert.equal(h.updates.at(-1).state, 'rejected')
-  assert.match(h.updates.at(-1).error, /Pre-existing or restored background work.*wait.*or open a new session/)
+  assert.equal(h.updates.at(-1).state, 'ready', 'live restored children are not model ownership')
   busy = false
   await h.command(`begin ${owner}`)
   assert.equal(h.updates.at(-1).state, 'ready')
@@ -766,5 +766,142 @@ for (const shape of [
     live = false
     await h.command(`check ${owner}`)
     assert.equal(h.updates.at(-1).state, 'cancelled')
+  })
+}
+
+test('companion stages exact tokens while busy and ignores readiness after withdrawal or replacement', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const waiters: Array<() => void> = []
+  h.ctx.waitForIdle = () => new Promise<void>(resolve => waiters.push(resolve))
+  h.ctx.isIdle = () => false
+  h.emit('agent_start')
+  await h.command(`begin ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'waiting')
+  await h.command(`withdraw ${owner}`)
+  const next = '77777777-7777-4777-8777-777777777777'
+  await h.command(`begin ${next}`)
+  h.ctx.isIdle = () => true
+  h.emit('agent_settled')
+  waiters[0]!()
+  await Promise.resolve()
+  assert.equal(h.updates.at(-1).state, 'waiting', 'withdrawn token cannot emit late readiness')
+  waiters[1]!()
+  await Promise.resolve()
+  assert.deepEqual(h.updates.at(-1), { version: 1, owner: next, state: 'ready' })
+})
+
+test('companion admits a live restored child without claiming it or a foreign model run', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.register({ name: 'pi-subagents', sessionId: 'session', isActive: () => true })
+  await h.command(`begin ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'ready')
+  h.emit('agent_start')
+  h.emit('tool_result', { toolName: 'subagent', details: { asyncId: 'foreign-child' } })
+  assert.equal(
+    h.updates.some(update => update.state === 'active'),
+    false
+  )
+  h.emit('agent_settled')
+  const next = '77777777-7777-4777-8777-777777777777'
+  await h.command(`begin ${next}`)
+  const requests: string[] = []
+  h.events.on('subagents:rpc:v1:request', request => requests.push(request.method))
+  await h.command(`cancel ${next}`)
+  assert.deepEqual(requests, [], 'new foreground token has no stop authority over restored/foreign children')
+})
+
+for (const residual of ['idle', 'native-run', 'pending-messages']) {
+  test(`companion cancellation with no owned children ignores foreign liveness but preserves ${residual}`, async t => {
+    const h = harness()
+    t.after(() => h.emit('session_shutdown'))
+    let livenessReads = 0
+    h.register({
+      name: 'pi-subagents',
+      sessionId: 'session',
+      isActive: () => {
+        livenessReads++
+        return true
+      }
+    })
+    const requests: string[] = []
+    h.events.on('subagents:rpc:v1:request', request => requests.push(request.method))
+    await h.command(`begin ${owner}`)
+    h.emit('input', { source: 'rpc', text: 'ordinary question' })
+    h.emit('before_agent_start', { prompt: 'ordinary question' })
+    h.emit('agent_start')
+    h.emit('message_start', { message: { role: 'user', content: 'ordinary question' } })
+    h.emit('agent_settled')
+    h.ctx.isIdle = () => residual !== 'native-run'
+    h.ctx.hasPendingMessages = () => residual === 'pending-messages'
+    await h.command(`cancel ${owner}`)
+    await h.command(`check ${owner}`)
+    assert.equal(h.updates.at(-1).state, residual === 'idle' ? 'cancelled' : 'pending')
+    h.ctx.isIdle = () => true
+    h.ctx.hasPendingMessages = () => false
+    await h.command(`check ${owner}`)
+    assert.equal(h.updates.at(-1).state, 'cancelled', 'foreign provider cannot hold an empty cancellation scope')
+    assert.equal(livenessReads, 0, 'foreign child liveness is irrelevant without observed owned IDs')
+    assert.deepEqual(requests, [], 'no status, interrupt or stop authority over unrelated work')
+  })
+}
+
+for (const normalization of ['unchanged', 'resized', 'failed', 'text-only-prefix', 'foreign-image-input']) {
+  test(`companion correlates image normalization without adopting foreign input: ${normalization}`, async t => {
+    const h = harness()
+    t.after(() => h.emit('session_shutdown'))
+    const image = { type: 'image', data: 'fixture', mimeType: 'image/png' }
+    const hasImages = normalization !== 'text-only-prefix'
+    let live = true
+    h.register({ name: 'pi-subagents', sessionId: 'session', isActive: () => live })
+    await h.command(`begin ${owner}`)
+    h.emit('input', { source: 'rpc', text: '/inspect', images: hasImages ? [image] : undefined })
+    // Pi expands input before this hook and appends normalization hints afterward.
+    h.emit('before_agent_start', { prompt: 'expanded inspection', images: hasImages ? [image] : undefined })
+    if (normalization === 'foreign-image-input') {
+      h.emit('input', { source: 'extension', text: 'expanded inspection', images: [image] })
+      h.emit('before_agent_start', { prompt: 'expanded inspection', images: [image] })
+    }
+    h.emit('agent_start')
+    const hints = normalization === 'unchanged' ? '' : '\n\nImage processing hint'
+    h.emit('message_start', {
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: `expanded inspection${hints}` },
+          ...(hasImages && normalization !== 'failed' ? [image] : [])
+        ]
+      }
+    })
+    h.emit('tool_result', { toolName: 'subagent', details: { asyncId: 'owned-image-child' } })
+    const stops: string[] = []
+    h.events.on('subagents:rpc:v1:request', request => {
+      if (request.method === 'stop') stops.push(request.params.id)
+      h.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+        version: 1,
+        requestId: request.requestId,
+        success: true,
+        data:
+          request.method === 'status'
+            ? {
+                asyncSnapshot: {
+                  kind: 'pi-subagents.async-status-snapshot',
+                  version: 1,
+                  runs: [
+                    { id: 'owned-image-child', state: 'running' },
+                    { id: 'unrelated-child', state: 'running' }
+                  ]
+                }
+              }
+            : { runId: request.params.id }
+      })
+    })
+    await h.command(`cancel ${owner}`)
+    assert.deepEqual(
+      stops,
+      ['text-only-prefix', 'foreign-image-input'].includes(normalization) ? [] : ['owned-image-child']
+    )
+    live = false
   })
 }

@@ -207,7 +207,16 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
           sessionId: 'sess-1',
           sessionFile: String(params.sessionPath)
         }),
-        prompt: async () => {}
+        prompt: async (
+          _message: string,
+          _images: unknown[],
+          onAccepted?: () => void,
+          _owner?: string,
+          onDispatched?: () => void
+        ) => {
+          onDispatched?.()
+          onAccepted?.()
+        }
       } as any
     }
 

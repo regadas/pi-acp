@@ -105,9 +105,15 @@ class RecordingPiRpcProcess extends FakePiRpcProcess {
     super()
   }
 
-  override async prompt(message: string, attachments: unknown[] = []): Promise<void> {
+  override async prompt(
+    message: string,
+    attachments: unknown[] = [],
+    onAccepted?: () => void,
+    owner?: string,
+    onDispatched?: () => void
+  ): Promise<void> {
     this.record({ kind: 'prompt', message })
-    await super.prompt(message, attachments)
+    await super.prompt(message, attachments, onAccepted, owner, onDispatched)
   }
 
   override async abort(): Promise<void> {

@@ -59,7 +59,14 @@ function withDelayedPreflight(proc: FakePiRpcProcess) {
   const preflight = deferred()
   let accept: (() => void) | null = null
 
-  proc.prompt = (message: string, images: unknown[] = [], onAccepted?: () => void) => {
+  proc.prompt = (
+    message: string,
+    images: unknown[] = [],
+    onAccepted?: () => void,
+    _owner?: string,
+    onDispatched?: () => void
+  ) => {
+    onDispatched?.()
     proc.prompts.push({ message, attachments: images })
     accept = onAccepted ?? null
     written.resolve()
@@ -99,7 +106,14 @@ function withQueuedFollowUp(proc: FakePiRpcProcess) {
   let accept: (() => void) | null = null
   let queuedText = ''
 
-  proc.prompt = (message: string, images: unknown[] = [], onAccepted?: () => void) => {
+  proc.prompt = (
+    message: string,
+    images: unknown[] = [],
+    onAccepted?: () => void,
+    _owner?: string,
+    onDispatched?: () => void
+  ) => {
+    onDispatched?.()
     proc.prompts.push({ message, attachments: images })
     accept = onAccepted ?? null
     queuedText = message

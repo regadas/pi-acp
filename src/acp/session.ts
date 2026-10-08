@@ -11,7 +11,13 @@ import type {
 import type { AcpClient } from './client.js'
 import { fileSnapshot } from './file-snapshot.js'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
-import { PiRpcProcess, PiRpcRequestTimeoutError, type PiRpcEvent, type PiRpcTermination } from '../pi-rpc/process.js'
+import {
+  PiRpcProcess,
+  PiRpcRequestTimeoutError,
+  PiRpcPromptDeferredError,
+  type PiRpcEvent,
+  type PiRpcTermination
+} from '../pi-rpc/process.js'
 import type { PiAssistantMessageEvent } from '../pi-rpc/protocol.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { terminationError, toRequestError } from './session-errors.js'
@@ -164,8 +170,8 @@ const PI_TURN_BOUND_EVENT_TYPES = new Set([
   'compaction_end'
 ])
 // An observed out-of-band run should always emit agent_settled. Keep the wait
-// finite so a lost event cannot hang ACP forever, but fail closed rather than
-// dispatching into a run whose lifecycle this turn does not own.
+// finite for adapter commands that require exclusive access. Ordinary input
+// uses withdrawable staged admission instead of a run-duration deadline.
 const DEFERRED_ADMISSION_TIMEOUT_MS = 10 * 60_000
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
@@ -285,7 +291,6 @@ export class PiAcpSession {
   // separate state machines, so every settlement path (complete, fail, cancel,
   // shutdown, disposal, termination) must clear *both*.
   private deferredDispatch: { turn: PendingTurn; message: string; images: unknown[] } | null = null
-  private deferredAdmissionTimer: NodeJS.Timeout | null = null
   // Adapter command holding the FIFO slot while an out-of-band pi run settles.
   private deferredCommandAdmission: DeferredCommandAdmission | null = null
   private deferredCommandAdmissionTimer: NodeJS.Timeout | null = null
@@ -348,6 +353,7 @@ export class PiAcpSession {
     // hand the FIFO on, and only the turn installed at termination may be
     // failed with this termination error.
     const turn = this.pendingTurn
+    this.terminalizeToolCalls()
 
     // Adapter-driven teardown (dispose/close) settles as a cancellation, not
     // as an internal error surfaced to the client. Fault quarantine explicitly
@@ -468,6 +474,13 @@ export class PiAcpSession {
     return maybeAuthRequiredError(err, this.authMethods) ?? toRequestError(err)
   }
 
+  private backgroundCancellationOwner(): string | undefined {
+    const turn = this.pendingTurn
+    // A completing turn normally holds only the ACP flush barrier. Failed
+    // cancellation transactions still retain their exact descendant scope.
+    return turn?.piRunOwned && (!turn.completionStarted || turn.cancellationPending) ? turn.owner : undefined
+  }
+
   dispose(options?: { expected?: boolean }): void {
     this.drainPendingUiRequests()
     if (this.disposed) return
@@ -485,9 +498,10 @@ export class PiAcpSession {
     try {
       this.unsubscribe()
     } finally {
+      const backgroundOwner = this.backgroundCancellationOwner()
       this.proc.dispose({
         expected: this.disposalExpected,
-        ...(this.pendingTurn?.piRunOwned ? { backgroundOwner: this.pendingTurn.owner } : {})
+        ...(backgroundOwner ? { backgroundOwner } : {})
       })
     }
   }
@@ -940,10 +954,15 @@ export class PiAcpSession {
 
     const activeTurn = this.pendingTurn
     if (activeTurn && !activeTurn.promptDispatched) {
-      // Nothing of this turn ever reached pi: the active run (if any) is
-      // out-of-band work this session does not own, so aborting pi would
-      // interrupt unrelated work. Settle locally with zero sends.
+      // Only admission bookkeeping may have reached pi, never the raw payload.
+      // Invalidate locally; native withdrawal can wait behind settlement hooks
+      // without making cancellation wait or aborting unrelated work.
       this.clearDeferredDispatch()
+      try {
+        await this.proc.withdrawPrompt(activeTurn.owner)
+      } catch {
+        this.dispose({ expected: false })
+      }
       this.completeTurn(activeTurn)
       await this.flushEmits()
       this.settleCancelledQueue(queued)
@@ -1044,20 +1063,23 @@ export class PiAcpSession {
 
     // Drop any held dispatch or parked command admission before the first
     // await so their admission timeouts cannot race shutdown settlement.
+    const stagedTurn = this.pendingTurn && !this.pendingTurn.promptDispatched ? this.pendingTurn : null
     this.clearDeferredDispatch()
+    if (stagedTurn) await this.proc.withdrawPrompt(stagedTurn.owner).catch(() => this.dispose({ expected: false }))
     this.releaseDeferredCommandAdmission()
 
     // Drain the queue synchronously so nothing already queued can start while
     // abort is in flight, but settle those requests only after final updates.
     const queued = this.turnQueue.splice(0, this.turnQueue.length)
 
-    if (this.pendingTurn) this.pendingTurn.cancellationPending = true
+    const backgroundOwner = this.backgroundCancellationOwner()
+    if (this.pendingTurn && !this.pendingTurn.completionStarted) this.pendingTurn.cancellationPending = true
     try {
-      await this.proc.abort(this.pendingTurn?.piRunOwned ? this.pendingTurn.owner : undefined)
+      if (!stagedTurn) await this.proc.abort(backgroundOwner)
     } catch (error) {
       // Shutdown still settles, but a lost Pi channel does not prove detached
       // descendants terminated. Publish the uncertainty before releasing ACP.
-      if (this.pendingTurn?.piRunOwned)
+      if (backgroundOwner)
         this.emit({
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: `Cancellation failed: ${String(error)}; detached work may still be running.` }
@@ -1380,7 +1402,7 @@ export class PiAcpSession {
   }
 
   private startTurn(t: QueuedPrompt): void {
-    this.settledToolCallIds.clear()
+    if (!this.piBusyOutOfBand) this.settledToolCallIds.clear()
     this.cancelRequested = false
     this.agentRunObserved = false
     this.lastDoneReason = null
@@ -1428,7 +1450,8 @@ export class PiAcpSession {
     //   turn so the ACP request does not hang.
     // While pi is observably busy with an out-of-band run, the raw prompt is
     // held (the ACP turn stays admitted) and dispatched only after that run's
-    // authoritative settlement. A finite timeout fails closed.
+    // authoritative settlement. The bridge acknowledges withdrawable input
+    // without imposing a runtime deadline on healthy autonomous work.
     this.dispatchOrDefer(turn, t.message, t.images)
   }
 
@@ -1439,28 +1462,41 @@ export class PiAcpSession {
     // prompt rejection path instead of parking the turn behind a run that can
     // no longer settle.
     if (this.piBusyOutOfBand && !this.procTermination) {
-      this.deferredDispatch = { turn, message, images }
-      const timer = setTimeout(() => {
-        if (this.deferredAdmissionTimer === timer) this.deferredAdmissionTimer = null
-        if (this.deferredDispatch?.turn !== turn) return
-
-        this.deferredDispatch = null
-        const error = new Error('Timed out waiting for out-of-band pi work to settle before dispatching the prompt.')
-        // The child lifecycle can no longer be correlated safely. Quarantine
-        // it and reject every admitted/queued turn without sending the prompt.
-        this.dispose({ expected: false })
-        this.failTurn(turn, error)
-      }, this.deferredAdmissionTimeoutMs)
-      // Keep referenced: this timer is the fail-closed settlement path.
-      this.deferredAdmissionTimer = timer
+      this.deferPrompt(turn, message, images)
       return
     }
 
     this.dispatchPrompt(turn, message, images)
   }
 
-  private dispatchPrompt(turn: PendingTurn, message: string, images: unknown[]): void {
+  private deferPrompt(turn: PendingTurn, message: string, images: unknown[]): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
+    turn.promptDispatched = false
+    // A busy rejection never accepted this attempt. Queue updates in its
+    // preflight window described foreign input, not the payload being re-staged.
+    turn.promptAccepted = false
+    turn.promptQueued = false
+    turn.expectedPromptText = message
+    turn.matchingPromptMessagesToSkip = 0
+    this.deferredDispatch = { turn, message, images }
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: {
+        type: 'text',
+        text: 'Input queued locally while Pi finishes its current model run; native admission may still be pending and autonomous progress remains visible.'
+      }
+    })
+    void this.proc.stagePrompt(turn.owner).catch(error => {
+      if (this.pendingTurn !== turn || turn.completionStarted) return
+      if (error instanceof PiRpcRequestTimeoutError) this.dispose({ expected: false })
+      this.failTurn(turn, error)
+    })
+  }
+
+  private dispatchPrompt(turn: PendingTurn, message: string, images: unknown[]): void {
+    if (this.pendingTurn !== turn || turn.completionStarted || this.isClosing()) return
+
+    this.clearDeferredDispatch()
 
     // Custom messages that arrived during deferral were buffered because the
     // Pi run was not owned by this ACP turn. Flush them now, still inside the
@@ -1482,9 +1518,11 @@ export class PiAcpSession {
     // buffered ahead of pi's response, so raw dispatch cannot establish event
     // ownership. PiRpcProcess invokes this callback synchronously on the
     // successful response record, before later records in the same chunk.
-    turn.promptDispatched = true
+    const markDispatched = () => {
+      turn.promptDispatched = true
+    }
     const markAccepted = () => {
-      if (this.pendingTurn !== turn || turn.completionStarted || turn.promptAccepted) return
+      if (this.pendingTurn !== turn || turn.completionStarted || turn.promptAccepted || !turn.promptDispatched) return
       turn.promptAccepted = true
       // With no observed run and no pre-response follow-up queue update, pi
       // took its idle path. It writes success immediately before starting
@@ -1495,14 +1533,19 @@ export class PiAcpSession {
       }
     }
     this.proc
-      .prompt(message, images, markAccepted, turn.owner)
+      .prompt(message, images, markAccepted, turn.owner, markDispatched)
       .then(() => {
-        // Compatibility for test doubles and older embedders that implement
-        // prompt() but ignore the optional synchronous acceptance callback.
+        if (this.pendingTurn !== turn || turn.completionStarted || !turn.promptDispatched) return
+        // Doubles that signal raw dispatch but omit synchronous acceptance
+        // can establish acceptance when their prompt() promise resolves.
         markAccepted()
         this.handlePromptAccepted(turn)
       })
       .catch(err => {
+        if (err instanceof PiRpcPromptDeferredError) {
+          this.deferPrompt(turn, message, images)
+          return
+        }
         if (err instanceof PiRpcRequestTimeoutError && err.command === 'prompt') {
           // PiRpcProcess already quarantined the channel. Unsubscribe session
           // event handling immediately and mark this session unavailable so a
@@ -1514,17 +1557,13 @@ export class PiAcpSession {
   }
 
   /**
-   * Drop the held dispatch payload and its admission timer. `deferredDispatch`
+   * Drop the held dispatch payload. `deferredDispatch`
    * always refers to the current pending turn, so every settlement path
    * (complete, fail, cancel, shutdown, disposal, process termination) clears
-   * it unconditionally and no late timeout can send or settle it twice.
+   * it unconditionally; token checks prevent late readiness from sending it.
    */
   private clearDeferredDispatch(): void {
     this.deferredDispatch = null
-    if (this.deferredAdmissionTimer) {
-      clearTimeout(this.deferredAdmissionTimer)
-      this.deferredAdmissionTimer = null
-    }
   }
 
   /**
@@ -1580,7 +1619,7 @@ export class PiAcpSession {
   private completeTurn(turn: PendingTurn): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
-    this.terminalizeToolCalls()
+    if (turn.piRunOwned || !this.piBusyOutOfBand) this.terminalizeToolCalls()
     this.clearDeferredDispatch()
     const reason: StopReason = this.cancelRequested
       ? 'cancelled'
@@ -1611,7 +1650,7 @@ export class PiAcpSession {
   private failTurn(turn: PendingTurn, err: unknown, piSettled = false): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
-    this.terminalizeToolCalls()
+    if (turn.piRunOwned || !this.piBusyOutOfBand) this.terminalizeToolCalls()
     this.clearDeferredDispatch()
 
     // Keep the failed turn installed while its existing updates flush so any
@@ -1823,15 +1862,9 @@ export class PiAcpSession {
     const ownsPiTurn = this.turnOwnsPiRun(turn)
 
     // Pi extensions may run autonomously. Until an accepted prompt owns pi's
-    // run, turn-bound output must not escape, mutate its result, or race a turn
-    // already completing. Preserve the legacy translator test seam for
-    // isolated events with no observed lifecycle; real pi emits agent_start.
-    const suppressUnownedPiOutput =
-      !ownsPiTurn &&
-      (this.piBusyOutOfBand ||
-        Boolean(turn?.promptDispatched) ||
-        Boolean(turn?.completionStarted) ||
-        Boolean(this.lifecycleAmbiguity))
+    // run, output is session-scoped progress, not its result. Ambiguous
+    // lifecycle output stays suppressed; permissions retain owned attribution.
+    const suppressUnownedPiOutput = !ownsPiTurn && Boolean(this.lifecycleAmbiguity)
     if (PI_TURN_BOUND_EVENT_TYPES.has(type) && suppressUnownedPiOutput) return
 
     switch (type) {
@@ -2016,6 +2049,7 @@ export class PiAcpSession {
         }
 
         if (ame?.type === 'done') {
+          if (!ownsPiTurn && (this.piBusyOutOfBand || turn)) break
           const reason = typeof ame.reason === 'string' ? ame.reason : null
           // A known successful completion supersedes a provisional error from
           // an attempt that pi recovered via retry or compaction. Unknown future
@@ -2030,6 +2064,7 @@ export class PiAcpSession {
         }
 
         if (ame?.type === 'error') {
+          if (!ownsPiTurn && (this.piBusyOutOfBand || turn)) break
           const reason = typeof ame.reason === 'string' ? ame.reason : 'error'
           const errorMessage = (ame as { error?: { errorMessage?: unknown } })?.error?.errorMessage
           const detail = typeof errorMessage === 'string' && errorMessage ? `: ${errorMessage}` : ''
@@ -2063,7 +2098,7 @@ export class PiAcpSession {
         }
         const activeTurn = this.pendingTurn
 
-        if (this.turnOwnsPiRun(activeTurn) || this.activeAdapterPromptTurns > 0) {
+        if (this.piBusyOutOfBand || this.turnOwnsPiRun(activeTurn) || this.activeAdapterPromptTurns > 0) {
           this.emitCustomMessageBlocks(blocks)
         } else {
           this.pendingCustomMessages.push(pendingMessage)
@@ -2279,7 +2314,7 @@ export class PiAcpSession {
         if ((ev as { success?: unknown }).success === false) {
           const finalError = stringProp(ev, 'finalError')
           const text = finalError ? `Automatic retry failed: ${finalError}` : 'Automatic retry failed.'
-          this.turnFailure = new Error(text)
+          if (ownsPiTurn || (!turn && !this.piBusyOutOfBand)) this.turnFailure = new Error(text)
           this.emit({
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text } satisfies ContentBlock
@@ -2287,7 +2322,7 @@ export class PiAcpSession {
           break
         }
 
-        this.turnFailure = null
+        if (ownsPiTurn || (!turn && !this.piBusyOutOfBand)) this.turnFailure = null
         this.emit({
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'Retry finished, resuming.' } satisfies ContentBlock
@@ -2359,6 +2394,7 @@ export class PiAcpSession {
           activeTurn.agentRunEverObserved = true
         }
         this.lowLevelAgentEnded = false
+        if (this.piBusyOutOfBand && !this.lifecycleAmbiguity) this.sendPendingCustomMessages()
         break
       }
 
@@ -2393,6 +2429,10 @@ export class PiAcpSession {
           if (ambiguousTurn && !ambiguousTurn.completionStarted) this.failTurn(ambiguousTurn, ambiguity)
           break
         }
+
+        // Retire autonomous cards at their own boundary before replacement
+        // dispatch. Staged cancellation alone cannot close these live cards.
+        if (!ownsPiTurn) this.terminalizeToolCalls()
 
         // Whatever unambiguous run was active has now reached its sole
         // authoritative AgentSession boundary.
@@ -2432,9 +2472,9 @@ export class PiAcpSession {
         }
 
         activeTurn.piSettled = true
-        if (activeTurn.backgroundActive || activeTurn.cancellationPending) {
-          // The companion owns exact async runs from this prompt and holds through
-          // pending notification delivery. Their synthesis starts a fresh Pi run.
+        if (activeTurn.cancellationPending) {
+          // Native abort and exact-child cancellation share one bounded
+          // transaction; neither a widget nor native settlement alone ends it.
           this.agentRunObserved = false
           break
         }
@@ -2534,7 +2574,13 @@ export class PiAcpSession {
         if (!Array.isArray(lines) || lines.length !== 1 || typeof lines[0] !== 'string') return
         const state = JSON.parse(lines[0]) as { version?: unknown; owner?: unknown; state?: unknown; error?: unknown }
         if (!turn || turn.completionStarted || state.version !== 1 || state.owner !== turn.owner) return
-        if (state.state === 'error') {
+        if (state.state === 'ready') {
+          const deferred = this.deferredDispatch
+          if (deferred?.turn === turn && !this.piBusyOutOfBand) {
+            this.clearDeferredDispatch()
+            this.dispatchPrompt(turn, deferred.message, deferred.images)
+          }
+        } else if (state.state === 'error') {
           const error = new Error(`Background harness: ${String(state.error ?? 'lifecycle failed')}`)
           this.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: error.message } })
           // The abort transaction owns cancellation settlement and its explicit

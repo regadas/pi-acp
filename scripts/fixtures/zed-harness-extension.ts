@@ -4,6 +4,9 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export default function (pi: import('@earendil-works/pi-coding-agent').ExtensionAPI) {
+  let raceInjected = false
+  let holdSettlementHook = false
+  let holdAutonomous = false
   let active = false
   let runState = 'running'
   let launchMode = ''
@@ -173,19 +176,92 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
         message.content = [{ type: 'toolCall', id: crypto.randomUUID(), name: 'subagent', arguments: {} }]
         message.stopReason = 'toolUse'
       }
-      setTimeout(() => {
+      const deferredSynthesis = JSON.stringify(last?.content).includes('DEFERRED_SYNTHESIS')
+      const autonomous = holdAutonomous && JSON.stringify(last?.content).includes('ASYNC_COMPLETION')
+      if (deferredSynthesis) {
+        message.content = [{ type: 'text', text: 'DEFERRED_SYNTHESIS_PROGRESS' }]
         stream.push({ type: 'start', partial: message })
+        stream.push({ type: 'text_delta', contentIndex: 0, delta: 'DEFERRED_SYNTHESIS_PROGRESS', partial: message })
+      }
+      if (autonomous) {
+        holdAutonomous = false
+        message.content = [{ type: 'text', text: 'AUTONOMOUS_PROGRESS' }]
+        stream.push({ type: 'start', partial: message })
+        stream.push({ type: 'text_delta', contentIndex: 0, delta: 'AUTONOMOUS_PROGRESS', partial: message })
+      }
+      const finish = () => {
+        if (!autonomous && !deferredSynthesis) stream.push({ type: 'start', partial: message })
         if (options?.signal?.aborted) {
           stream.push({ type: 'error', reason: 'aborted', error: { ...message, stopReason: 'aborted' } })
         } else {
           if (launch)
             stream.push({ type: 'toolcall_end', contentIndex: 0, toolCall: message.content[0], partial: message })
-          else stream.push({ type: 'text_delta', contentIndex: 0, delta: 'HARNESS_RESPONSE', partial: message })
+          else if (!autonomous && !deferredSynthesis)
+            stream.push({ type: 'text_delta', contentIndex: 0, delta: 'HARNESS_RESPONSE', partial: message })
           stream.push({ type: 'done', reason: message.stopReason, message })
         }
         stream.end()
-      }, 100)
+      }
+      if (autonomous || deferredSynthesis) {
+        const timer = setInterval(() => {
+          if (!options?.signal?.aborted) {
+            try {
+              if (
+                readFileSync(
+                  join(deliveryGate, '..', deferredSynthesis ? 'finish-deferred-synthesis' : 'finish-autonomous'),
+                  'utf8'
+                ) !== 'release'
+              )
+                return
+            } catch {
+              return
+            }
+          }
+          clearInterval(timer)
+          finish()
+        }, 10)
+      } else setTimeout(finish, 100)
       return stream
+    }
+  })
+  pi.registerCommand('eval-settlement-gate', {
+    description: 'Start an isolated autonomous run with gated native settlement and deferred synthesis',
+    handler: async () => {
+      holdSettlementHook = true
+      setTimeout(
+        () =>
+          pi.sendMessage(
+            { customType: 'eval-hook-run', content: 'SETTLEMENT_HOOK_RUN', display: true },
+            { triggerTurn: true }
+          ),
+        20
+      )
+    }
+  })
+  pi.on('agent_settled', async (_event, ctx) => {
+    if (!holdSettlementHook) return
+    holdSettlementHook = false
+    const started = Date.now()
+    ctx.ui.setStatus('eval-hook-entered', JSON.stringify({ started, pid: process.pid }))
+    // Pi defers this full synthesis before later prompt/control actions.
+    pi.sendMessage(
+      { customType: 'eval-deferred-synthesis', content: 'DEFERRED_SYNTHESIS', display: true },
+      { triggerTurn: true }
+    )
+    while (Date.now() - started < 60_000) {
+      try {
+        if (readFileSync(join(ctx.cwd, 'release-settlement-hook'), 'utf8') === 'release') break
+      } catch {
+        /* Explicit test gate remains held. */
+      }
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    ctx.ui.setStatus('eval-hook-released', JSON.stringify({ elapsedMs: Date.now() - started, pid: process.pid }))
+  })
+  pi.registerCommand('eval-hold-autonomous', {
+    description: 'Hold the next deterministic autonomous model run',
+    handler: async () => {
+      holdAutonomous = true
     }
   })
   pi.registerCommand('eval-confirm', {
@@ -237,6 +313,12 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
     description: 'Evaluation process exit',
     handler: async () => {
       process.exit(23)
+    }
+  })
+  pi.on('input', event => {
+    if (event.source === 'rpc' && event.text === 'native admission race' && !raceInjected) {
+      raceInjected = true
+      pi.sendMessage({ customType: 'eval-race', content: 'RACE_AUTONOMOUS', display: true }, { triggerTurn: true })
     }
   })
   pi.on('before_agent_start', event => {

@@ -19,30 +19,18 @@ function harness() {
   return { conn, proc, session, lifecycle }
 }
 
-test('owned background delivery holds FIFO across low-level runs and flushes synthesis before response', async () => {
+test('owned background settlement releases FIFO and later synthesis is session-scoped', async () => {
   const { conn, proc, session, lifecycle } = harness()
-  proc.state = { isStreaming: false }
   const first = session.prompt('launch')
-  const second = session.prompt('next')
-  let settled = false
-  void first.then(() => {
-    settled = true
-  })
   proc.emit({ type: 'agent_start' })
-  lifecycle('active')
+  const owner = (session as any).pendingTurn.owner
+  lifecycle('active', owner)
   proc.emit({ type: 'agent_settled' })
-  await tick()
-  assert.equal(settled, false)
-  assert.equal(proc.prompts.length, 1)
+  assert.equal(await first, 'end_turn')
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'synthesis' } })
-  proc.emit({ type: 'agent_settled' })
+  lifecycle('idle', owner)
   await tick()
-  assert.equal(settled, false, 'terminal delivery is still pending')
-  lifecycle('idle', 'foreign')
-  assert.equal(settled, false)
-  lifecycle('idle')
-  assert.equal(await first, 'end_turn')
   assert.ok(
     conn.updates.some(
       n =>
@@ -51,7 +39,11 @@ test('owned background delivery holds FIFO across low-level runs and flushes syn
         n.update.content.text === 'synthesis'
     )
   )
-  assert.equal(proc.prompts.length, 2)
+  const second = session.prompt('next')
+  await tick()
+  assert.equal(proc.prompts.length, 1, 'current model run, not the child pipeline, stages input')
+  proc.emit({ type: 'agent_settled' })
+  await tick()
   proc.emit({ type: 'agent_start' })
   proc.emit({ type: 'agent_settled' })
   assert.equal(await second, 'end_turn')
@@ -108,7 +100,7 @@ test('background cancellation forwards the exact owner and cancels FIFO', async 
 })
 
 for (const rejectProbe of [false, true]) {
-  test(`background hold ignores a late ${rejectProbe ? 'failed' : 'idle'} acceptance probe`, async () => {
+  test(`native settlement releases background foreground despite a late ${rejectProbe ? 'failed' : 'idle'} acceptance probe`, async () => {
     const { proc, session, lifecycle } = harness()
     let resolve!: (state: unknown) => void
     let reject!: (error: Error) => void
@@ -121,14 +113,15 @@ for (const rejectProbe of [false, true]) {
     await tick()
     proc.emit({ type: 'agent_start' })
     lifecycle('active')
+    proc.getState = async () => ({ isStreaming: false })
     proc.emit({ type: 'agent_settled' })
     if (rejectProbe) reject(new Error('late probe'))
     else resolve({ isStreaming: false })
     await tick()
     assert.equal(proc.disposed, false)
-    assert.ok((session as any).pendingTurn)
+    assert.equal((session as any).pendingTurn, null)
     proc.getState = async () => ({ isStreaming: false })
-    lifecycle('idle')
+    lifecycle('idle', 'released-owner')
     assert.equal(await prompt, 'end_turn')
   })
 }
@@ -217,6 +210,77 @@ test('cancellation widget failure cannot settle before the abort transaction rep
     )
   )
 })
+
+for (const action of ['shutdown', 'dispose'] as const) {
+  test(`native-settled completion flushing keeps children detached during ${action}`, async () => {
+    const { conn, proc, session, lifecycle } = harness()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const deliver = conn.sessionUpdate.bind(conn)
+    conn.sessionUpdate = async message => {
+      await gate
+      await deliver(message)
+    }
+    const prompt = session.prompt('launch')
+    let settled = false
+    void prompt.then(() => {
+      settled = true
+    })
+    proc.emit({ type: 'agent_start' })
+    const owner = (session as unknown as { pendingTurn: { owner: string } }).pendingTurn.owner
+    lifecycle('active', owner)
+    proc.emit({ type: 'agent_settled' })
+    let shutdown: Promise<void> | undefined
+    try {
+      await tick()
+      assert.equal(settled, false, 'ACP completion is still flushing after native settlement')
+      if (action === 'shutdown') {
+        shutdown = session.shutdown()
+        assert.equal(session.shutdown(), shutdown, 'shutdown remains idempotent')
+        await tick()
+        assert.deepEqual(proc.abortOwners, [undefined], 'native-only teardown cannot reclaim the detached owner')
+        session.dispose()
+      } else {
+        session.dispose()
+      }
+      session.dispose()
+      const options = proc.disposeOptions as Array<{ expected?: boolean; backgroundOwner?: string }>
+      assert.deepEqual(options, [{ expected: true }], 'disposal cannot reclaim the detached owner either')
+    } finally {
+      release()
+      await shutdown
+      assert.equal(await prompt, 'end_turn', 'late teardown does not rewrite native-completed outcome')
+    }
+  })
+}
+
+for (const cancellationPending of [false, true]) {
+  test(`disposal retains exact foreground ownership with native cancellation pending: ${cancellationPending}`, async () => {
+    const { proc, session, lifecycle } = harness()
+    proc.terminateOnDispose = true
+    let finishAbort!: () => void
+    proc.abort = owner => {
+      proc.abortOwners.push(owner)
+      return new Promise<void>(resolve => {
+        finishAbort = resolve
+      })
+    }
+    const prompt = session.prompt('launch')
+    proc.emit({ type: 'agent_start' })
+    const owner = (session as unknown as { pendingTurn: { owner: string } }).pendingTurn.owner
+    lifecycle('active', owner)
+    const cancellation = cancellationPending ? session.cancel() : undefined
+    if (cancellationPending) proc.emit({ type: 'agent_settled' })
+    session.dispose()
+    const options = proc.disposeOptions as Array<{ expected?: boolean; backgroundOwner?: string }>
+    assert.deepEqual(options, [{ expected: true, backgroundOwner: owner }])
+    if (cancellationPending) finishAbort()
+    await cancellation
+    assert.equal(await prompt, 'cancelled')
+  })
+}
 
 test('shutdown retains the turn until native and late owned cancellation finish', async () => {
   const { proc, session, lifecycle } = harness()

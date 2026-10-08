@@ -471,7 +471,10 @@ test('preacceptance permissions announce before requesting and cancel while anno
     if (notification.update.sessionUpdate === 'tool_call') await gate
     await deliver(notification)
   }
-  proc.prompt = async () => new Promise(() => {})
+  proc.prompt = async (_message, _images, _onAccepted, _owner, onDispatched) => {
+    onDispatched?.()
+    return new Promise(() => {})
+  }
   const prompt = session.prompt('/ask')
   proc.emit({ type: 'extension_ui_request', id: 'preflight', method: 'confirm' })
   const cancel = session.cancel()

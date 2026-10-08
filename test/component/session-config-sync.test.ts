@@ -567,7 +567,8 @@ for (const completion of ['shutdown', 'abort-failure', 'preflight-cancel']) {
     }
     const acceptance = deferred()
     if (completion === 'preflight-cancel') {
-      proc.prompt = async () => {
+      proc.prompt = async (_message, _images, _onAccepted, _owner, onDispatched) => {
+        onDispatched?.()
         await acceptance.promise
       }
     }

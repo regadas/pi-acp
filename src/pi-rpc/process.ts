@@ -45,6 +45,9 @@ export class PiRpcRequestTimeoutError extends Error {
   }
 }
 
+/** A healthy foreign model run won admission; no user input was queued. */
+export class PiRpcPromptDeferredError extends Error {}
+
 export class PiRpcClosedError extends Error {
   constructor(message: string) {
     super(message)
@@ -118,7 +121,13 @@ type PendingEntry = {
   reject: (e: unknown) => void
   beforeResolve?: (response: PiRpcResponse) => void
   timer?: NodeJS.Timeout
+  admission: boolean
+  remainingMs?: number
+  timerStartedAt?: number
+  onTimeout?: () => void
 }
+
+type StagedPrompt = { owner: string; withdrawn: boolean; begin?: Promise<boolean> }
 
 export class PiRpcProcess {
   private readonly child: ChildProcessWithoutNullStreams
@@ -134,6 +143,7 @@ export class PiRpcProcess {
   private disposeIsExpected = false
   private killTimer: NodeJS.Timeout | undefined
   private exitFallbackTimer: NodeJS.Timeout | undefined
+  private nativeUnsettled = false
 
   private constructor(child: ChildProcessWithoutNullStreams, opts?: PiRpcProcessOptions) {
     this.child = child
@@ -229,6 +239,17 @@ export class PiRpcProcess {
       return
     }
 
+    if (decoded.type === 'agent_start' || decoded.type === 'agent_settled') {
+      this.nativeUnsettled = decoded.type === 'agent_start'
+      for (const entry of this.pending.values()) {
+        if (!entry.admission) continue
+        if (this.nativeUnsettled && entry.timer) {
+          clearTimeout(entry.timer)
+          entry.remainingMs = Math.max(1, entry.remainingMs! - (Date.now() - entry.timerStartedAt!))
+          entry.timer = undefined
+        } else if (!this.nativeUnsettled) this.armRequestTimer(entry)
+      }
+    }
     this.dispatchEvent(decoded as PiRpcEvent)
   }
 
@@ -485,7 +506,9 @@ export class PiRpcProcess {
    * this to decide whether the channel has to be quarantined.
    */
   hasPendingRequests(): boolean {
-    return this.pending.size > 0
+    // Serialized, withdrawable admission bookkeeping is not foreground or
+    // manual RPC work that requires quarantine when an adapter command cancels.
+    return [...this.pending.values()].some(entry => !entry.admission)
   }
 
   /**
@@ -543,46 +566,105 @@ export class PiRpcProcess {
 
   private bridgeReady: Promise<void> | undefined
 
-  async prompt(message: string, images: unknown[] = [], onAccepted?: () => void, owner?: string): Promise<void> {
+  private stagedPrompt: StagedPrompt | undefined
+  private admissionControls: Promise<void> = Promise.resolve()
+
+  private queueAdmissionControl(operation: 'begin' | 'withdraw', stage: StagedPrompt): Promise<boolean> {
+    const control = this.admissionControls.then(async () => {
+      await this.ensureBridge()
+      if (operation === 'begin' && (this.stagedPrompt !== stage || stage.withdrawn)) return false
+      return this.control(operation, stage.owner, DEFAULT_REQUEST_TIMEOUT_MS, undefined, true)
+    })
+    // Native settled actions run sequentially too. An old begin and its exact
+    // withdrawal must finish before a newer token can acquire native ownership.
+    this.admissionControls = control.then(
+      () => {},
+      () => {}
+    )
+    return control
+  }
+
+  private beginPrompt(stage: StagedPrompt): Promise<boolean> {
+    stage.begin ??= this.queueAdmissionControl('begin', stage).finally(() => {
+      stage.begin = undefined
+    })
+    return stage.begin
+  }
+
+  private async ensureBridge(): Promise<void> {
+    this.bridgeReady ??= this.getCommands().then(raw => {
+      const commands = (raw as { commands?: Array<{ name?: unknown }> })?.commands
+      if (!Array.isArray(commands) || !commands.some(command => command.name === 'pi-acp-control'))
+        throw new Error(
+          'The adapter lifecycle extension failed to load; refusing to send an internal command to the model'
+        )
+    })
+    await this.bridgeReady
+  }
+
+  async stagePrompt(owner: string): Promise<void> {
+    const stage: StagedPrompt = this.stagedPrompt?.owner === owner ? this.stagedPrompt : { owner, withdrawn: false }
+    this.stagedPrompt = stage
+    await this.beginPrompt(stage)
+  }
+
+  async withdrawPrompt(owner: string): Promise<void> {
+    const stage = this.stagedPrompt
+    if (!stage || stage.owner !== owner) return
+    stage.withdrawn = true
+    this.stagedPrompt = undefined
+    // Invalidate locally before any await. Native cleanup may itself be deferred
+    // behind healthy settlement hooks/synthesis; cancellation must not wait for it.
+    void this.queueAdmissionControl('withdraw', stage).catch(() => this.dispose({ expected: false }))
+  }
+
+  async prompt(
+    message: string,
+    images: unknown[] = [],
+    onAccepted?: () => void,
+    owner?: string,
+    onDispatched?: () => void
+  ): Promise<void> {
     if (/^\/pi-acp-control(?:\s|$)/.test(message)) throw new Error('pi-acp-control is reserved for the adapter')
+    let stage: StagedPrompt | undefined
     if (owner) {
-      this.bridgeReady ??= this.getCommands().then(raw => {
-        const commands = (raw as { commands?: Array<{ name?: unknown }> })?.commands
-        if (!Array.isArray(commands) || !commands.some(command => command.name === 'pi-acp-control')) {
-          throw new Error(
-            'The adapter lifecycle extension failed to load; refusing to send an internal command to the model'
-          )
-        }
-      })
-      await this.bridgeReady
-      await this.control('begin', owner, DEFAULT_REQUEST_TIMEOUT_MS)
+      stage = this.stagedPrompt?.owner === owner ? this.stagedPrompt : { owner, withdrawn: false }
+      this.stagedPrompt = stage
+      const ready = await this.beginPrompt(stage)
+      if (this.stagedPrompt !== stage || stage.withdrawn) return
+      if (!ready || this.nativeUnsettled) throw new PiRpcPromptDeferredError('Pi model run is still active')
     }
-    // TOCTOU backstop: pi consults streamingBehavior only when it is already
-    // streaming, where a bare prompt is rejected outright ("Agent is already
-    // processing"). Extensions can start runs pi-acp does not own, so a
-    // dispatch that races such a run is queued non-interruptively as a
-    // follow-up instead of failing the ACP request. The idle path is
-    // unchanged: pi ignores the field entirely when not streaming.
+    // Never insert unremovable text into a foreign native queue. If a run
+    // starts after readiness, Pi rejects this bare prompt before acceptance;
+    // the session re-admits its exact staged token without aborting that run.
+    onDispatched?.()
     const res = await this.request(
-      { type: 'prompt', message, images, streamingBehavior: 'followUp' },
+      { type: 'prompt', message, images },
       {
-        // This callback runs synchronously at the successful response record,
-        // before any later event records from the same stdout chunk. Session
-        // ownership must cross that wire boundary rather than the earlier
-        // stdin-write boundary.
         beforeResolve: response => {
           if (response.success) onAccepted?.()
         }
       }
     )
-    if (!res.success) throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+    if (!res.success) {
+      if (
+        owner &&
+        /^(Agent is already processing\.|Cannot submit a prompt while compaction is in progress\.)/.test(
+          res.error ?? ''
+        )
+      )
+        throw new PiRpcPromptDeferredError('Pi became busy before prompt acceptance')
+      throw new Error(`pi prompt failed: ${res.error ?? JSON.stringify(res.data)}`)
+    }
+    if (this.stagedPrompt === stage) this.stagedPrompt = undefined
   }
 
   private async control(
-    operation: 'begin' | 'cancel' | 'check',
+    operation: 'begin' | 'withdraw' | 'cancel' | 'check',
     owner: string,
     timeoutMs: number,
-    deadline?: number
+    deadline?: number,
+    admission = false
   ): Promise<boolean> {
     let acknowledgement: { state?: unknown; error?: unknown } | undefined
     const unsubscribe = this.onEvent(event => {
@@ -599,7 +681,14 @@ export class PiRpcProcess {
         if (
           state.version === 1 &&
           state.owner === owner &&
-          ['ready', 'rejected', 'stopping', 'pending', 'cancelled', 'error'].includes(String(state.state))
+          (operation === 'begin'
+            ? ['ready', 'waiting', 'rejected', 'error']
+            : operation === 'withdraw'
+              ? ['withdrawn', 'error']
+              : operation === 'cancel'
+                ? ['stopping', 'error']
+                : ['pending', 'cancelled', 'error']
+          ).includes(String(state.state))
         )
           acknowledgement = state
       } catch {
@@ -607,20 +696,29 @@ export class PiRpcProcess {
       }
     })
     try {
-      await this.call(
+      const response = await this.request(
         {
           type: 'prompt',
           message: `/pi-acp-control ${operation} ${owner}${deadline === undefined ? '' : ` ${deadline}`}`
         },
-        timeoutMs
+        { timeoutMs, admission }
       )
+      if (!response.success) throw new Error(`pi prompt failed: ${response.error ?? JSON.stringify(response.data)}`)
       // Pi reports a handled command as RPC success even when its handler throws.
       // Only the companion's correlated acknowledgement permits user dispatch.
-      if (operation !== 'begin' && typeof acknowledgement?.error === 'string')
+      if (operation !== 'begin' && operation !== 'withdraw' && typeof acknowledgement?.error === 'string')
         this.abortControlDiagnostic = acknowledgement.error
       if (operation === 'check' && acknowledgement?.state === 'pending') return false
+      if (operation === 'begin' && acknowledgement?.state === 'waiting') return false
       if (
-        acknowledgement?.state === (operation === 'begin' ? 'ready' : operation === 'cancel' ? 'stopping' : 'cancelled')
+        acknowledgement?.state ===
+        (operation === 'begin'
+          ? 'ready'
+          : operation === 'withdraw'
+            ? 'withdrawn'
+            : operation === 'cancel'
+              ? 'stopping'
+              : 'cancelled')
       )
         return true
       if (acknowledgement?.state !== 'rejected') this.dispose({ expected: false })
@@ -785,9 +883,15 @@ export class PiRpcProcess {
     return res.data
   }
 
+  private armRequestTimer(entry: PendingEntry): void {
+    if (entry.timer || entry.remainingMs === undefined || (entry.admission && this.nativeUnsettled)) return
+    entry.timerStartedAt = Date.now()
+    entry.timer = setTimeout(entry.onTimeout!, entry.remainingMs)
+  }
+
   private request(
     cmd: PiRpcCommand,
-    opts?: { beforeResolve?: (response: PiRpcResponse) => void; timeoutMs?: number }
+    opts?: { beforeResolve?: (response: PiRpcResponse) => void; timeoutMs?: number; admission?: boolean }
   ): Promise<PiRpcResponse> {
     const id = crypto.randomUUID()
     const line = `${JSON.stringify({ ...cmd, id })}\n`
@@ -798,10 +902,16 @@ export class PiRpcProcess {
         return
       }
 
-      const entry: PendingEntry = { resolve, reject, beforeResolve: opts?.beforeResolve }
+      const entry: PendingEntry = {
+        resolve,
+        reject,
+        beforeResolve: opts?.beforeResolve,
+        admission: opts?.admission ?? false
+      }
       const timeoutMs = opts?.timeoutMs ?? this.timeoutForCommand(cmd.type)
       if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-        const timer = setTimeout(() => {
+        entry.remainingMs = timeoutMs
+        entry.onTimeout = () => {
           if (!this.takePending(id)) return
           const error = new PiRpcRequestTimeoutError(cmd.type, timeoutMs)
           // Any timed-out command leaves both the command outcome and channel
@@ -813,8 +923,11 @@ export class PiRpcProcess {
           // future request fails fast instead of hanging.
           this.dispose({ expected: false })
           reject(error)
-        }, timeoutMs)
-        entry.timer = timer
+        }
+        // Only internal admission/withdrawal budgets exclude observed native
+        // work through authoritative settlement, including awaited hooks. Reads,
+        // raw preflight, manual work and owned cancellation keep wall-clock guards.
+        this.armRequestTimer(entry)
       }
       this.pending.set(id, entry)
 

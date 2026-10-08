@@ -10,6 +10,8 @@ const root = await mkdtemp(join(tmpdir(), 'pi-acp-zed-eval-'))
 const pi = process.env.PI_ACP_EVAL_PI ?? execFileSync('which', ['pi'], { encoding: 'utf8' }).trim()
 const tracePath = join(root, 'pi.jsonl')
 const wrapper = join(root, 'pi-wrapper.mjs')
+const acpWrapper = join(root, 'acp-wrapper.mjs')
+const acpTracePath = join(root, 'acp.jsonl')
 await mkdir(join(root, '.pi', 'extensions'), { recursive: true })
 await mkdir(join(root, 'agent'), { recursive: true })
 await writeFile(
@@ -34,7 +36,7 @@ if (!args.includes('--version')) args.push('--extension', ${JSON.stringify(join(
 const child = spawn(${JSON.stringify(pi)}, args, { stdio: ['pipe','pipe','inherit'] });
 function trace(stream, direction, target) {
  let buffer = ''; stream.on('data', chunk => { target.write(chunk); buffer += chunk; let i;
- while ((i = buffer.indexOf('\\n')) >= 0) { const line = buffer.slice(0,i); buffer = buffer.slice(i+1); try { appendFileSync(${JSON.stringify(tracePath)}, JSON.stringify({direction, ...JSON.parse(line)})+'\\n'); } catch {} }
+ while ((i = buffer.indexOf('\\n')) >= 0) { const line = buffer.slice(0,i); buffer = buffer.slice(i+1); try { appendFileSync(${JSON.stringify(tracePath)}, JSON.stringify({time: Date.now(), direction, ...JSON.parse(line)})+'\\n'); } catch {} }
  });
 }
 trace(process.stdin, 'in', child.stdin); trace(child.stdout, 'out', process.stdout);
@@ -43,6 +45,22 @@ process.on('SIGTERM', () => child.kill('SIGTERM'));
 child.on('exit', code => process.exit(code ?? 1));
 `,
   { mode: 0o755 }
+)
+await writeFile(
+  acpWrapper,
+  `import { spawn } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
+const child = spawn(process.execPath, [${JSON.stringify(resolve('dist/index.js'))}], { stdio: ['pipe','pipe','inherit'] });
+function trace(stream, direction, target) {
+ let buffer = ''; stream.on('data', chunk => { target.write(chunk); buffer += chunk; let i;
+ while ((i = buffer.indexOf('\\n')) >= 0) { const line = buffer.slice(0,i); buffer = buffer.slice(i+1); try { appendFileSync(${JSON.stringify(acpTracePath)}, JSON.stringify({time: Date.now(), direction, ...JSON.parse(line)})+'\\n'); } catch {} }
+ });
+}
+trace(process.stdin, 'in', child.stdin); trace(child.stdout, 'out', process.stdout);
+process.stdin.on('end', () => child.stdin.end());
+process.on('SIGTERM', () => child.kill('SIGTERM'));
+child.on('exit', code => process.exit(code ?? 1));
+`
 )
 const trace = async () =>
   (await readFile(tracePath, 'utf8'))
@@ -202,9 +220,16 @@ try {
       })
       await waitTrace(backgroundActive, asyncStart)
       const terminal = await waitTrace(e => e.statusKey === 'eval-terminal', asyncStart)
-      check('ACP holds initial turn through terminal-pending-delivery work', !settled)
-      await writeFile(join(root, 'deliver-async'), terminal.statusText)
       assert.equal((await asyncTurn).stopReason, 'end_turn')
+      check('ACP releases foreground independently of terminal-pending-delivery child', settled)
+      const idleChildStart = (await trace()).length
+      assert.equal((await prompt('ordinary question while child is live')).stopReason, 'end_turn')
+      check(
+        'idle model admits ordinary input without adopting live child',
+        !(await trace()).slice(idleChildStart).some(e => e.statusKey === 'eval-stopped')
+      )
+      await writeFile(join(root, 'deliver-async'), terminal.statusText)
+      await waitTrace(e => e.type === 'agent_settled', (await trace()).length)
       check(
         'real Pi emits delayed subagent-contract message',
         (await trace()).some(e => e.type === 'message_end' && e.message?.content === 'ASYNC_COMPLETION')
@@ -214,6 +239,173 @@ try {
         'async triggered assistant response delivered',
         texts().split('HARNESS_RESPONSE').length > initialResponseCount + 1
       )
+      const busyIdentity = JSON.parse((await trace()).findLast(e => e.statusKey === 'eval-session').statusText)
+      const busyStart = (await trace()).length
+      assert.equal((await prompt('/eval-hold-autonomous')).stopReason, 'end_turn')
+      const heldLaunch = prompt('launch async')
+      const heldTerminal = await waitTrace(e => e.statusKey === 'eval-terminal', busyStart)
+      assert.equal((await heldLaunch).stopReason, 'end_turn')
+      await writeFile(join(root, 'deliver-async'), heldTerminal.statusText)
+      await waitTrace(
+        e => e.type === 'message_update' && e.assistantMessageEvent?.delta === 'AUTONOMOUS_PROGRESS',
+        busyStart
+      )
+      const busyQuestionStart = (await trace()).length
+      const withdrawn = prompt('withdraw this ordinary question')
+      await waitTrace(
+        e => e.widgetKey === 'pi-acp-lifecycle' && JSON.parse(e.widgetLines[0]).state === 'waiting',
+        busyQuestionStart
+      )
+      client.notify('session/cancel', { sessionId })
+      assert.equal((await withdrawn).stopReason, 'cancelled')
+      const withdrawalRecords = (await trace()).slice(busyQuestionStart)
+      assert.ok(!withdrawalRecords.some(e => e.direction === 'in' && ['abort', 'clear_queue'].includes(e.type)))
+      assert.ok(!withdrawalRecords.some(e => e.direction === 'in' && e.message === 'withdraw this ordinary question'))
+      const admittedAt = Date.now()
+      const busyQuestion = prompt('ordinary question after autonomous progress')
+      await waitTrace(
+        e => e.widgetKey === 'pi-acp-lifecycle' && JSON.parse(e.widgetLines[0]).state === 'waiting',
+        busyQuestionStart + withdrawalRecords.length
+      )
+      await sleep(100)
+      assert.ok(texts().includes('AUTONOMOUS_PROGRESS'))
+      assert.ok(texts().includes('Input queued'))
+      await writeFile(join(root, 'finish-autonomous'), 'release')
+      assert.equal((await busyQuestion).stopReason, 'end_turn')
+      const admittedRecords = (await trace()).slice(busyQuestionStart)
+      const userPrompt = admittedRecords.find(
+        e => e.direction === 'in' && e.message === 'ordinary question after autonomous progress'
+      )
+      assert.ok(userPrompt && !('streamingBehavior' in userPrompt))
+      assert.ok(
+        admittedRecords.some(
+          e =>
+            e.type === 'message_start' &&
+            e.message?.role === 'user' &&
+            JSON.stringify(e.message.content).includes('ordinary question after autonomous progress')
+        )
+      )
+      assert.equal(
+        admittedRecords.filter(e => e.direction === 'in' && e.message === 'ordinary question after autonomous progress')
+          .length,
+        1
+      )
+      assert.ok(admittedRecords.some(e => e.type === 'response' && e.id === userPrompt.id && e.success))
+      assert.ok(admittedRecords.some(e => e.type === 'agent_settled'))
+      assert.ok(Date.now() - admittedAt < 5000, 'delivery follows model settlement, not delegated pipeline drain')
+      assert.equal((await prompt('/eval-confirm')).stopReason, 'end_turn')
+      const busySurvivor = JSON.parse((await trace()).findLast(e => e.statusKey === 'eval-session').statusText)
+      assert.equal(busySurvivor.pid, busyIdentity.pid)
+      console.log(`Staged native follow-up latency: ${Date.now() - admittedAt}ms; Pi PID survived: ${busySurvivor.pid}`)
+      check(
+        'real Pi autonomous progress, native staged admission, exact withdrawal and correlated follow-up survive on one subprocess',
+        true
+      )
+      const raceStart = (await trace()).length
+      assert.equal((await prompt('native admission race')).stopReason, 'end_turn')
+      const raceRecords = (await trace()).slice(raceStart)
+      const racedPrompts = raceRecords.filter(e => e.direction === 'in' && e.message === 'native admission race')
+      assert.equal(racedPrompts.length, 2, 'one rejected preacceptance attempt plus one admitted dispatch')
+      assert.ok(racedPrompts.every(e => !('streamingBehavior' in e)))
+      assert.equal(
+        raceRecords.filter(e => e.type === 'response' && racedPrompts.some(p => p.id === e.id) && e.success).length,
+        1
+      )
+      assert.ok(
+        raceRecords.some(
+          e =>
+            e.type === 'response' &&
+            e.id === racedPrompts[0].id &&
+            !e.success &&
+            e.error.startsWith('Agent is already processing.')
+        )
+      )
+      assert.ok(!raceRecords.some(e => e.direction === 'in' && ['abort', 'clear_queue'].includes(e.type)))
+      check(
+        'real Pi ready-to-raw race rejects then re-admits once without native queue insertion or foreign abort',
+        true
+      )
+      const hookStart = (await trace()).length
+      assert.equal((await prompt('/eval-settlement-gate')).stopReason, 'end_turn')
+      const hookEntered = await waitTrace(e => e.statusKey === 'eval-hook-entered', hookStart)
+      const hookIdentity = JSON.parse(hookEntered.statusText)
+      let withdrawnOutcome
+      const hookWithdrawn = prompt('withdraw during long native hook').then(
+        result => {
+          withdrawnOutcome = result
+          return result
+        },
+        error => {
+          withdrawnOutcome = error
+          return error
+        }
+      )
+      try {
+        // Actual wall-clock native hook; not a fake timer or provider sleep.
+        await sleep(31_100)
+        assert.equal(withdrawnOutcome, undefined, 'healthy native settlement must not time out staged admission')
+        const cancelAt = Date.now()
+        client.notify('session/cancel', { sessionId })
+        while (!withdrawnOutcome && Date.now() - cancelAt < 1000) await sleep(5)
+        assert.equal(
+          withdrawnOutcome?.stopReason,
+          'cancelled',
+          'local cancellation must not await deferred native withdraw'
+        )
+        assert.equal((await hookWithdrawn).stopReason, 'cancelled')
+        const cancellationMs = Date.now() - cancelAt
+        const newToken = prompt('new token after long native hook')
+        await sleep(50)
+        await writeFile(join(root, 'release-settlement-hook'), 'release')
+        const released = await waitTrace(e => e.statusKey === 'eval-hook-released', hookStart)
+        assert.ok(JSON.parse(released.statusText).elapsedMs > 30_000)
+        await waitTrace(
+          e => e.type === 'message_update' && e.assistantMessageEvent?.delta === 'DEFERRED_SYNTHESIS_PROGRESS',
+          hookStart
+        )
+        const duringSynthesis = (await trace()).slice(hookStart)
+        assert.ok(
+          !duringSynthesis.some(
+            e =>
+              e.direction === 'in' &&
+              ['withdraw during long native hook', 'new token after long native hook'].includes(e.message)
+          )
+        )
+        await writeFile(join(root, 'finish-deferred-synthesis'), 'release')
+        assert.equal((await newToken).stopReason, 'end_turn')
+        assert.equal((await prompt('/eval-confirm')).stopReason, 'end_turn')
+        const survivor = JSON.parse((await trace()).findLast(e => e.statusKey === 'eval-session').statusText)
+        assert.equal(survivor.pid, hookIdentity.pid)
+        const hookRecords = (await trace()).slice(hookStart)
+        assert.ok(!hookRecords.some(e => e.direction === 'in' && ['abort', 'clear_queue'].includes(e.type)))
+        assert.equal(
+          hookRecords.filter(e => e.direction === 'in' && e.message === 'withdraw during long native hook').length,
+          0
+        )
+        const delivered = hookRecords.filter(
+          e => e.direction === 'in' && e.message === 'new token after long native hook'
+        )
+        assert.equal(delivered.length, 1)
+        assert.ok(hookRecords.some(e => e.type === 'response' && e.id === delivered[0].id && e.success))
+        assert.ok(
+          hookRecords.some(
+            e =>
+              e.type === 'message_start' &&
+              e.message?.role === 'user' &&
+              JSON.stringify(e.message.content).includes('new token after long native hook')
+          )
+        )
+        console.log(
+          `Native settlement hook held ${JSON.parse(released.statusText).elapsedMs}ms; local cancellation ${cancellationMs}ms; Pi PID ${survivor.pid} survived`
+        )
+        check(
+          'actual native hook over 30 seconds and deferred synthesis preserve local withdrawal, new token, exact delivery and subprocess',
+          true
+        )
+      } finally {
+        await writeFile(join(root, 'release-settlement-hook'), 'release')
+        await writeFile(join(root, 'finish-deferred-synthesis'), 'release')
+      }
       const cancelStart = (await trace()).length
       const cancelledAsync = prompt('launch async')
       await waitTrace(backgroundActive, cancelStart)
@@ -311,19 +503,13 @@ try {
         client.request('session/prompt', { sessionId: rejectedSession.sessionId, prompt: [{ type: 'text', text }] })
       assert.equal((await rejectedPrompt('/eval-unrelated')).stopReason, 'end_turn')
       const rejectStart = (await trace()).length
-      await assert.rejects(
-        rejectedPrompt('MUST_NOT_DISPATCH'),
-        /Pre-existing or restored background work.*wait.*or open a new session/
-      )
-      assert.ok(
-        !(await trace()).slice(rejectStart).some(e => e.direction === 'in' && e.message === 'MUST_NOT_DISPATCH')
-      )
+      assert.equal((await rejectedPrompt('ordinary restored-child question')).stopReason, 'end_turn')
+      const restoredRecords = (await trace()).slice(rejectStart)
+      assert.ok(restoredRecords.some(e => e.direction === 'in' && e.message === 'ordinary restored-child question'))
+      assert.ok(!restoredRecords.some(e => e.statusKey === 'eval-stopped'))
       await writeFile(join(root, 'release-unrelated'), 'release')
       assert.equal((await rejectedPrompt('/eval-confirm')).stopReason, 'end_turn')
-      check(
-        'real Pi begin rejection prevents user dispatch and permits same-channel recovery',
-        !(await trace()).slice(rejectStart).some(e => e.direction === 'in' && e.type === 'get_commands')
-      )
+      check('real Pi admits idle foreground with restored live child without adoption or stop', true)
       await client.request('session/close', { sessionId: rejectedSession.sessionId })
       const disconnectSession = await client.request('session/new', { cwd: root, mcpServers: [] })
       const disconnectStart = (await trace()).length
@@ -337,6 +523,8 @@ try {
       stopsBeforeDisconnect = (await trace()).filter(e => e.statusKey === 'eval-stopped').length
     },
     {
+      args: [acpWrapper],
+      timeoutMs: 100_000,
       env: {
         PATH: process.env.PATH,
         HOME: root,
@@ -366,7 +554,7 @@ try {
     await writeFile(join(destination, 'pi-trace.jsonl'), await readFile(tracePath).catch(() => ''))
     await writeFile(
       join(destination, 'acp-trace.jsonl'),
-      acpMessages.map(message => JSON.stringify(message)).join('\n') + '\n'
+      await readFile(acpTracePath).catch(() => acpMessages.map(message => JSON.stringify(message)).join('\n') + '\n')
     )
     await writeFile(join(destination, 'checks.json'), JSON.stringify(checks, null, 2) + '\n')
   }

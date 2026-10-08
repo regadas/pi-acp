@@ -5,13 +5,28 @@ type Context = {
   mode?: string
   isIdle(): boolean
   hasPendingMessages(): boolean
+  waitForIdle(): Promise<void>
   sessionManager: { getSessionId(): string; getSessionFile(): string | undefined }
   ui: { setWidget(key: string, lines: string[] | undefined): void }
 }
 type Provider = { name: string; sessionId: string; sessionFile?: string; isActive(): boolean }
 type Pi = {
   events: { on(name: string, handler: (data: unknown) => void): () => void; emit(name: string, data: unknown): void }
-  on(name: string, handler: (event: { toolName?: string; details?: unknown }, ctx: Context) => void): void
+  on(
+    name: string,
+    handler: (
+      event: {
+        toolName?: string
+        details?: unknown
+        source?: string
+        text?: string
+        prompt?: string
+        images?: unknown[]
+        message?: { role?: string; content?: unknown }
+      },
+      ctx: Context
+    ) => void
+  ): void
   registerCommand(
     name: string,
     command: { description: string; handler(args: string, ctx: Context): Promise<void> }
@@ -70,6 +85,10 @@ export default function acpExtension(pi: Pi): void {
   let context: Context | null = null
   let active = false
   let cancelling = false
+  let admission: { id: string } | undefined
+  let expectedInput: { text: string; hasImages: boolean } | undefined
+  let foregroundRun = false
+  let modelActive = false
   let timer: ReturnType<typeof setInterval> | undefined
   const runs = new Set<string>()
   let runGeneration = 0
@@ -77,7 +96,17 @@ export default function acpExtension(pi: Pi): void {
   let observationError: string | undefined
   let cancellationDiagnostic: string | undefined
   const emit = (
-    state: 'active' | 'idle' | 'error' | 'ready' | 'rejected' | 'stopping' | 'pending' | 'cancelled',
+    state:
+      | 'active'
+      | 'idle'
+      | 'error'
+      | 'ready'
+      | 'waiting'
+      | 'withdrawn'
+      | 'rejected'
+      | 'stopping'
+      | 'pending'
+      | 'cancelled',
     error?: string,
     token = owner
   ) => {
@@ -166,22 +195,50 @@ export default function acpExtension(pi: Pi): void {
     async handler(args, ctx) {
       context = ctx
       const [operation, id, deadlineText] = args.split(' ')
+      if (operation === 'withdraw' && id) {
+        if (admission?.id === id) {
+          admission = undefined
+          expectedInput = undefined
+        }
+        emit('withdrawn', undefined, id)
+        return
+      }
       if (operation === 'begin' && id && /^[a-f0-9-]{36}$/.test(id)) {
         observe()
-        try {
-          if (active || runs.size) throw new Error('Previous ACP background work has not drained')
-          owner = null
-          if (currentProviders().some(provider => provider.isActive()))
-            throw new Error(
-              'Pre-existing or restored background work remains in this session; wait for it to finish or open a new session'
-            )
-          owner = id
-          cancelling = false
-          interrupted.clear()
-          cancellationDiagnostic = undefined
-          emit('ready')
-        } catch (error) {
-          emit('rejected', error instanceof Error ? error.message : String(error), id)
+        if (owner === id && (active || runs.size)) {
+          emit('rejected', 'Previous ACP background work has not drained', id)
+          return
+        }
+        // A completed foreground's children remain autonomous. A new token
+        // gets no stop authority over them, including restored live children.
+        if (owner !== id) {
+          stopTimer()
+          runs.clear()
+          active = false
+          foregroundRun = false
+          expectedInput = undefined
+        }
+        expectedInput = undefined
+        owner = id
+        cancelling = false
+        interrupted.clear()
+        cancellationDiagnostic = undefined
+        const staged = admission ?? { id }
+        admission = staged.id === id ? staged : { id }
+        if (!modelActive && ctx.isIdle()) {
+          foregroundRun = true
+          emit('ready', undefined, id)
+        } else {
+          emit('waiting', undefined, id)
+          const pending = admission
+          void ctx.waitForIdle().then(
+            () => {
+              if (admission === pending && !modelActive && ctx.isIdle()) emit('ready', undefined, id)
+            },
+            error => {
+              if (admission === pending) emit('error', String(error), id)
+            }
+          )
         }
         return
       }
@@ -304,12 +361,12 @@ export default function acpExtension(pi: Pi): void {
         }
         const live = currentProviders()
         if (runs.size && !live.length) throw new Error('Missing pi-subagents liveness during cancellation')
-        // Aggregate idle is sufficient proof, not stop authority. Busy may be
-        // unrelated: retain exact IDs and report unknown until the caller deadline.
+        // Aggregate liveness is conservative proof for owned descendants only.
+        // With no owned IDs, foreign children cannot hold native cancellation.
         if (
           generation !== runGeneration ||
           !terminal ||
-          live.some(provider => provider.isActive()) ||
+          (runs.size > 0 && live.some(provider => provider.isActive())) ||
           !ctx.isIdle() ||
           ctx.hasPendingMessages()
         ) {
@@ -329,8 +386,49 @@ export default function acpExtension(pi: Pi): void {
       }
     }
   })
+  pi.on('input', event => {
+    expectedInput =
+      event.source === 'rpc' && admission && typeof event.text === 'string'
+        ? { text: event.text, hasImages: false }
+        : undefined
+  })
+  pi.on('before_agent_start', event => {
+    if (expectedInput !== undefined) {
+      expectedInput =
+        typeof event.prompt === 'string'
+          ? { text: event.prompt, hasImages: Array.isArray(event.images) && event.images.length > 0 }
+          : undefined
+    }
+  })
+  pi.on('message_start', event => {
+    const message = event.message
+    if (!admission || expectedInput === undefined || message?.role !== 'user') return
+    const text =
+      typeof message.content === 'string'
+        ? message.content
+        : Array.isArray(message.content)
+          ? message.content
+              .filter(part => part?.type === 'text')
+              .map(part => part.text)
+              .join('\n')
+          : undefined
+    // Native Pi appends normalization hints after before_agent_start, even
+    // when all attached images fail processing. Text-only prefixes are foreign.
+    if (text === expectedInput.text || (expectedInput.hasImages && text?.startsWith(`${expectedInput.text}\n\n`))) {
+      foregroundRun = true
+      expectedInput = undefined
+      admission = undefined
+    }
+  })
+  pi.on('agent_start', () => {
+    if (!modelActive) foregroundRun = false
+    modelActive = true
+  })
+  pi.on('agent_settled', () => {
+    modelActive = false
+  })
   pi.on('tool_result', (event, ctx) => {
-    if (!owner || event.toolName !== 'subagent') return
+    if (!owner || !foregroundRun || event.toolName !== 'subagent') return
     const details = event.details as { asyncId?: unknown } | undefined
     const id = details?.asyncId
     if (typeof id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)) return

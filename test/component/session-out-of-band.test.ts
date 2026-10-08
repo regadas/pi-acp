@@ -179,12 +179,13 @@ test('PiAcpSession: a foreign run buffered before prompt acceptance stays unowne
     proc.prompts.map(item => item.message),
     ['hello']
   )
-  assert.equal(turnBoundUpdateCount(conn), 0, 'pre-response foreign output must remain suppressed')
+  assert.ok(agentMessageTexts(conn).includes('foreign text'), 'autonomous progress stays visible before ownership')
   assert.equal(conn.permissionRequests.length, 0, 'foreign UI must not escape as an ACP permission request')
   assert.deepEqual(proc.extensionUiResponses, [{ id: 'foreign-ui', cancelled: true }])
 
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'still foreign' } })
-  assert.equal(turnBoundUpdateCount(conn), 0, 'post-response foreign output remains unowned before the follow-up')
+  await tick()
+  assert.ok(agentMessageTexts(conn).includes('still foreign'))
 
   proc.emit({
     type: 'message_start',
@@ -196,7 +197,8 @@ test('PiAcpSession: a foreign run buffered before prompt acceptance stays unowne
   proc.emit({ type: 'agent_settled' })
 
   assert.equal(await prompt, 'end_turn', 'foreign done:length and retry failure must not contaminate the turn')
-  assert.deepEqual(agentMessageTexts(conn), ['Buffered foreign notification.', 'owned response'])
+  assert.ok(agentMessageTexts(conn).includes('Buffered foreign notification.'))
+  assert.ok(agentMessageTexts(conn).includes('owned response'))
 })
 
 test('PiAcpSession: duplicate foreign follow-ups are skipped before claiming the queued prompt', async () => {
@@ -221,7 +223,7 @@ test('PiAcpSession: duplicate foreign follow-ups are skipped before claiming the
   proc.emit({ type: 'agent_settled' })
 
   assert.equal(await prompt, 'end_turn')
-  assert.deepEqual(agentMessageTexts(conn), ['owned duplicate'])
+  assert.deepEqual(agentMessageTexts(conn), ['foreign duplicate', 'owned duplicate'])
 })
 
 test('PiAcpSession: an image-only queued prompt correlates on its empty text block', async () => {
@@ -324,7 +326,7 @@ test('PiAcpSession: a queue update before agent_end marks a legitimate autonomou
   assert.equal(await prompt, 'end_turn')
 })
 
-test('PiAcpSession: foreign output is suppressed and custom messages flush only when deferred dispatch begins', async () => {
+test('PiAcpSession: autonomous output stays visible while foreground result attribution waits for dispatch', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   proc.state = { isStreaming: false }
@@ -337,12 +339,12 @@ test('PiAcpSession: foreign output is suppressed and custom messages flush only 
     message: { role: 'custom', display: true, content: 'Background completion.' }
   })
   await tick()
-  assert.equal(turnBoundUpdateCount(conn), 0, 'foreign output must not escape while ACP is idle')
+  assert.ok(agentMessageTexts(conn).includes('foreign text'), 'autonomous output is session-scoped')
 
   const prompt = session.prompt('/extension-handled')
   await tick()
   assert.equal(proc.prompts.length, 0)
-  assert.equal(turnBoundUpdateCount(conn), 0, 'foreign output and custom messages stay buffered during admission')
+  assert.ok(agentMessageTexts(conn).some(text => text.includes('Input queued')))
 
   emitForeignTurnBoundEvents(proc)
   proc.emit({ type: 'agent_end' })
@@ -350,7 +352,7 @@ test('PiAcpSession: foreign output is suppressed and custom messages flush only 
 
   assert.equal(await prompt, 'end_turn', 'foreign done:length/failure state cannot affect the no-run prompt')
   assert.equal(proc.prompts.length, 1)
-  assert.deepEqual(agentMessageTexts(conn), ['Background completion.'])
+  assert.ok(agentMessageTexts(conn).includes('Background completion.'))
 })
 
 test('PiAcpSession: FIFO is preserved behind a deferred turn', async () => {
@@ -388,7 +390,7 @@ test('PiAcpSession: FIFO is preserved behind a deferred turn', async () => {
   assert.equal(await second, 'end_turn')
 })
 
-test('PiAcpSession: cancel while deferred settles locally and suppresses all later foreign output', async () => {
+test('PiAcpSession: cancel while staged settles locally and preserves later autonomous progress', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const session = makeSession(conn, proc, { deferredAdmissionTimeoutMs: 20 })
@@ -416,7 +418,10 @@ test('PiAcpSession: cancel while deferred settles locally and suppresses all lat
   })
   await sleep(60)
   assert.equal(proc.prompts.length, 0, 'the cleared admission timeout cannot dispatch after cancellation')
-  assert.equal(turnBoundUpdateCount(conn), updatesAtCancel, 'post-cancel foreign output must not escape')
+  assert.ok(
+    turnBoundUpdateCount(conn) > updatesAtCancel,
+    'autonomous progress remains visible after local cancellation'
+  )
 
   proc.emit({ type: 'agent_settled' })
   await tick()
@@ -476,24 +481,22 @@ test('PiAcpSession: expected teardown while deferred cancels turns and clears ad
   assert.equal(proc.prompts.length, 0)
 })
 
-test('PiAcpSession: admission timeout quarantines and rejects without dispatching', async () => {
+test('PiAcpSession: staged input outlives the old admission budget and eventually runs once', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const session = makeSession(conn, proc, { deferredAdmissionTimeoutMs: 20 })
-
   proc.emit({ type: 'agent_start' })
   const first = session.prompt('first')
-  const second = session.prompt('second')
-
-  await assertInternalFailure(first, /Timed out waiting for out-of-band pi work to settle/)
-  await assertInternalFailure(second, /Timed out waiting for out-of-band pi work to settle/)
+  await sleep(60)
+  assert.equal(proc.disposeCount, 0)
   assert.equal(proc.prompts.length, 0)
-  assert.equal(proc.disposeCount, 1, 'an uncorrelatable child is quarantined')
-  assert.deepEqual(proc.disposeOptions, [{ expected: false }])
-
+  assert.ok(agentMessageTexts(conn).some(text => text.includes('Input queued')))
   proc.emit({ type: 'agent_settled' })
-  await sleep(40)
-  assert.equal(proc.prompts.length, 0, 'late settlement cannot resurrect the failed dispatch')
+  await tick()
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await first, 'end_turn')
+  assert.equal(proc.prompts.length, 1)
 })
 
 test('PiAcpSession: cancel does not abort autonomous work while a completed turn flushes', async () => {
@@ -585,7 +588,7 @@ test(
     proc.emit({ type: 'agent_start' })
     proc.emit({ type: 'agent_settled' })
     assert.equal(await second, 'end_turn')
-    assert.ok(!agentMessageTexts(conn).includes('foreign text'))
+    assert.ok(agentMessageTexts(conn).includes('foreign text'))
   }
 )
 
@@ -691,6 +694,6 @@ test('PiAcpSession: steering evidence ends at settlement, not the next ACP dispa
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'owned duplicate' } })
   proc.emit({ type: 'agent_settled' })
   assert.equal(await second, 'end_turn')
-  assert.deepEqual(agentMessageTexts(conn), ['owned duplicate'])
+  assert.deepEqual(agentMessageTexts(conn), ['foreign duplicate', 'owned duplicate'])
   assert.equal(proc.disposeCount, 0)
 })

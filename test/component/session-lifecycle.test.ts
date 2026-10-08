@@ -172,7 +172,8 @@ test(
     }
 
     let rejectFirstPrompt!: (error: Error) => void
-    proc.prompt = (message, attachments = [], onAccepted) => {
+    proc.prompt = (message, attachments = [], onAccepted, _owner, onDispatched) => {
+      onDispatched?.()
       proc.prompts.push({ message, attachments })
       if (message !== 'first') {
         onAccepted?.()

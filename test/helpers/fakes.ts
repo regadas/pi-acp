@@ -144,7 +144,18 @@ export class FakePiRpcProcess {
    */
   terminateOnDispose = false
 
-  async prompt(message: string, attachments: unknown[] = [], onAccepted?: () => void): Promise<void> {
+  async stagePrompt(_owner: string): Promise<void> {}
+
+  async withdrawPrompt(_owner: string): Promise<void> {}
+
+  async prompt(
+    message: string,
+    attachments: unknown[] = [],
+    onAccepted?: () => void,
+    _owner?: string,
+    onDispatched?: () => void
+  ): Promise<void> {
+    onDispatched?.()
     this.prompts.push({ message, attachments })
     this.beforePromptAccepted?.(message)
     onAccepted?.()
