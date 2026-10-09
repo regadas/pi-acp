@@ -228,10 +228,12 @@ test('repository.list scans canonical mapped duplicates first without scanning l
 })
 
 test('repository.list defers stat to missing timestamps and normalizes only the selected timestamp', async t => {
-  const { root, sessions, repository } = fixture(t)
+  const { root, sessions, store, repository } = fixture(t)
   const timestamped = writeSession(join(sessions, 'timestamped.jsonl'), 'timestamped', root)
   const missing = join(sessions, 'missing.jsonl')
   fs.writeFileSync(missing, `${JSON.stringify({ type: 'session', id: 'missing', cwd: root })}\n`)
+  store.upsert({ sessionId: 'timestamped', cwd: root, sessionFile: timestamped })
+  store.upsert({ sessionId: 'missing', cwd: root, sessionFile: missing })
   for (let index = 0; index < 20; index++) {
     fs.appendFileSync(timestamped, `${JSON.stringify({ type: 'session_info', timestamp: TIMESTAMP, name: 'title' })}\n`)
   }
@@ -510,8 +512,9 @@ test('repository metadata enforces byte-based record caps and recovers after ove
 })
 
 test('repository metadata distinguishes exact-limit EOF from truncation and keeps titles anywhere within budget', async t => {
-  const { root, sessions, repository } = fixture(t)
+  const { root, sessions, store, repository } = fixture(t)
   const path = join(sessions, 'budget.jsonl')
+  store.upsert({ sessionId: 'budget', cwd: root, sessionFile: path })
   const header = JSON.stringify({ type: 'session', id: 'budget', cwd: root }) + '\n'
   const message =
     JSON.stringify({ type: 'message', timestamp: TIMESTAMP, message: { role: 'user', content: 'fallback' } }) + '\n'

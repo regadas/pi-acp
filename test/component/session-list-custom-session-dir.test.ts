@@ -1,10 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PiAcpAgent } from '../../src/acp/agent.js'
 import { SessionRepository } from '../../src/acp/session-repository.js'
 import { SessionStore } from '../../src/acp/session-store.js'
+import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
 test('SessionRepository respects custom sessionDir from pi settings', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-custom-dir-'))
@@ -36,6 +38,42 @@ test('SessionRepository respects custom sessionDir from pi settings', async () =
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
     else process.env.PI_CODING_AGENT_DIR = previous
   }
+})
+
+test('PiAcpAgent deletes history listed from another cwd with a relative session directory', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-custom-dir-delete-'))
+  const cwd = join(root, 'project')
+  assert.notEqual(cwd, process.cwd())
+  const sessions = join(cwd, 'sessions')
+  mkdirSync(sessions, { recursive: true })
+  const sessionFile = join(sessions, 'listed.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 'listed', cwd })}\n`)
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR
+  const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR
+  const previousAcpDir = process.env.PI_ACP_DIR
+  process.env.PI_CODING_AGENT_DIR = join(root, 'agent')
+  process.env.PI_CODING_AGENT_SESSION_DIR = 'sessions'
+  process.env.PI_ACP_DIR = join(root, 'acp')
+  t.after(() => {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir
+    if (previousSessionDir === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR
+    else process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionDir
+    if (previousAcpDir === undefined) delete process.env.PI_ACP_DIR
+    else process.env.PI_ACP_DIR = previousAcpDir
+    rmSync(root, { recursive: true, force: true })
+  })
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  t.after(() => agent.dispose())
+
+  assert.deepEqual(
+    (await agent.listSessions({ cwd })).sessions.map(session => session.sessionId),
+    ['listed']
+  )
+  assert.deepEqual(await agent.deleteSession({ sessionId: 'listed' }), {})
+  assert.equal(existsSync(sessionFile), false, 'successful deletion must remove the listed history')
+  assert.deepEqual((await agent.listSessions({ cwd })).sessions, [])
+  assert.deepEqual(await agent.deleteSession({ sessionId: 'listed' }), {})
 })
 
 test(

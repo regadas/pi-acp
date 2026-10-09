@@ -67,6 +67,126 @@ test('repository keeps a mapped duplicate canonical for find and list while dele
   )
 })
 
+test('repository.list retains only validated in-scope winners without replacing a mapped foreign owner', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-list-mappings-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const cwd = join(root, 'project')
+  const foreign = join(root, 'foreign')
+  const sessions = join(cwd, 'sessions')
+  mkdirSync(sessions, { recursive: true })
+  const writeSession = (name: string, id: string, owner: string, timestamp: string) => {
+    const path = join(sessions, `${name}.jsonl`)
+    writeFileSync(
+      path,
+      `${JSON.stringify({ type: 'session', id, cwd: owner })}\n${JSON.stringify({ type: 'session_info', timestamp, name })}\n`
+    )
+    return path
+  }
+  const oldFile = writeSession('old-local', 'wanted', cwd, '2026-01-01T00:00:00Z')
+  const wantedFile = writeSession('new-local', 'wanted', cwd, '2026-01-02T00:00:00Z')
+  writeSession('foreign', 'foreign', foreign, '2026-01-01T00:00:00Z')
+  writeSession('old-local-copy', 'foreign-winner', cwd, '2026-01-01T00:00:00Z')
+  writeSession('new-foreign-copy', 'foreign-winner', foreign, '2026-01-02T00:00:00Z')
+  const mappedForeign = writeSession('mapped-foreign', 'mapped', foreign, '2026-01-01T00:00:00Z')
+  writeSession('new-local-copy', 'mapped', cwd, '2026-01-02T00:00:00Z')
+  const invalidFile = join(sessions, 'invalid.jsonl')
+  writeFileSync(invalidFile, `${JSON.stringify({ type: 'message', id: 'invalid', cwd })}\n`)
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'mapped', cwd: foreign, sessionFile: mappedForeign })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: 'sessions' }, join(root, 'agent'))
+
+  assert.deepEqual(
+    (await repository.list(cwd)).map(record => [record.sessionId, record.sessionFile]),
+    [['wanted', wantedFile]]
+  )
+  assert.equal(store.get('wanted')?.sessionFile, wantedFile)
+  assert.equal(store.get('wanted')?.cwd, cwd)
+  for (const id of ['foreign', 'foreign-winner', 'invalid']) assert.equal(store.get(id), null)
+  assert.equal(store.get('mapped')?.sessionFile, mappedForeign)
+  assert.equal(store.get('mapped')?.cwd, foreign)
+  const upsert = t.mock.method(store, 'upsert')
+  assert.deepEqual(
+    (await repository.list(cwd)).map(record => record.sessionFile),
+    [wantedFile]
+  )
+  assert.equal(upsert.mock.callCount(), 0, 'unchanged validated mappings must not be rewritten')
+
+  assert.equal(await repository.delete('wanted'), wantedFile)
+  assert.equal(existsSync(oldFile), false)
+  assert.equal(existsSync(wantedFile), false)
+  assert.equal(existsSync(mappedForeign), true)
+  assert.equal(existsSync(invalidFile), true)
+  assert.equal(store.get('wanted'), null)
+  assert.deepEqual(await repository.list(cwd), [])
+})
+
+test('repository.list preserves a canonical owner established after its mapping snapshot', async t => {
+  for (const owner of ['foreign', 'local']) {
+    await t.test(owner, async t => {
+      const { rmSync } = await import('node:fs')
+      const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-list-owner-race-'))
+      t.after(() => rmSync(root, { recursive: true, force: true }))
+      const cwd = join(root, 'project')
+      const canonicalCwd = owner === 'foreign' ? join(root, 'other-project') : cwd
+      const writeSession = (project: string, name: string, timestamp: string) => {
+        const sessions = join(project, 'sessions')
+        mkdirSync(sessions, { recursive: true })
+        const path = join(sessions, `${name}.jsonl`)
+        writeFileSync(
+          path,
+          `${JSON.stringify({ type: 'session', id: 'duplicate', cwd: project })}\n${JSON.stringify({ type: 'session_info', timestamp, name })}\n`
+        )
+        return path
+      }
+      const localFile = writeSession(cwd, 'newer-local', '2026-01-02T00:00:00Z')
+      const canonicalFile = writeSession(canonicalCwd, 'canonical', '2026-01-01T00:00:00Z')
+      const store = new SessionStore(join(root, 'map.json'))
+      const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: 'sessions' }, join(root, 'agent'))
+      const realList = store.list.bind(store)
+      let captured!: () => void
+      const snapshotCaptured = new Promise<void>(resolve => (captured = resolve))
+      let release!: () => void
+      const resumeList = new Promise<void>(resolve => (release = resolve))
+      t.mock.method(store, 'list', async () => {
+        const snapshot = await realList()
+        captured()
+        await resumeList
+        return snapshot
+      })
+
+      const listing = repository.list(cwd)
+      await snapshotCaptured
+      try {
+        assert.equal(store.get('duplicate'), null)
+        if (owner === 'foreign') {
+          assert.equal((await repository.find('duplicate', canonicalCwd))?.sessionFile, canonicalFile)
+        } else {
+          repository.upsert({
+            sessionId: 'duplicate',
+            cwd: canonicalCwd,
+            sessionFile: canonicalFile
+          })
+        }
+        assert.equal(store.get('duplicate')?.sessionFile, canonicalFile)
+      } finally {
+        release()
+      }
+      const records = await listing
+      assert.equal(store.get('duplicate')?.sessionFile, canonicalFile, 'stale listing must not replace the owner')
+      assert.equal(store.get('duplicate')?.cwd, canonicalCwd)
+      assert.deepEqual(
+        records.map(record => [record.sessionFile, record.title]),
+        owner === 'foreign' ? [] : [[canonicalFile, 'canonical']],
+        'listing must use the current validated canonical record, not expose a stale duplicate'
+      )
+      assert.equal((await repository.find('duplicate', canonicalCwd))?.sessionFile, canonicalFile)
+      assert.equal(existsSync(localFile), true)
+      assert.equal(existsSync(canonicalFile), true)
+    })
+  }
+})
+
 test('repository.find uses a validated mapped file without enumerating or scanning metadata', async t => {
   const { default: fs } = await import('node:fs')
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-mapped-'))

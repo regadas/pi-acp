@@ -370,11 +370,11 @@ export class SessionRepository {
     }
     const inScope = (rawCwd: string): boolean => !cwd || comparisonCwd(rawCwd) === comparisonCwd(cwd)
     const paths = new Set<string>()
-    const mappedPaths = new Map<string, string>()
+    const mappedSessions = new Map<string, StoredSession>()
     const roots = new Set([discoveryRoot(cwd ?? process.cwd())])
     for (const stored of await this.store.list()) {
       paths.add(stored.sessionFile)
-      mappedPaths.set(stored.sessionId, stored.sessionFile)
+      mappedSessions.set(stored.sessionId, stored)
       addStoredDiscoveryRoot(roots, stored, this.env, this.agentDir, discoveryRoot(stored.cwd))
     }
     for (const root of roots) {
@@ -392,7 +392,8 @@ export class SessionRepository {
     }
     const byId = new Map<string, SessionRecord>()
     const attemptedMappedPaths = new Set<string>()
-    for (const [sessionId, path] of mappedPaths) {
+    for (const [sessionId, stored] of mappedSessions) {
+      const path = stored.sessionFile
       const header = headers.get(path)
       if (!header || header.sessionId !== sessionId || !scopedIds.has(sessionId)) continue
       attemptedMappedPaths.add(path)
@@ -402,9 +403,24 @@ export class SessionRepository {
     for (const [path, header] of headers) {
       if (!scopedIds.has(header.sessionId) || attemptedMappedPaths.has(path)) continue
       const previous = byId.get(header.sessionId)
-      if (previous && previous.sessionFile === mappedPaths.get(header.sessionId)) continue
+      if (previous && previous.sessionFile === mappedSessions.get(header.sessionId)?.sessionFile) continue
       const record = await project(path, undefined, header)
       if (record && (!previous || isNewer(record, previous))) byId.set(record.sessionId, record)
+    }
+    for (const [sessionId, record] of byId) {
+      let selected = record
+      let mapped = mappedSessions.get(sessionId)
+      let stored = this.store.get(sessionId)
+      // Discovery can yield while another operation establishes a canonical owner.
+      while (stored && (stored.sessionFile !== mapped?.sessionFile || stored.cwd !== mapped?.cwd)) {
+        mapped = stored
+        selected = (await project(stored.sessionFile, sessionId)) ?? selected
+        stored = this.store.get(sessionId)
+      }
+      byId.set(sessionId, selected)
+      if (inScope(selected.cwd) && (stored?.sessionFile !== selected.sessionFile || stored?.cwd !== selected.cwd)) {
+        this.store.upsert(selected)
+      }
     }
     return [...byId.values()]
       .filter(record => inScope(record.cwd))
