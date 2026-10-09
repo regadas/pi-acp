@@ -396,6 +396,70 @@ test('PiRpcProcess: a failed stdin write quarantines the channel as an unexpecte
   }
 })
 
+test('PiRpcProcess: asynchronous stdin errors reject pending requests and retain ownership until close', async t => {
+  const mock = new MockChild()
+  const proc = PiRpcProcess.fromChild(asChild(mock), { requestTimeoutMs: 5_000, killGraceMs: 30 })
+  t.after(() => {
+    proc.dispose()
+    mock.emit('close', null, 'SIGKILL')
+  })
+  const terminations: PiRpcTermination[] = []
+  proc.onTermination(termination => terminations.push(termination))
+  const events: PiRpcEvent[] = []
+  proc.onEvent(event => events.push(event))
+  const pending = Promise.all([
+    assert.rejects(proc.getState(), PiRpcClosedError),
+    assert.rejects(proc.getEntries(), PiRpcClosedError)
+  ])
+  await tick()
+  assert.equal(proc.hasPendingRequests(), true)
+
+  mock.stdin.destroy(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+  await withTimeout(pending, 500, 'stdin error pending cleanup')
+
+  assert.equal(proc.hasPendingRequests(), false)
+  assert.deepEqual(mock.kills, ['SIGTERM'])
+  assert.equal(terminations.length, 0, 'a stream error does not release the live child')
+  await assert.rejects(proc.getState(), PiRpcClosedError)
+  mock.stdout.write('{"type":"agent_start"}\n')
+  await tick()
+  assert.deepEqual(events, [], 'a broken channel suppresses later stdout records')
+  await sleep(60)
+  assert.deepEqual(mock.kills, ['SIGTERM', 'SIGKILL'])
+  mock.emit('close', null, 'SIGKILL')
+  assert.equal(terminations.length, 1)
+  assert.equal(terminations[0]!.expected, false)
+  mock.stdin.emit('error', new Error('late stdin error'))
+  assert.equal(terminations.length, 1)
+})
+
+test('PiRpcProcess: a child closing stdin cannot crash the server with asynchronous EPIPE (real child)', async t => {
+  const fixture = fileURLToPath(new URL('../fixtures/fake-pi-rpc-closed-stdin.mjs', import.meta.url))
+  const child = spawn(process.execPath, [fixture], { stdio: 'pipe' })
+  const proc = PiRpcProcess.fromChild(child, { requestTimeoutMs: 5_000, killGraceMs: 100 })
+  const terminationPromise = new Promise<PiRpcTermination>(resolve => proc.onTermination(resolve))
+  t.after(() => cleanupFixture(child, proc, terminationPromise, 'closed stdin fixture cleanup'))
+  const ready = new Promise<void>(resolve =>
+    proc.onEvent(event => {
+      if (event.type === 'session_info_changed' && event.ready === true) resolve()
+    })
+  )
+  await withTimeout(ready, 2_000, 'closed stdin fixture readiness')
+
+  await Promise.all([
+    assert.rejects(proc.getState(), PiRpcClosedError),
+    assert.rejects(proc.getEntries(), PiRpcClosedError),
+    assert.rejects(proc.sendExtensionUiResponse({ id: 'x'.repeat(2 * 1024 * 1024), cancelled: true }), {
+      code: 'EPIPE'
+    })
+  ])
+  assert.equal(proc.hasPendingRequests(), false)
+  await assert.rejects(proc.getState(), PiRpcClosedError)
+  const termination = await withTimeout(terminationPromise, 2_000, 'closed stdin fixture termination')
+  assert.equal((child.stdin.errored as NodeJS.ErrnoException).code, 'EPIPE')
+  assert.equal(termination.expected, false)
+})
+
 test('PiRpcProcess: a failed fire-and-forget stdin write rejects and quarantines the channel', async () => {
   const mock = new MockChild()
   const failure = new Error('stdin closed')

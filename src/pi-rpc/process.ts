@@ -151,6 +151,9 @@ export class PiRpcProcess {
     this.killGraceMs = opts?.killGraceMs ?? KILL_GRACE_MS
     this.closeFallbackMs = opts?.closeFallbackMs ?? CLOSE_FALLBACK_MS
 
+    // Write callbacks do not consume the stream's asynchronous error event.
+    child.stdin.on('error', () => this.dispose({ expected: false }))
+
     const decoder = new LfLineDecoder(opts?.maxStdoutRecordBytes)
     child.stdout.on('data', (chunk: Buffer) => {
       try {
