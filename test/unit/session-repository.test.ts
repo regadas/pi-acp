@@ -401,6 +401,101 @@ test('repository.delete fails closed on a file descriptor exhaustion error', asy
   assert.equal(store.get('wanted')?.sessionFile, storedFile)
 })
 
+test('repository.delete preserves mappings and all copies on unexpected header IO failures', async t => {
+  for (const stage of ['open', 'read']) {
+    for (const blocked of ['mapped', 'discovered']) {
+      for (const code of ['EACCES', 'EIO']) {
+        await t.test(`${stage} ${blocked} ${code}`, async t => {
+          const { default: fs } = await import('node:fs')
+          const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-unreadable-delete-'))
+          t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+          const sessions = join(root, 'sessions')
+          mkdirSync(sessions)
+          const storedFile = join(sessions, 'stored.jsonl')
+          const discoveredFile = join(sessions, 'discovered.jsonl')
+          const content = `${JSON.stringify({ type: 'session', id: 'wanted', cwd: root })}\n`
+          for (const path of [storedFile, discoveredFile]) writeFileSync(path, content)
+          const mapPath = join(root, 'map.json')
+          const store = new SessionStore(mapPath)
+          store.upsert({ sessionId: 'wanted', cwd: root, sessionFile: storedFile })
+          const mapping = store.get('wanted')
+          const blockedFile = blocked === 'mapped' ? storedFile : discoveredFile
+          const error = Object.assign(new Error('header failed'), { code })
+          const realOpen = fs.promises.open
+          let closed = false
+          t.mock.method(fs.promises, 'open', async (...args: Parameters<typeof realOpen>) => {
+            if (args[0] === blockedFile && stage === 'open') throw error
+            const handle = await realOpen(...args)
+            if (args[0] === blockedFile) {
+              t.mock.method(handle, 'read', async () => {
+                throw error
+              })
+              const close = handle.close.bind(handle)
+              t.mock.method(handle, 'close', async () => {
+                await close()
+                closed = true
+              })
+            }
+            return handle
+          })
+          syncBuiltinESMExports()
+          t.after(() => {
+            t.mock.restoreAll()
+            syncBuiltinESMExports()
+          })
+          const repository = new SessionRepository(
+            store,
+            { PI_CODING_AGENT_SESSION_DIR: sessions },
+            join(root, 'agent')
+          )
+
+          await assert.rejects(repository.delete('wanted'), error)
+          for (const path of [storedFile, discoveredFile]) assert.equal(fs.readFileSync(path, 'utf8'), content)
+          assert.deepEqual(store.get('wanted'), mapping)
+          assert.deepEqual(new SessionStore(mapPath).get('wanted'), mapping)
+          if (stage === 'read') assert.equal(closed, true, 'failed header reads must close their handle')
+        })
+      }
+    }
+  }
+})
+
+test('repository.delete remains idempotent for a legitimately missing mapped file', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-missing-delete-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  const sessionFile = join(sessions, 'missing.jsonl')
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'missing', cwd: root, sessionFile })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  assert.equal(await repository.delete('missing'), null)
+  assert.equal(existsSync(sessionFile), false)
+  assert.equal(store.get('missing'), null)
+  assert.equal(await repository.delete('missing'), null)
+})
+
+test('repository.delete remains idempotent when a mapped file ancestor is not a directory', async t => {
+  const { readFileSync, rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-enotdir-delete-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  writeFileSync(sessions, 'not a directory')
+  const sessionFile = join(sessions, 'missing.jsonl')
+  const mapPath = join(root, 'map.json')
+  const store = new SessionStore(mapPath)
+  store.upsert({ sessionId: 'missing', cwd: root, sessionFile })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  assert.equal(existsSync(sessionFile), false)
+  assert.equal(await repository.delete('missing'), null)
+  assert.equal(readFileSync(sessions, 'utf8'), 'not a directory')
+  assert.equal(store.get('missing'), null)
+  assert.equal(new SessionStore(mapPath).get('missing'), null)
+  assert.equal(await repository.delete('missing'), null)
+})
+
 test('repository validates stored headers before deletion and tombstones tampered paths', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-delete-'))
   const map = join(root, 'session-map.json')

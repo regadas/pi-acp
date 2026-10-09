@@ -80,15 +80,26 @@ async function readHeaderLine(path: string): Promise<string | null> {
     if (length >= HEADER_LIMIT) return null
     return (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, length)).toString('utf8')
   } catch (error) {
-    rethrowResourceExhaustion(error)
-    return null
+    if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return null
+    throw error
   } finally {
     await handle?.close().catch(() => {})
   }
 }
 
-async function validatedHeader(path: string, requestedId?: string): Promise<{ sessionId: string; cwd: string } | null> {
-  const head = await readHeaderLine(path)
+async function validatedHeader(
+  path: string,
+  requestedId?: string,
+  strictRead = false
+): Promise<{ sessionId: string; cwd: string } | null> {
+  let head: string | null
+  try {
+    head = await readHeaderLine(path)
+  } catch (error) {
+    rethrowResourceExhaustion(error)
+    if (strictRead) throw error
+    return null
+  }
   if (!head) return null
   try {
     const value = JSON.parse(head.trim()) as Record<string, unknown>
@@ -216,9 +227,10 @@ function isNewer(candidate: SessionRecord, previous: SessionRecord): boolean {
 async function project(
   path: string,
   requestedId?: string,
-  knownHeader?: { sessionId: string; cwd: string }
+  knownHeader?: { sessionId: string; cwd: string },
+  strictRead = false
 ): Promise<SessionRecord | null> {
-  const header = knownHeader ?? (await validatedHeader(path, requestedId))
+  const header = knownHeader ?? (await validatedHeader(path, requestedId, strictRead))
   if (!header) return null
   const metadata = await scanMetadata(path)
   let mtime: Date | null = null
@@ -294,7 +306,7 @@ export class SessionRepository {
     return this.store.get(sessionId)
   }
 
-  private async matchingRecords(sessionId: string, cwd?: string): Promise<SessionRecord[]> {
+  private async matchingRecords(sessionId: string, cwd?: string, strictRead = false): Promise<SessionRecord[]> {
     const stored = this.store.get(sessionId)
     const paths = new Set<string>()
     const roots = new Set<string>()
@@ -309,7 +321,7 @@ export class SessionRepository {
     const records: SessionRecord[] = []
     for (let offset = 0; offset < files.length; offset += LOOKUP_CONCURRENCY) {
       const candidates = await Promise.all(
-        files.slice(offset, offset + LOOKUP_CONCURRENCY).map(path => project(path, sessionId))
+        files.slice(offset, offset + LOOKUP_CONCURRENCY).map(path => project(path, sessionId, undefined, strictRead))
       )
       for (const candidate of candidates) if (candidate) records.push(candidate)
     }
@@ -428,7 +440,7 @@ export class SessionRepository {
   }
 
   async delete(sessionId: string): Promise<string | null> {
-    const records = await this.matchingRecords(sessionId)
+    const records = await this.matchingRecords(sessionId, undefined, true)
     let newest: SessionRecord | null = null
     for (const record of records) {
       if (!newest || isNewer(record, newest)) newest = record
