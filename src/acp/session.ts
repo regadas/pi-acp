@@ -141,6 +141,10 @@ type PendingCustomMessage = {
   sequence: number
 }
 
+type PublishedCustomMessage = PendingCustomMessage & {
+  deliveries: Promise<void>[]
+}
+
 type PermissionResponse = Awaited<ReturnType<AcpClient['requestPermission']>>
 type PiUiResponse = { id: string; value: string } | { id: string; confirmed: boolean } | { id: string; cancelled: true }
 type PendingUiRequest = {
@@ -207,6 +211,7 @@ export class PiAcpSession {
   private activeAdapterPromptTurns = 0
   private customMessageSequence = 0
   private readonly pendingCustomMessages: PendingCustomMessage[] = []
+  private publishedCustomMessagesDuringLoad: PublishedCustomMessage[] | null = null
   private publishedTitle: string | null | undefined
   private sessionInfoSyncTail: Promise<void> = Promise.resolve()
   private publishedConfigFingerprint: string | undefined
@@ -572,9 +577,31 @@ export class PiAcpSession {
     return this.customMessageSequence
   }
 
-  reconcileLoadedCustomMessages(messages: unknown[], throughSequence: number): void {
+  capturePublishedCustomMessagesForLoad(): () => PublishedCustomMessage[] {
+    const published: PublishedCustomMessage[] = []
+    this.publishedCustomMessagesDuringLoad = published
+    return () => {
+      this.publishedCustomMessagesDuringLoad = null
+      return published
+    }
+  }
+
+  reconcileLoadedCustomMessages(
+    messages: unknown[],
+    throughSequence: number,
+    publishedMessages: PublishedCustomMessage[]
+  ): Map<number, Promise<void>[]> {
+    const publishedByIdentity = new Map<string, PublishedCustomMessage[]>()
+    for (const message of publishedMessages) {
+      if (message.sequence > throughSequence) continue
+      const matching = publishedByIdentity.get(message.identity)
+      if (matching) matching.push(message)
+      else publishedByIdentity.set(message.identity, [message])
+    }
+
+    const skippedReplayMessages = new Map<number, Promise<void>[]>()
     const replayedByIdentity = new Map<string, number>()
-    for (const message of messages) {
+    for (const [index, message] of messages.entries()) {
       const record = message as { role?: unknown; display?: unknown; content?: unknown } | null | undefined
       if (record?.role !== 'custom' || record.display !== true) continue
 
@@ -582,7 +609,12 @@ export class PiAcpSession {
       if (!blocks.length) continue
 
       const identity = customMessageIdentity(message, blocks)
-      replayedByIdentity.set(identity, (replayedByIdentity.get(identity) ?? 0) + 1)
+      const published = publishedByIdentity.get(identity)?.shift()
+      if (published) {
+        skippedReplayMessages.set(index, published.deliveries)
+      } else {
+        replayedByIdentity.set(identity, (replayedByIdentity.get(identity) ?? 0) + 1)
+      }
     }
 
     const reconciledSequences = new Set<number>()
@@ -607,24 +639,26 @@ export class PiAcpSession {
 
     const retained = this.pendingCustomMessages.filter(message => !reconciledSequences.has(message.sequence))
     this.pendingCustomMessages.splice(0, this.pendingCustomMessages.length, ...retained)
+    return skippedReplayMessages
   }
 
   private sendPendingCustomMessages(): void {
     const messages = this.pendingCustomMessages.splice(0)
     for (const message of messages) {
-      this.emitCustomMessageBlocks(message.blocks)
+      const deliveries = this.emitCustomMessageBlocks(message.blocks)
+      this.publishedCustomMessagesDuringLoad?.push({ ...message, deliveries })
     }
   }
 
-  private emitCustomMessageBlocks(blocks: TranslatedUserBlock[]): void {
-    for (const block of blocks) {
-      this.emit({
+  private emitCustomMessageBlocks(blocks: TranslatedUserBlock[]): Promise<void>[] {
+    return blocks.map(block =>
+      this.enqueueUpdate({
         sessionUpdate: 'agent_message_chunk',
         content: (block.kind === 'text'
           ? { type: 'text', text: block.text }
           : { type: 'image', data: block.data, mimeType: block.mimeType }) satisfies ContentBlock
       })
-    }
+    )
   }
 
   async prompt(message: string, images: unknown[] = [], beforeRelease?: () => Promise<void>): Promise<StopReason> {
@@ -2099,7 +2133,8 @@ export class PiAcpSession {
         const activeTurn = this.pendingTurn
 
         if (this.piBusyOutOfBand || this.turnOwnsPiRun(activeTurn) || this.activeAdapterPromptTurns > 0) {
-          this.emitCustomMessageBlocks(blocks)
+          const deliveries = this.emitCustomMessageBlocks(blocks)
+          this.publishedCustomMessagesDuringLoad?.push({ ...pendingMessage, deliveries })
         } else {
           this.pendingCustomMessages.push(pendingMessage)
         }

@@ -349,3 +349,159 @@ test('config restore retries when a load begins during the restore TOCTOU window
     PiRpcProcess.spawn = originalSpawn
   }
 })
+
+test('session/load publishes autonomous custom messages only once when history overlaps', async () => {
+  const treeStarted = deferred()
+  const releaseTree = deferred()
+  const message = { role: 'custom', customType: 'background-task', display: true, content: 'Live custom note' }
+  const proc = new MockProc({
+    getEntries: async beforeResponseResolve => {
+      treeStarted.resolve()
+      await releaseTree.promise
+      beforeResponseResolve?.()
+      return {
+        entries: [{ id: 'e1', parentId: null, type: 'custom_message', timestamp: '', ...message }],
+        leafId: 'e1'
+      }
+    }
+  })
+  const { agent, conn, manager } = makeAgent()
+  const noteCount = () =>
+    conn.updates.filter(
+      ({ update }) =>
+        update.sessionUpdate === 'agent_message_chunk' &&
+        update.content.type === 'text' &&
+        update.content.text === message.content
+    ).length
+
+  try {
+    await withMockSpawn([proc], async () => {
+      const load = agent.loadSession(loadParams)
+      await treeStarted.promise
+      proc.emit({ type: 'agent_start' })
+      proc.emit({ type: 'message_end', message })
+      await tick()
+      assert.equal(noteCount(), 1, 'the custom message is already delivered live during load')
+      releaseTree.resolve()
+      await load
+      assert.equal(noteCount(), 1, 'history must not republish the live custom message')
+    })
+  } finally {
+    releaseTree.resolve()
+    manager.maybeGet('s1')?.dispose()
+  }
+})
+
+test('session/load waits for every block of an overlapping live custom message', async () => {
+  const treeStarted = deferred()
+  const releaseTree = deferred()
+  const firstStarted = deferred()
+  const secondStarted = deferred()
+  const firstGate = deferred()
+  const secondGate = deferred()
+  const message = {
+    role: 'custom',
+    customType: 'background-task',
+    display: true,
+    content: [
+      { type: 'image', data: 'aW1n', mimeType: 'image/png' },
+      { type: 'text', text: 'Live custom note' }
+    ]
+  }
+  const proc = new MockProc({
+    getEntries: async beforeResponseResolve => {
+      treeStarted.resolve()
+      await releaseTree.promise
+      beforeResponseResolve?.()
+      return {
+        entries: [{ id: 'e1', parentId: null, type: 'custom_message', timestamp: '', ...message }],
+        leafId: 'e1'
+      }
+    }
+  })
+  const { agent, conn, manager } = makeAgent()
+  const delivered: string[] = []
+  conn.sessionUpdate = async msg => {
+    const update = msg.update
+    if (update.sessionUpdate !== 'agent_message_chunk') return
+    if (update.content.type === 'image') {
+      firstStarted.resolve()
+      await firstGate.promise
+    } else {
+      secondStarted.resolve()
+      await secondGate.promise
+    }
+    delivered.push(update.content.type)
+  }
+
+  try {
+    await withMockSpawn([proc], async () => {
+      let loadSettled = false
+      const load = agent.loadSession(loadParams).finally(() => {
+        loadSettled = true
+      })
+      void load.catch(() => {})
+      try {
+        await treeStarted.promise
+        proc.emit({ type: 'agent_start' })
+        proc.emit({ type: 'message_end', message })
+        await firstStarted.promise
+        releaseTree.resolve()
+        await tick()
+        assert.equal(loadSettled, false, 'load cannot satisfy history with an undelivered first block')
+        firstGate.resolve()
+        await secondStarted.promise
+        await tick()
+        assert.equal(loadSettled, false, 'load must await the later blocks too')
+        secondGate.resolve()
+        await load
+        assert.deepEqual(delivered, ['image', 'text'], 'all blocks are delivered exactly once before load completes')
+      } finally {
+        releaseTree.resolve()
+        firstGate.resolve()
+        secondGate.resolve()
+        await load.catch(() => {})
+      }
+    })
+  } finally {
+    manager.maybeGet('s1')?.dispose()
+  }
+})
+
+test('session/load rejects and retires its process when an overlapping live custom block fails delivery', async () => {
+  const treeStarted = deferred()
+  const releaseTree = deferred()
+  const message = { role: 'custom', customType: 'background-task', display: true, content: 'Live custom note' }
+  const proc = new MockProc({
+    getEntries: async beforeResponseResolve => {
+      treeStarted.resolve()
+      await releaseTree.promise
+      beforeResponseResolve?.()
+      return {
+        entries: [{ id: 'e1', parentId: null, type: 'custom_message', timestamp: '', ...message }],
+        leafId: 'e1'
+      }
+    }
+  })
+  const { agent, conn, manager } = makeAgent()
+  conn.sessionUpdate = async msg => {
+    const update = msg.update
+    if (update.sessionUpdate === 'agent_message_chunk') throw new Error('custom delivery failed')
+  }
+  try {
+    await withMockSpawn([proc], async () => {
+      const rejectedLoad = assert.rejects(agent.loadSession(loadParams), /custom delivery failed/)
+      await treeStarted.promise
+      proc.emit({ type: 'agent_start' })
+      proc.emit({ type: 'message_end', message })
+      await tick()
+      releaseTree.resolve()
+      await rejectedLoad
+      assert.equal(proc.disposeCount, 1, 'failed live delivery is a load failure that retires the provisional process')
+      assert.equal(manager.maybeGet('s1'), undefined)
+    })
+  } finally {
+    releaseTree.resolve()
+    manager.maybeGet('s1')?.dispose()
+  }
+})
