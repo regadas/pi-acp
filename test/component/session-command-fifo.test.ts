@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { PiAcpAgent } from '../../src/acp/agent.js'
+import { PiAcpAgent, runPromptWithCancellation } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { runBuiltinCommand } from '../../src/acp/builtin-commands.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
@@ -128,6 +128,77 @@ test('PiAcpAgent: an adapter command queues behind the active prompt instead of 
   assert.ok(appliedIndex > queuedIndex, 'the command result is delivered after its queue notice')
 })
 
+for (const activeKind of ['prompt', 'command']) {
+  for (const queuedKind of ['prompt', 'command']) {
+    test(`runPromptWithCancellation: cancelling queued ${queuedKind} preserves active ${activeKind} and remaining FIFO`, async t => {
+      const proc = new FakePiRpcProcess()
+      const commandStarted = deferred<void>()
+      const commandResult = deferred<unknown>()
+      const names: string[] = []
+      Object.assign(proc, {
+        compact: () => {
+          commandStarted.resolve()
+          return proc.pendingRequest(commandResult.promise)
+        },
+        setSessionName: async (name: string) => {
+          names.push(name)
+        }
+      })
+      const { agent, conn, session } = makeAgent(proc)
+      t.after(() => session.dispose())
+      const first = agent.prompt({
+        sessionId: 's1',
+        prompt: [{ type: 'text', text: activeKind === 'prompt' ? 'first' : '/compact' }]
+      })
+      if (activeKind === 'command') await commandStarted.promise
+      else await tick()
+
+      const controller = new AbortController()
+      const cancelled = runPromptWithCancellation(
+        agent,
+        { sessionId: 's1', prompt: [{ type: 'text', text: queuedKind === 'prompt' ? 'never' : '/name Never' }] },
+        controller.signal
+      )
+      const third = agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: 'third' }] })
+      const fourth = agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: 'fourth' }] })
+      await tick()
+      assert.deepEqual(queueStates(conn).at(-1), { queueDepth: 3, running: true })
+
+      controller.abort()
+      const cancelledResponse = await cancelled
+      assert.equal(cancelledResponse.stopReason, 'cancelled')
+      assert.equal(cancelledResponse.usage, undefined, 'never-run work has no usage')
+      assert.equal(proc.abortCount, 0, 'queued cancellation cannot abort the active owner')
+      assert.equal(proc.disposeCount, 0, 'queued cancellation cannot quarantine the active owner')
+      assert.deepEqual(queueStates(conn).at(-1), { queueDepth: 2, running: true })
+      assert.deepEqual(names, [], 'the cancelled command never executes')
+
+      if (activeKind === 'command') commandResult.resolve({ tokensBefore: 10 })
+      else {
+        proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'first output' } })
+        proc.emit({ type: 'agent_settled' })
+      }
+      assert.equal((await first).stopReason, 'end_turn')
+      await tick()
+      assert.deepEqual(
+        proc.prompts.map(item => item.message),
+        activeKind === 'prompt' ? ['first', 'third'] : ['third']
+      )
+      proc.emit({ type: 'agent_settled' })
+      assert.equal((await third).stopReason, 'end_turn')
+      await tick()
+      assert.equal(proc.prompts.at(-1)?.message, 'fourth')
+      proc.emit({ type: 'agent_settled' })
+      assert.equal((await fourth).stopReason, 'end_turn')
+      assert.ok(!proc.prompts.some(item => item.message === 'never'), 'the cancelled prompt never executes')
+      assert.deepEqual(names, [])
+      if (activeKind === 'prompt') assert.ok(agentMessageTexts(conn).includes('first output'))
+      await tick()
+      assert.deepEqual(queueStates(conn).at(-1), { queueDepth: 0, running: false })
+    })
+  }
+}
+
 test('PiAcpAgent: prompt usage is captured before the FIFO admits the next prompt', async () => {
   const proc = new FakePiRpcProcess() as any
   const usageStarted = deferred<void>()
@@ -216,34 +287,42 @@ test('PiAcpAgent: a prompt arriving during an adapter command waits for it', asy
   assert.equal((await queuedPrompt).stopReason, 'end_turn')
 })
 
-test('PiAcpAgent: cancelling a command blocked on pi quarantines the channel and settles as cancelled', async () => {
-  const proc = new FakePiRpcProcess() as any
-  const compactStarted = deferred<void>()
-  // Never settled by the test: only quarantining the channel can end this RPC,
-  // exactly like a real manual compaction that pi refuses to abort.
-  const compactResult = deferred<unknown>()
-  proc.compact = () => {
-    compactStarted.resolve()
-    return proc.pendingRequest(compactResult.promise)
-  }
-  const { agent, conn, session, sessions } = makeAgent(proc)
+for (const cancellation of ['session', 'request']) {
+  test(`PiAcpAgent: ${cancellation} cancellation of a command blocked on pi quarantines the channel and settles as cancelled`, async () => {
+    const proc = new FakePiRpcProcess()
+    const compactStarted = deferred<void>()
+    // Only quarantining the channel can end this RPC, like real manual compaction.
+    const compactResult = deferred<unknown>()
+    Object.assign(proc, {
+      compact: () => {
+        compactStarted.resolve()
+        return proc.pendingRequest(compactResult.promise)
+      }
+    })
+    const { agent, conn, session, sessions } = makeAgent(proc)
+    const controller = new AbortController()
+    const compacting = runPromptWithCancellation(
+      agent,
+      { sessionId: 's1', prompt: [{ type: 'text', text: '/compact' }] },
+      controller.signal
+    )
+    await compactStarted.promise
 
-  const compacting = agent.prompt(promptParams('/compact'))
-  await compactStarted.promise
+    if (cancellation === 'request') controller.abort()
+    else await agent.cancel({ sessionId: 's1' })
 
-  await agent.cancel({ sessionId: 's1' } as any)
-
-  assert.equal(proc.abortCount, 0, 'abort cannot settle a manual RPC, so cancellation does not issue one')
-  assert.equal(proc.disposeCount, 1, 'the channel is quarantined so the pending RPC rejects promptly')
-  assert.equal((await compacting).stopReason, 'cancelled')
-  assert.equal(session.isUnavailable(), true, 'the quarantined session is unavailable and must be restored later')
-  assert.deepEqual(sessions.evicted, ['s1'], 'the agent evicts it so a later request restores the session')
-  assert.deepEqual(
-    agentMessageTexts(conn).filter(text => text.includes('Compaction completed')),
-    [],
-    'a cancelled command publishes no completion output'
-  )
-})
+    assert.equal((await compacting).stopReason, 'cancelled')
+    assert.equal(proc.abortCount, 0, 'abort cannot settle a manual RPC, so cancellation does not issue one')
+    assert.equal(proc.disposeCount, 1, 'the channel is quarantined so the pending RPC rejects promptly')
+    assert.equal(session.isUnavailable(), true, 'the quarantined session is unavailable and must be restored later')
+    assert.deepEqual(sessions.evicted, ['s1'], 'the agent evicts it so a later request restores the session')
+    assert.deepEqual(
+      agentMessageTexts(conn).filter(text => text.includes('Compaction completed')),
+      [],
+      'a cancelled command publishes no completion output'
+    )
+  })
+}
 
 test('PiAcpAgent: cancelling a command with no pending pi RPC leaves the channel alone', async () => {
   const proc = new FakePiRpcProcess() as any
@@ -554,6 +633,42 @@ test('PiAcpAgent: a command cancelled after its pi RPC finished publishes no lat
   )
   proc.emit({ type: 'agent_settled' })
   assert.equal((await next).stopReason, 'end_turn')
+})
+
+test('PiAcpSession: late request cancellation while a completed command flushes does not clear the FIFO', async t => {
+  const proc = new FakePiRpcProcess()
+  const conn = new GatedConnection()
+  const { session } = makeAgent(proc, conn)
+  await session.syncSessionConfiguration()
+  const gate = deferred<void>()
+  t.after(() => {
+    gate.resolve()
+    session.dispose()
+  })
+  conn.gateUpdates(gate.promise)
+  const requestOwner = Symbol()
+  const command = session.runCommand(async ctx => {
+    void ctx.sendSessionUpdate({
+      sessionId: 's1',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Completed command' } }
+    })
+    return 'complete'
+  }, requestOwner)
+  const next = session.prompt('next')
+  await tick()
+
+  await session.cancel(requestOwner)
+  assert.equal(proc.abortCount, 0)
+  assert.equal(proc.disposeCount, 0)
+  gate.resolve()
+  assert.equal(await command, 'complete')
+  await tick()
+  assert.deepEqual(
+    proc.prompts.map(item => item.message),
+    ['next']
+  )
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await next, 'end_turn')
 })
 
 test('PiAcpSession: cancellation rechecks success and title inside the shared delivery queue', async () => {

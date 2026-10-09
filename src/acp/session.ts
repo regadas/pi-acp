@@ -49,6 +49,7 @@ export type StopReason = 'end_turn' | 'cancelled' | 'max_tokens'
 
 type PendingTurn = {
   owner: string
+  requestOwner?: symbol
   backgroundActive: boolean
   cancellationPending: boolean
   piSettled: boolean
@@ -71,6 +72,7 @@ type PendingTurn = {
 
 type QueuedPrompt = {
   kind: 'prompt'
+  requestOwner?: symbol
   message: string
   images: unknown[]
   resolve: (reason: StopReason) => void
@@ -81,6 +83,7 @@ type QueuedPrompt = {
 /** The adapter-handled slash command currently holding the session FIFO. */
 type ActiveCommand = {
   cancelled: boolean
+  requestOwner?: symbol
   /**
    * Absolute deadline for waiting out autonomous pi work before this command
    * may talk to pi. Set at its first park and preserved across re-parks, so
@@ -661,12 +664,17 @@ export class PiAcpSession {
     )
   }
 
-  async prompt(message: string, images: unknown[] = [], beforeRelease?: () => Promise<void>): Promise<StopReason> {
+  async prompt(
+    message: string,
+    images: unknown[] = [],
+    beforeRelease?: () => Promise<void>,
+    requestOwner?: symbol
+  ): Promise<StopReason> {
     // Once shutdown starts, no new work may be admitted to this subprocess.
     if (this.isClosing()) return 'cancelled'
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedPrompt = { kind: 'prompt', message, images, resolve, reject, beforeRelease }
+      const queued: QueuedPrompt = { kind: 'prompt', message, images, resolve, reject, beforeRelease, requestOwner }
 
       // If a turn or adapter command is running (or work is already waiting
       // behind it), enqueue so every prompt path stays FIFO.
@@ -696,7 +704,7 @@ export class PiAcpSession {
    * while it runs, and `cancel()` settles it promptly. Resolves `null` when
    * the command was cancelled before or during execution.
    */
-  async runCommand<T>(run: (ctx: CommandContext) => Promise<T>): Promise<T | null> {
+  async runCommand<T>(run: (ctx: CommandContext) => Promise<T>, requestOwner?: symbol): Promise<T | null> {
     // Defense in depth for the invariant `startNextQueuedWork` enforces for
     // queued work: no adapter command may run local-only work and report
     // success for a session whose child is gone or whose channel was
@@ -708,7 +716,7 @@ export class PiAcpSession {
     if (entryFailure) throw entryFailure
     if (this.procTermination || this.isClosing()) return null
 
-    const command: ActiveCommand = { cancelled: false }
+    const command: ActiveCommand = { cancelled: false, requestOwner }
     if (!(await this.admitCommandForExecution(command))) {
       // The admission was released rather than rejected, but the channel may
       // still have died under it: reject instead of reporting a benign
@@ -764,6 +772,7 @@ export class PiAcpSession {
       if (command.cancelled) return null
       throw error
     } finally {
+      command.requestOwner = undefined
       await finishAdapterPromptTurn()
       this.releaseCommandSlot()
     }
@@ -947,7 +956,26 @@ export class PiAcpSession {
     }
   }
 
-  async cancel(): Promise<void> {
+  async cancel(requestOwner?: symbol): Promise<void> {
+    if (requestOwner !== undefined) {
+      const queuedIndex = this.turnQueue.findIndex(
+        entry => (entry.kind === 'prompt' ? entry.requestOwner : entry.command.requestOwner) === requestOwner
+      )
+      if (queuedIndex >= 0) {
+        const queued = this.turnQueue.splice(queuedIndex, 1)
+        this.publishQueueState(this.isBusy(), this.turnQueue.length)
+        await this.flushEmits()
+        this.settleCancelledQueue(queued)
+        return
+      }
+      if (
+        this.activeCommand?.requestOwner !== requestOwner &&
+        (this.pendingTurn?.requestOwner !== requestOwner || this.pendingTurn.completionStarted)
+      ) {
+        return
+      }
+    }
+
     this.drainPendingUiRequests()
     // Cancel current and clear any queued work.
     this.cancelRequested = true
@@ -1444,6 +1472,7 @@ export class PiAcpSession {
 
     const turn: PendingTurn = {
       owner: crypto.randomUUID(),
+      requestOwner: t.requestOwner,
       backgroundActive: false,
       cancellationPending: false,
       piSettled: false,
