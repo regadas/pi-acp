@@ -67,6 +67,15 @@ export type PiRpcTermination = {
   stderrTail: string
 }
 
+const ACP_TASK_INSTRUCTIONS =
+  `You are serving the user through an Agent Client Protocol (ACP) client such as Zed. Ending the foreground turn tells the client that the task is finished: its busy indicator stops and it may send a completion notification.
+For an end-to-end task whose requested result depends on delegated work, keep children asynchronous but keep this foreground turn active through required implementation, reviews, accepted fixes, validation, and final synthesis. Progress messages are not completion. Do not end the turn merely because agents are reviewing or working in the background.
+After safe independent work is exhausted, use an available blocking wait tool for the owning run (for example bg_wait with its run id). Native async completion notifications do not justify ending this foreground turn. Saying "I'll wait" and then ending the response is not waiting. Resolve pending supervisor requests before waiting; after the wait, handle its actual outcome and continue the task. A wait timeout is not completion: wait again while required work remains and no action or decision is pending. Honor cancellation and deadlines. If waiting is unavailable or the runner fails, report the concrete blocker instead of claiming completion or silently detaching.
+Only leave requested work detached when the user explicitly asks for background or fire-and-forget execution. Do not wait for, adopt, or cancel unrelated or previously detached work. Deliver the final result, or a clear blocker requiring user input, before ending an end-to-end task.`
+    // The Windows pi.cmd launcher concatenates argv through cmd.exe, which splits
+    // CR/LF inside a quoted token, so the guidance must stay single-line.
+    .replace(/\r?\n/g, ' ')
+
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const ABORT_TIMEOUT_MS = 10_000
 // Prompt preflight may run extension hooks and overflow compaction before pi
@@ -370,7 +379,15 @@ export class PiRpcProcess {
     const extensionPath = fileURLToPath(
       existsSync(extension) ? extension : new URL('./acp-extension.ts', import.meta.url)
     )
-    const args = ['--mode', 'rpc', '--no-themes', '--extension', extensionPath]
+    const args = [
+      '--mode',
+      'rpc',
+      '--no-themes',
+      '--extension',
+      extensionPath,
+      '--append-system-prompt',
+      ACP_TASK_INSTRUCTIONS
+    ]
     let emptySessionPath: string | undefined
     if (!params.sessionPath && params.sessionDirectory) {
       // Pi opens an explicit empty session file eagerly. Its default new-session
