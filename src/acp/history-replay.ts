@@ -44,9 +44,16 @@ export async function replaySessionHistory({
   // events written after that response cannot be mistaken for entries in
   // its snapshot.
   let customMessageBoundary = session.currentCustomMessageSequence()
-  const entryData = await proc.getEntries(() => {
-    customMessageBoundary = session.currentCustomMessageSequence()
-  })
+  const stopCapture = session.capturePublishedCustomMessagesForLoad()
+  let entryData: unknown
+  let publishedCustomMessages: ReturnType<typeof stopCapture>
+  try {
+    entryData = await proc.getEntries(() => {
+      customMessageBoundary = session.currentCustomMessageSequence()
+    })
+  } finally {
+    publishedCustomMessages = stopCapture()
+  }
   assertActive()
 
   let entries: ReturnType<typeof walkActiveEntryBranch>
@@ -86,9 +93,10 @@ export async function replaySessionHistory({
     }
   }
 
-  session.reconcileLoadedCustomMessages(
+  const skippedCustomMessages = session.reconcileLoadedCustomMessages(
     records.map(record => record.message),
-    customMessageBoundary
+    customMessageBoundary,
+    publishedCustomMessages
   )
 
   const replayedToolCallIds = new Set<string>()
@@ -96,7 +104,13 @@ export async function replaySessionHistory({
   // branch; closed as failed after the walk (see below).
   const openToolCalls = new Map<string, { isBash: boolean }>()
 
-  for (const { entryId, message: m } of records) {
+  for (const [index, { entryId, message: m }] of records.entries()) {
+    const publishedDeliveries = skippedCustomMessages.get(index)
+    if (publishedDeliveries) {
+      await Promise.all(publishedDeliveries)
+      assertActive()
+      continue
+    }
     const role = String(m?.role ?? '')
 
     if (role === 'user') {

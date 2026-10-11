@@ -776,39 +776,62 @@ export class PiAcpAgent implements ACPAgent {
       return { stopReason: 'cancelled' }
     }
 
-    const { message, images } = promptToPiMessage(params.prompt)
-
-    // Built-in ACP slash command handling (headless-friendly subset).
-    // Note: file-based slash commands are expanded inside session.prompt().
-    if (images.length === 0 && message.trimStart().startsWith('/')) {
-      const trimmed = message.trim()
-      const space = trimmed.indexOf(' ')
-      const cmd = space === -1 ? trimmed.slice(1) : trimmed.slice(1, space)
-      const argsString = space === -1 ? '' : trimmed.slice(space + 1)
-      const args = parseCommandArgs(argsString)
-
-      if (BUILTIN_COMMAND_NAMES.has(cmd)) {
-        // Adapter-handled commands share the session FIFO with ordinary
-        // prompts: they wait for an active turn and hold later prompts back.
-        // pi cannot abort an in-flight manual RPC, so a cancel fails closed by
-        // quarantining the channel; the command then settles as cancelled and
-        // the next request restores the session on a fresh pi subprocess.
-        const completed = await session.runCommand(async ctx => ({
-          response: await runBuiltinCommand(session, cmd, args, ctx),
-          usage: await this.usageFor(session)
-        }))
-        if (!completed) return { stopReason: 'cancelled' }
-        return { ...completed.response, usage: completed.usage }
-      }
+    const requestOwner = Symbol()
+    const onAbort = () => {
+      void session
+        .cancel(requestOwner)
+        .then(() => {
+          if (session.isUnavailable()) this.sessions.evictIfCurrent(params.sessionId, session)
+        })
+        .catch(() => {})
     }
+    signal?.addEventListener('abort', onAbort, { once: true })
 
-    // Failures reject with an ACP error (session.PiAcpSession.failTurn);
-    // successful turns resolve with a stable ACP stop reason.
-    let usage
-    const stopReason: StopReason = await session.prompt(message, images, async () => {
-      usage = await this.usageFor(session)
-    })
-    return { stopReason, usage }
+    try {
+      const { message, images } = promptToPiMessage(params.prompt)
+
+      // Built-in ACP slash command handling (headless-friendly subset).
+      // Note: file-based slash commands are expanded inside session.prompt().
+      if (images.length === 0 && message.trimStart().startsWith('/')) {
+        const trimmed = message.trim()
+        const space = trimmed.indexOf(' ')
+        const cmd = space === -1 ? trimmed.slice(1) : trimmed.slice(1, space)
+        const argsString = space === -1 ? '' : trimmed.slice(space + 1)
+        const args = parseCommandArgs(argsString)
+
+        if (BUILTIN_COMMAND_NAMES.has(cmd)) {
+          // Adapter-handled commands share the session FIFO with ordinary
+          // prompts: they wait for an active turn and hold later prompts back.
+          // pi cannot abort an in-flight manual RPC, so a cancel fails closed by
+          // quarantining the channel; the command then settles as cancelled and
+          // the next request restores the session on a fresh pi subprocess.
+          const completed = await session.runCommand(
+            async ctx => ({
+              response: await runBuiltinCommand(session, cmd, args, ctx),
+              usage: await this.usageFor(session)
+            }),
+            requestOwner
+          )
+          if (!completed) return { stopReason: 'cancelled' }
+          return { ...completed.response, usage: completed.usage }
+        }
+      }
+
+      // Failures reject with an ACP error (session.PiAcpSession.failTurn);
+      // successful turns resolve with a stable ACP stop reason.
+      let usage
+      const stopReason: StopReason = await session.prompt(
+        message,
+        images,
+        async () => {
+          usage = await this.usageFor(session)
+        },
+        requestOwner
+      )
+      return { stopReason, usage }
+    } finally {
+      signal?.removeEventListener('abort', onAbort)
+    }
   }
 
   /**
@@ -1208,49 +1231,18 @@ export class PiAcpAgent implements ACPAgent {
   }
 }
 
-/**
- * Run a `session/prompt` while honoring the request's AbortSignal. ACP
- * clients normally stop a turn with the `session/cancel` notification, but
- * the signal also fires when the client sends the generic `$/cancel_request`
- * for this prompt (or the connection closes). Route that into the same
- * per-session cancellation path so the prompt still settles with the
- * `cancelled` stop reason after final updates flush, instead of running to
- * completion.
- *
- * The listener is scoped to this call: once the prompt settles it is removed,
- * so a later teardown-time abort of the signal cannot cancel a subsequent
- * turn.
- */
+/** Normalize request cancellation after its owned prompt work and updates settle. */
 export async function runPromptWithCancellation(
-  agent: Pick<PiAcpAgent, 'prompt' | 'cancel'>,
+  agent: Pick<PiAcpAgent, 'prompt'>,
   params: PromptRequest,
   signal: AbortSignal
 ): Promise<PromptResponse> {
-  let cancellationStarted = false
-  const onAbort = () => {
-    if (cancellationStarted) return
-    cancellationStarted = true
-
-    // Fire-and-forget: nothing awaits this listener, so swallow rejections
-    // rather than surfacing them as unhandled.
-    void agent.cancel({ sessionId: params.sessionId }).catch(() => {})
-  }
-
-  // Pass the signal through prompt startup so an abort cannot cross an async
-  // restoration boundary and reach pi. The listener still routes mid-turn
-  // aborts through the normal per-session cancellation path.
-  const prompt = agent.prompt(params, signal)
-  signal.addEventListener('abort', onAbort, { once: true })
-  if (signal.aborted) onAbort()
-
   try {
-    const response = await prompt
+    const response = await agent.prompt(params, signal)
     return signal.aborted ? { ...response, stopReason: 'cancelled' } : response
   } catch (error) {
     if (signal.aborted) return { stopReason: 'cancelled' }
     throw error
-  } finally {
-    signal.removeEventListener('abort', onAbort)
   }
 }
 

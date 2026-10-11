@@ -80,15 +80,26 @@ async function readHeaderLine(path: string): Promise<string | null> {
     if (length >= HEADER_LIMIT) return null
     return (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, length)).toString('utf8')
   } catch (error) {
-    rethrowResourceExhaustion(error)
-    return null
+    if (['ENOENT', 'ENOTDIR'].includes((error as NodeJS.ErrnoException).code ?? '')) return null
+    throw error
   } finally {
     await handle?.close().catch(() => {})
   }
 }
 
-async function validatedHeader(path: string, requestedId?: string): Promise<{ sessionId: string; cwd: string } | null> {
-  const head = await readHeaderLine(path)
+async function validatedHeader(
+  path: string,
+  requestedId?: string,
+  strictRead = false
+): Promise<{ sessionId: string; cwd: string } | null> {
+  let head: string | null
+  try {
+    head = await readHeaderLine(path)
+  } catch (error) {
+    rethrowResourceExhaustion(error)
+    if (strictRead) throw error
+    return null
+  }
   if (!head) return null
   try {
     const value = JSON.parse(head.trim()) as Record<string, unknown>
@@ -216,9 +227,10 @@ function isNewer(candidate: SessionRecord, previous: SessionRecord): boolean {
 async function project(
   path: string,
   requestedId?: string,
-  knownHeader?: { sessionId: string; cwd: string }
+  knownHeader?: { sessionId: string; cwd: string },
+  strictRead = false
 ): Promise<SessionRecord | null> {
-  const header = knownHeader ?? (await validatedHeader(path, requestedId))
+  const header = knownHeader ?? (await validatedHeader(path, requestedId, strictRead))
   if (!header) return null
   const metadata = await scanMetadata(path)
   let mtime: Date | null = null
@@ -294,7 +306,7 @@ export class SessionRepository {
     return this.store.get(sessionId)
   }
 
-  private async matchingRecords(sessionId: string, cwd?: string): Promise<SessionRecord[]> {
+  private async matchingRecords(sessionId: string, cwd?: string, strictRead = false): Promise<SessionRecord[]> {
     const stored = this.store.get(sessionId)
     const paths = new Set<string>()
     const roots = new Set<string>()
@@ -309,7 +321,7 @@ export class SessionRepository {
     const records: SessionRecord[] = []
     for (let offset = 0; offset < files.length; offset += LOOKUP_CONCURRENCY) {
       const candidates = await Promise.all(
-        files.slice(offset, offset + LOOKUP_CONCURRENCY).map(path => project(path, sessionId))
+        files.slice(offset, offset + LOOKUP_CONCURRENCY).map(path => project(path, sessionId, undefined, strictRead))
       )
       for (const candidate of candidates) if (candidate) records.push(candidate)
     }
@@ -370,11 +382,11 @@ export class SessionRepository {
     }
     const inScope = (rawCwd: string): boolean => !cwd || comparisonCwd(rawCwd) === comparisonCwd(cwd)
     const paths = new Set<string>()
-    const mappedPaths = new Map<string, string>()
+    const mappedSessions = new Map<string, StoredSession>()
     const roots = new Set([discoveryRoot(cwd ?? process.cwd())])
     for (const stored of await this.store.list()) {
       paths.add(stored.sessionFile)
-      mappedPaths.set(stored.sessionId, stored.sessionFile)
+      mappedSessions.set(stored.sessionId, stored)
       addStoredDiscoveryRoot(roots, stored, this.env, this.agentDir, discoveryRoot(stored.cwd))
     }
     for (const root of roots) {
@@ -392,7 +404,8 @@ export class SessionRepository {
     }
     const byId = new Map<string, SessionRecord>()
     const attemptedMappedPaths = new Set<string>()
-    for (const [sessionId, path] of mappedPaths) {
+    for (const [sessionId, stored] of mappedSessions) {
+      const path = stored.sessionFile
       const header = headers.get(path)
       if (!header || header.sessionId !== sessionId || !scopedIds.has(sessionId)) continue
       attemptedMappedPaths.add(path)
@@ -402,9 +415,24 @@ export class SessionRepository {
     for (const [path, header] of headers) {
       if (!scopedIds.has(header.sessionId) || attemptedMappedPaths.has(path)) continue
       const previous = byId.get(header.sessionId)
-      if (previous && previous.sessionFile === mappedPaths.get(header.sessionId)) continue
+      if (previous && previous.sessionFile === mappedSessions.get(header.sessionId)?.sessionFile) continue
       const record = await project(path, undefined, header)
       if (record && (!previous || isNewer(record, previous))) byId.set(record.sessionId, record)
+    }
+    for (const [sessionId, record] of byId) {
+      let selected = record
+      let mapped = mappedSessions.get(sessionId)
+      let stored = this.store.get(sessionId)
+      // Discovery can yield while another operation establishes a canonical owner.
+      while (stored && (stored.sessionFile !== mapped?.sessionFile || stored.cwd !== mapped?.cwd)) {
+        mapped = stored
+        selected = (await project(stored.sessionFile, sessionId)) ?? selected
+        stored = this.store.get(sessionId)
+      }
+      byId.set(sessionId, selected)
+      if (inScope(selected.cwd) && (stored?.sessionFile !== selected.sessionFile || stored?.cwd !== selected.cwd)) {
+        this.store.upsert(selected)
+      }
     }
     return [...byId.values()]
       .filter(record => inScope(record.cwd))
@@ -412,7 +440,7 @@ export class SessionRepository {
   }
 
   async delete(sessionId: string): Promise<string | null> {
-    const records = await this.matchingRecords(sessionId)
+    const records = await this.matchingRecords(sessionId, undefined, true)
     let newest: SessionRecord | null = null
     for (const record of records) {
       if (!newest || isNewer(record, newest)) newest = record

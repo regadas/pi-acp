@@ -49,6 +49,7 @@ export type StopReason = 'end_turn' | 'cancelled' | 'max_tokens'
 
 type PendingTurn = {
   owner: string
+  requestOwner?: symbol
   backgroundActive: boolean
   cancellationPending: boolean
   piSettled: boolean
@@ -71,6 +72,7 @@ type PendingTurn = {
 
 type QueuedPrompt = {
   kind: 'prompt'
+  requestOwner?: symbol
   message: string
   images: unknown[]
   resolve: (reason: StopReason) => void
@@ -81,6 +83,7 @@ type QueuedPrompt = {
 /** The adapter-handled slash command currently holding the session FIFO. */
 type ActiveCommand = {
   cancelled: boolean
+  requestOwner?: symbol
   /**
    * Absolute deadline for waiting out autonomous pi work before this command
    * may talk to pi. Set at its first park and preserved across re-parks, so
@@ -139,6 +142,10 @@ type PendingCustomMessage = {
   blocks: TranslatedUserBlock[]
   identity: string
   sequence: number
+}
+
+type PublishedCustomMessage = PendingCustomMessage & {
+  deliveries: Promise<void>[]
 }
 
 type PermissionResponse = Awaited<ReturnType<AcpClient['requestPermission']>>
@@ -207,6 +214,7 @@ export class PiAcpSession {
   private activeAdapterPromptTurns = 0
   private customMessageSequence = 0
   private readonly pendingCustomMessages: PendingCustomMessage[] = []
+  private publishedCustomMessagesDuringLoad: PublishedCustomMessage[] | null = null
   private publishedTitle: string | null | undefined
   private sessionInfoSyncTail: Promise<void> = Promise.resolve()
   private publishedConfigFingerprint: string | undefined
@@ -572,9 +580,31 @@ export class PiAcpSession {
     return this.customMessageSequence
   }
 
-  reconcileLoadedCustomMessages(messages: unknown[], throughSequence: number): void {
+  capturePublishedCustomMessagesForLoad(): () => PublishedCustomMessage[] {
+    const published: PublishedCustomMessage[] = []
+    this.publishedCustomMessagesDuringLoad = published
+    return () => {
+      this.publishedCustomMessagesDuringLoad = null
+      return published
+    }
+  }
+
+  reconcileLoadedCustomMessages(
+    messages: unknown[],
+    throughSequence: number,
+    publishedMessages: PublishedCustomMessage[]
+  ): Map<number, Promise<void>[]> {
+    const publishedByIdentity = new Map<string, PublishedCustomMessage[]>()
+    for (const message of publishedMessages) {
+      if (message.sequence > throughSequence) continue
+      const matching = publishedByIdentity.get(message.identity)
+      if (matching) matching.push(message)
+      else publishedByIdentity.set(message.identity, [message])
+    }
+
+    const skippedReplayMessages = new Map<number, Promise<void>[]>()
     const replayedByIdentity = new Map<string, number>()
-    for (const message of messages) {
+    for (const [index, message] of messages.entries()) {
       const record = message as { role?: unknown; display?: unknown; content?: unknown } | null | undefined
       if (record?.role !== 'custom' || record.display !== true) continue
 
@@ -582,7 +612,12 @@ export class PiAcpSession {
       if (!blocks.length) continue
 
       const identity = customMessageIdentity(message, blocks)
-      replayedByIdentity.set(identity, (replayedByIdentity.get(identity) ?? 0) + 1)
+      const published = publishedByIdentity.get(identity)?.shift()
+      if (published) {
+        skippedReplayMessages.set(index, published.deliveries)
+      } else {
+        replayedByIdentity.set(identity, (replayedByIdentity.get(identity) ?? 0) + 1)
+      }
     }
 
     const reconciledSequences = new Set<number>()
@@ -607,32 +642,39 @@ export class PiAcpSession {
 
     const retained = this.pendingCustomMessages.filter(message => !reconciledSequences.has(message.sequence))
     this.pendingCustomMessages.splice(0, this.pendingCustomMessages.length, ...retained)
+    return skippedReplayMessages
   }
 
   private sendPendingCustomMessages(): void {
     const messages = this.pendingCustomMessages.splice(0)
     for (const message of messages) {
-      this.emitCustomMessageBlocks(message.blocks)
+      const deliveries = this.emitCustomMessageBlocks(message.blocks)
+      this.publishedCustomMessagesDuringLoad?.push({ ...message, deliveries })
     }
   }
 
-  private emitCustomMessageBlocks(blocks: TranslatedUserBlock[]): void {
-    for (const block of blocks) {
-      this.emit({
+  private emitCustomMessageBlocks(blocks: TranslatedUserBlock[]): Promise<void>[] {
+    return blocks.map(block =>
+      this.enqueueUpdate({
         sessionUpdate: 'agent_message_chunk',
         content: (block.kind === 'text'
           ? { type: 'text', text: block.text }
           : { type: 'image', data: block.data, mimeType: block.mimeType }) satisfies ContentBlock
       })
-    }
+    )
   }
 
-  async prompt(message: string, images: unknown[] = [], beforeRelease?: () => Promise<void>): Promise<StopReason> {
+  async prompt(
+    message: string,
+    images: unknown[] = [],
+    beforeRelease?: () => Promise<void>,
+    requestOwner?: symbol
+  ): Promise<StopReason> {
     // Once shutdown starts, no new work may be admitted to this subprocess.
     if (this.isClosing()) return 'cancelled'
 
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
-      const queued: QueuedPrompt = { kind: 'prompt', message, images, resolve, reject, beforeRelease }
+      const queued: QueuedPrompt = { kind: 'prompt', message, images, resolve, reject, beforeRelease, requestOwner }
 
       // If a turn or adapter command is running (or work is already waiting
       // behind it), enqueue so every prompt path stays FIFO.
@@ -662,7 +704,7 @@ export class PiAcpSession {
    * while it runs, and `cancel()` settles it promptly. Resolves `null` when
    * the command was cancelled before or during execution.
    */
-  async runCommand<T>(run: (ctx: CommandContext) => Promise<T>): Promise<T | null> {
+  async runCommand<T>(run: (ctx: CommandContext) => Promise<T>, requestOwner?: symbol): Promise<T | null> {
     // Defense in depth for the invariant `startNextQueuedWork` enforces for
     // queued work: no adapter command may run local-only work and report
     // success for a session whose child is gone or whose channel was
@@ -674,7 +716,7 @@ export class PiAcpSession {
     if (entryFailure) throw entryFailure
     if (this.procTermination || this.isClosing()) return null
 
-    const command: ActiveCommand = { cancelled: false }
+    const command: ActiveCommand = { cancelled: false, requestOwner }
     if (!(await this.admitCommandForExecution(command))) {
       // The admission was released rather than rejected, but the channel may
       // still have died under it: reject instead of reporting a benign
@@ -730,6 +772,7 @@ export class PiAcpSession {
       if (command.cancelled) return null
       throw error
     } finally {
+      command.requestOwner = undefined
       await finishAdapterPromptTurn()
       this.releaseCommandSlot()
     }
@@ -913,7 +956,26 @@ export class PiAcpSession {
     }
   }
 
-  async cancel(): Promise<void> {
+  async cancel(requestOwner?: symbol): Promise<void> {
+    if (requestOwner !== undefined) {
+      const queuedIndex = this.turnQueue.findIndex(
+        entry => (entry.kind === 'prompt' ? entry.requestOwner : entry.command.requestOwner) === requestOwner
+      )
+      if (queuedIndex >= 0) {
+        const queued = this.turnQueue.splice(queuedIndex, 1)
+        this.publishQueueState(this.isBusy(), this.turnQueue.length)
+        await this.flushEmits()
+        this.settleCancelledQueue(queued)
+        return
+      }
+      if (
+        this.activeCommand?.requestOwner !== requestOwner &&
+        (this.pendingTurn?.requestOwner !== requestOwner || this.pendingTurn.completionStarted)
+      ) {
+        return
+      }
+    }
+
     this.drainPendingUiRequests()
     // Cancel current and clear any queued work.
     this.cancelRequested = true
@@ -1410,6 +1472,7 @@ export class PiAcpSession {
 
     const turn: PendingTurn = {
       owner: crypto.randomUUID(),
+      requestOwner: t.requestOwner,
       backgroundActive: false,
       cancellationPending: false,
       piSettled: false,
@@ -2099,7 +2162,8 @@ export class PiAcpSession {
         const activeTurn = this.pendingTurn
 
         if (this.piBusyOutOfBand || this.turnOwnsPiRun(activeTurn) || this.activeAdapterPromptTurns > 0) {
-          this.emitCustomMessageBlocks(blocks)
+          const deliveries = this.emitCustomMessageBlocks(blocks)
+          this.publishedCustomMessagesDuringLoad?.push({ ...pendingMessage, deliveries })
         } else {
           this.pendingCustomMessages.push(pendingMessage)
         }

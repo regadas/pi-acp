@@ -74,46 +74,45 @@ test('PiAcpAgent.prompt: cancellation preserves returned usage and metadata', as
   assert.equal(response.stopReason, 'end_turn')
 })
 
-test('runPromptWithCancellation: request abort routes into agent.cancel', async () => {
-  const cancelled: string[] = []
-  let resolvePrompt!: (r: { stopReason: 'cancelled' }) => void
-
+test('runPromptWithCancellation: delegates the request signal without calling session-wide cancel', async () => {
+  const controller = new AbortController()
+  let cancelCount = 0
   const agent = {
-    prompt: () => new Promise<{ stopReason: 'cancelled' }>(res => (resolvePrompt = res)),
-    cancel: async (params: { sessionId: string }) => {
-      cancelled.push(params.sessionId)
-      resolvePrompt({ stopReason: 'cancelled' })
+    prompt: (_params: PromptRequest, signal?: AbortSignal) => {
+      assert.equal(signal, controller.signal)
+      return new Promise<PromptResponse>((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('owned work cancelled')), { once: true })
+      })
+    },
+    cancel: async () => {
+      cancelCount += 1
     }
   }
-
-  const controller = new AbortController()
-  const pending = runPromptWithCancellation(agent as unknown as PiAcpAgent, promptParams('s1'), controller.signal)
-
+  const pending = runPromptWithCancellation(agent, promptParams('s1'), controller.signal)
   controller.abort()
 
-  assert.equal((await pending).stopReason, 'cancelled')
-  assert.deepEqual(cancelled, ['s1'])
+  assert.deepEqual(await pending, { stopReason: 'cancelled' })
+  assert.equal(cancelCount, 0)
 })
 
-test('runPromptWithCancellation: an already-aborted signal cancels immediately', async () => {
-  const cancelled: string[] = []
-  let resolvePrompt!: (r: { stopReason: 'cancelled' }) => void
-
-  const agent = {
-    prompt: () => new Promise<{ stopReason: 'cancelled' }>(res => (resolvePrompt = res)),
-    cancel: async (params: { sessionId: string }) => {
-      cancelled.push(params.sessionId)
-      resolvePrompt({ stopReason: 'cancelled' })
-    }
-  }
-
+test('runPromptWithCancellation: an already-aborted signal reaches prompt without session-wide cancel', async () => {
   const controller = new AbortController()
   controller.abort()
-
-  const res = await runPromptWithCancellation(agent as unknown as PiAcpAgent, promptParams('s1'), controller.signal)
+  let cancelCount = 0
+  const agent = {
+    prompt: async (_params: PromptRequest, signal?: AbortSignal): Promise<PromptResponse> => {
+      assert.equal(signal, controller.signal)
+      assert.equal(signal?.aborted, true)
+      return { stopReason: 'cancelled' }
+    },
+    cancel: async () => {
+      cancelCount += 1
+    }
+  }
+  const res = await runPromptWithCancellation(agent, promptParams('s1'), controller.signal)
 
   assert.equal(res.stopReason, 'cancelled')
-  assert.deepEqual(cancelled, ['s1'])
+  assert.equal(cancelCount, 0)
 })
 
 test('runPromptWithCancellation: request abort remains sticky across deferred restore', async () => {
@@ -145,25 +144,31 @@ test('PiAcpAgent: session/cancel remains sticky across deferred restore', async 
   assert.equal(proc.prompts.length, 0, 'cancelled startup never sent work to pi')
 })
 
-test('runPromptWithCancellation: abort after settlement does not cancel later turns', async () => {
-  let cancelCount = 0
-
-  const agent = {
-    prompt: async () => ({ stopReason: 'end_turn' as const }),
-    cancel: async () => {
-      cancelCount += 1
-    }
-  }
-
+test('runPromptWithCancellation: abort after settlement does not cancel later turns', async t => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 's1',
+    cwd: process.cwd(),
+    proc: proc as unknown as PiAcpSession['proc'],
+    conn: asAgentConn(conn)
+  })
+  t.after(() => session.dispose())
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
   const controller = new AbortController()
-  const res = await runPromptWithCancellation(agent as unknown as PiAcpAgent, promptParams('s1'), controller.signal)
-  assert.equal(res.stopReason, 'end_turn')
+  const first = runPromptWithCancellation(agent, promptParams('s1'), controller.signal)
+  await new Promise(resolve => setImmediate(resolve))
+  proc.emit({ type: 'agent_settled' })
+  assert.equal((await first).stopReason, 'end_turn')
 
-  // The listener is removed once the prompt settles; a teardown-time abort of
-  // the same signal must not cancel anything.
+  const second = agent.prompt(promptParams('s1'))
+  await new Promise(resolve => setImmediate(resolve))
   controller.abort()
-  await new Promise(resolve => setTimeout(resolve, 0))
-  assert.equal(cancelCount, 0)
+  assert.equal(proc.abortCount, 0)
+  assert.equal(proc.disposeCount, 0)
+  proc.emit({ type: 'agent_settled' })
+  assert.equal((await second).stopReason, 'end_turn')
 })
 
 test('PiAcpAgent: abort failure evicts the unavailable session after cancelling its prompt', async () => {
@@ -295,7 +300,7 @@ test('runPromptWithCancellation: generic cancellation settles the session prompt
     return res
   })
 
-  // Generic $/cancel_request → request signal abort → session cancellation.
+  // Generic $/cancel_request aborts this active owner and clears its queue.
   controller.abort()
   await new Promise(resolve => setTimeout(resolve, 0))
   assert.equal(proc.abortCount, 1)
@@ -327,6 +332,47 @@ test('runPromptWithCancellation: generic cancellation settles the session prompt
   assert.ok(updatesAtResolve > deltaIndex, 'updates flushed before the prompt response settled')
   const usageIndex = delivered.findIndex(u => u.sessionUpdate === 'usage_update')
   assert.ok(usageIndex > deltaIndex && usageIndex < updatesAtResolve, 'usage flushes before settlement')
+})
+
+test('runPromptWithCancellation: abort while a completed turn flushes usage preserves the next request', async t => {
+  const conn = new FakeAgentSideConnection()
+  const usageStarted = deferred<void>()
+  const usageResult = deferred<unknown>()
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: () => {
+      usageStarted.resolve()
+      return usageResult.promise
+    }
+  })
+  const session = new PiAcpSession({
+    sessionId: 'completing',
+    cwd: process.cwd(),
+    proc: proc as unknown as PiAcpSession['proc'],
+    conn: asAgentConn(conn)
+  })
+  t.after(() => session.dispose())
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
+  ;(agent as unknown as { sessions: { maybeGet: () => PiAcpSession } }).sessions = { maybeGet: () => session }
+  const controller = new AbortController()
+  const first = runPromptWithCancellation(agent, promptParams('completing'), controller.signal)
+  await new Promise(resolve => setImmediate(resolve))
+  proc.emit({ type: 'agent_settled' })
+  await usageStarted.promise
+  const second = agent.prompt({ sessionId: 'completing', prompt: [{ type: 'text', text: 'next' }] })
+  await new Promise(resolve => setImmediate(resolve))
+
+  controller.abort()
+  usageResult.resolve({ tokens: { input: 1, output: 2, total: 3 } })
+  assert.equal((await first).stopReason, 'cancelled')
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(
+    proc.prompts.map(item => item.message),
+    ['hello', 'next']
+  )
+  assert.equal(proc.abortCount, 0)
+  proc.emit({ type: 'agent_settled' })
+  assert.equal((await second).stopReason, 'end_turn')
 })
 
 test('PiAcpAgent.prompt: cancellation before held dispatch never captures unrelated usage', async () => {

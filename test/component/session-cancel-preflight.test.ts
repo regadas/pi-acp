@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { PiAcpAgent } from '../../src/acp/agent.js'
+import { PiAcpAgent, runPromptWithCancellation } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -203,28 +203,74 @@ test('PiAcpSession: prompts queued behind a preflight cancellation settle as can
   assert.equal(proc.prompts.length, 1)
 })
 
-test('PiAcpAgent: a preflight cancellation evicts the session so the next request restores it', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-  const session = makeSession(conn, proc)
-  const pi = withDelayedPreflight(proc)
+for (const cancellation of ['session', 'request']) {
+  test(`PiAcpAgent: ${cancellation} preflight cancellation evicts the session so the next request restores it`, async () => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+    const pi = withDelayedPreflight(proc)
 
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  const sessions = new FakeSessions(session)
-  ;(agent as any).sessions = sessions
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    const sessions = new FakeSessions(session)
+    ;(agent as unknown as { sessions: FakeSessions }).sessions = sessions
+    const controller = new AbortController()
+    const prompt = runPromptWithCancellation(
+      agent,
+      { sessionId: 's1', prompt: [{ type: 'text', text: 'hello' }] },
+      controller.signal
+    )
+    await pi.written
 
-  const prompt = agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: 'hello' }] } as any)
-  await pi.written
+    if (cancellation === 'request') controller.abort()
+    else await agent.cancel({ sessionId: 's1' })
 
-  await agent.cancel({ sessionId: 's1' } as any)
+    assert.equal((await prompt).stopReason, 'cancelled')
+    assert.deepEqual(sessions.evicted, ['s1'])
+    assert.equal(proc.disposeCount, 1)
+    assert.equal(proc.abortCount, 0)
 
-  assert.equal((await prompt).stopReason, 'cancelled')
-  assert.deepEqual(sessions.evicted, ['s1'])
+    pi.finishPreflight()
+    await tick()
+    assert.equal(proc.prompts.length, 1)
+  })
+}
 
-  pi.finishPreflight()
-  await tick()
-  assert.equal(proc.prompts.length, 1)
-})
+for (const cancellation of ['queued', 'already aborted']) {
+  test(`runPromptWithCancellation: ${cancellation} request leaves another prompt's preflight intact`, async t => {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess()
+    const session = makeSession(conn, proc)
+    t.after(() => session.dispose())
+    const pi = withDelayedPreflight(proc)
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    const sessions = new FakeSessions(session)
+    ;(agent as unknown as { sessions: FakeSessions }).sessions = sessions
+
+    const first = agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: 'first' }] })
+    await pi.written
+    const controller = new AbortController()
+    if (cancellation === 'already aborted') controller.abort()
+    const second = runPromptWithCancellation(
+      agent,
+      { sessionId: 's1', prompt: [{ type: 'text', text: 'never' }] },
+      controller.signal
+    )
+    await tick()
+    controller.abort()
+
+    assert.equal((await second).stopReason, 'cancelled')
+    assert.equal(proc.disposeCount, 0, 'another request cannot quarantine the active preflight')
+    assert.equal(proc.abortCount, 0)
+    assert.deepEqual(sessions.evicted, [])
+    pi.finishPreflight()
+    assert.equal((await first).stopReason, 'end_turn')
+    assert.deepEqual(
+      proc.prompts.map(item => item.message),
+      ['first']
+    )
+    assert.ok(conn.updates.some(item => item.update.sessionUpdate === 'agent_message_chunk'))
+  })
+}
 
 test('PiAcpSession: cancelling an accepted prompt still aborts its run instead of quarantining', async () => {
   const conn = new FakeAgentSideConnection()
