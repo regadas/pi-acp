@@ -24,17 +24,17 @@ through its own event dispatch unchanged.
 
 One JSON object per file:
 
-| Field                                | Meaning                                                                                       |
-| ------------------------------------ | --------------------------------------------------------------------------------------------- |
-| `formatVersion`                      | Must be `1`.                                                                                  |
-| `name`                               | Test case name (matches the file name by convention).                                         |
-| `description`                        | What behavior the case locks.                                                                 |
-| `session.sessionId`                  | Session id for the session under test. Always `"s1"` in v1.                                   |
-| `session.cwd`                        | Session working directory. Always `"/fixture/cwd"` in v1; it must never be touched on disk.   |
-| `session.supportsTerminalOutputMeta` | Optional, default `false`. Enables the negotiated Zed `_meta.terminal_output` bash rendering. |
-| `steps`                              | Ordered script (see below).                                                                   |
-| `expected.pi`                        | Ordered pi-bound effects.                                                                     |
-| `expected.acp`                       | Ordered client-bound effects.                                                                 |
+| Field                                | Meaning                                                                                             |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `formatVersion`                      | Must be `1`.                                                                                        |
+| `name`                               | Test case name (matches the file name by convention).                                               |
+| `description`                        | What behavior the case locks.                                                                       |
+| `session.sessionId`                  | Session id for the session under test. Always `"s1"` in v1.                                         |
+| `session.cwd`                        | Session working directory. Always `"/fixture/cwd"` in v1; it must never be touched on disk.         |
+| `session.supportsTerminalOutputMeta` | Optional, default `false`. Enables the negotiated `_meta.terminal_output` bash rendering extension. |
+| `steps`                              | Ordered script (see below).                                                                         |
+| `expected.pi`                        | Ordered pi-bound effects.                                                                           |
+| `expected.acp`                       | Ordered client-bound effects.                                                                       |
 
 ### Steps
 

@@ -251,7 +251,7 @@ test('app wiring: advertised session lifecycle methods are registered and routed
     (err: unknown) => (err as RequestError).code === -32002
   )
 
-  // The legacy Zed model selector method is gone; model selection goes
+  // The legacy model selector method is gone; model selection goes
   // through the standard session/set_config_option path.
   await assert.rejects(
     () => conn.agent.request('session/set_model', { sessionId: 'unknown', modelId: 'test/alpha' }),

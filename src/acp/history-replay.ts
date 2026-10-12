@@ -349,9 +349,8 @@ export async function replaySessionHistory({
     }
   }
 
-  // Latest Zed renders a replayed tool call with no terminal status as a
-  // spinner forever. A durable history that ends mid-call has no result to
-  // replay, so close such calls as failed with a standard explanation.
+  // A durable history that ends mid-call has no result to replay; close
+  // such calls as failed so clients do not leave them indefinitely pending.
   // Live sessions are unaffected: this runs only on load replay.
   for (const [toolCallId, metadata] of openToolCalls) {
     const explanation: ToolCallContent = {

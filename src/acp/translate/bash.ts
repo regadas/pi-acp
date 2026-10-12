@@ -104,7 +104,7 @@ function fencedConsoleContent(text: string): ToolCallContent {
 
 /**
  * Standard ACP content for bash output when the client did not negotiate the
- * Zed `_meta.terminal_output` convention. One ordered pass over the result's
+ * `_meta.terminal_output` extension. One ordered pass over the result's
  * content blocks: text is fenced in place and images stay standard image
  * content, so a `[image, text, image]` result keeps its source order. Text is
  * preserved verbatim inside a fence longer than every backtick run it contains.
@@ -148,8 +148,8 @@ export function bashOrderedContent(result: unknown): ToolCallContent[] {
 }
 
 export function bashTerminalInfoMeta(toolCallId: string, cwd: string) {
-  // Zed renders ACP `execute` tools as display-only terminals when paired with
-  // terminal content plus terminal metadata. See ACP execute tool schema:
+  // Negotiating clients can render ACP `execute` tools as display-only
+  // terminals using terminal content plus metadata. See ACP execute tool schema:
   // https://agentclientprotocol.com/protocol/schema#param-execute
   return { terminal_info: { terminal_id: toolCallId, cwd } }
 }

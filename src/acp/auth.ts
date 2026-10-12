@@ -6,8 +6,8 @@ export const PI_SETUP_METHOD_ID = 'pi_terminal_login'
  * Terminal login methods for the negotiating client:
  *  - The stable v1 terminal AuthMethod (`type`/`args`/`env`) is advertised
  *    only when the client declared `clientCapabilities.auth.terminal`.
- *  - Zed additionally reads `_meta["terminal-auth"]` (launch spec) to render
- *    its "Authenticate" banner; included only when the client also declared
+ *  - The optional `_meta["terminal-auth"]` launch spec is included only when
+ *    the client also declared
  *    the matching `clientCapabilities._meta["terminal-auth"]` flag.
  * A client that does not declare the standard terminal auth capability gets
  * no auth methods: pi-acp has no agent-managed auth flow, so advertising one
@@ -39,8 +39,7 @@ export function getAuthMethods(opts?: {
   }
 
   if (supportsTerminalAuthMeta) {
-    // Best-effort launch spec for Zed's terminal-auth banner.
-    // Zed expects a full command+args (see mistral-vibe implementation).
+    // The negotiated launch spec includes the full command and arguments.
     const launch = terminalAuthLaunchSpec()
 
     method._meta = {
@@ -57,7 +56,7 @@ export function getAuthMethods(opts?: {
 
 function terminalAuthLaunchSpec(): { command: string; args: string[] } {
   // If we were launched as `node /path/to/dist/index.js`, reuse that.
-  // This is the most reliable in local dev and custom Zed configurations.
+  // This also supports local development and custom client configurations.
   const argv0 = process.argv[0] || 'node'
   const argv1 = process.argv[1]
   if (argv1 && argv0) {

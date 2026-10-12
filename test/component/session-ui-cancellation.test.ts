@@ -307,12 +307,12 @@ for (const scenario of [
   { method: 'confirm', optionId: null, status: 'cancelled', reply: { cancelled: true } },
   { method: 'confirm', optionId: 'error', status: 'waiting', reply: { cancelled: true } }
 ]) {
-  test(`synthetic ${scenario.method} card completes after ${scenario.optionId ?? 'cancel'} in the Zed permission model`, async () => {
+  test(`synthetic ${scenario.method} card completes after ${scenario.optionId ?? 'cancel'} when client permission choices leave the card pending`, async () => {
     const conn = new FakeAgentSideConnection()
     const states: string[] = []
     let cardId: string | undefined
-    // Zed acp_thread.rs: request_tool_call_authorization upserts the card;
-    // authorize_tool_call leaves allowed/action choices in progress, not completed.
+    // A client may upsert the permission card and leave action choices in
+    // progress; the adapter must publish its own final status.
     conn.requestPermission = async raw => {
       const request = raw as RequestPermissionRequest
       cardId = request.toolCall.toolCallId

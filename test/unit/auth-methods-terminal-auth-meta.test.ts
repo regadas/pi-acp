@@ -4,7 +4,7 @@ import { getAuthMethods, PI_SETUP_METHOD_ID } from '../../src/acp/auth.js'
 
 test('getAuthMethods: advertises the terminal method only with the standard auth.terminal capability', () => {
   assert.deepEqual(getAuthMethods({ supportsTerminalAuth: false, supportsTerminalAuthMeta: false }), [])
-  // Zed's meta flag alone must not resurrect a method the standard capability
+  // The meta flag alone must not resurrect a method the standard capability
   // did not negotiate.
   assert.deepEqual(getAuthMethods({ supportsTerminalAuth: false, supportsTerminalAuthMeta: true }), [])
 
@@ -17,7 +17,7 @@ test('getAuthMethods: advertises the terminal method only with the standard auth
   assert.ok(!m._meta || !m._meta['terminal-auth'])
 })
 
-test('getAuthMethods: includes Zed terminal-auth metadata only when its meta flag is negotiated', () => {
+test('getAuthMethods: includes terminal-auth metadata only when its meta flag is negotiated', () => {
   const methods = getAuthMethods({ supportsTerminalAuth: true, supportsTerminalAuthMeta: true })
   assert.equal(methods.length, 1)
   const m: any = methods[0]

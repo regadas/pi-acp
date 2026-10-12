@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process'
 import { withSmokeAgent } from './smoke-client.mjs'
 
 // Actual built ACP stdio + installed Pi; only the provider and extension work are deterministic.
-const root = await mkdtemp(join(tmpdir(), 'pi-acp-zed-eval-'))
+const root = await mkdtemp(join(tmpdir(), 'pi-acp-client-eval-'))
 const pi = process.env.PI_ACP_EVAL_PI ?? execFileSync('which', ['pi'], { encoding: 'utf8' }).trim()
 const tracePath = join(root, 'pi.jsonl')
 const wrapper = join(root, 'pi-wrapper.mjs')
@@ -16,7 +16,7 @@ await mkdir(join(root, '.pi', 'extensions'), { recursive: true })
 await mkdir(join(root, 'agent'), { recursive: true })
 await writeFile(
   join(root, '.pi', 'extensions', 'eval.ts'),
-  await readFile(new URL('./fixtures/zed-harness-extension.ts', import.meta.url))
+  await readFile(new URL('./fixtures/acp-harness-extension.ts', import.meta.url))
 )
 await writeFile(
   join(root, 'agent', 'settings.json'),
@@ -27,7 +27,7 @@ await writeFile(
   })
 )
 // A user resource discovered natively from the isolated agent directory (no CLI injection).
-await writeFile(join(root, 'agent', 'APPEND_SYSTEM.md'), 'ZED_HARNESS_APPEND_SYSTEM_SENTINEL')
+await writeFile(join(root, 'agent', 'APPEND_SYSTEM.md'), 'ACP_HARNESS_APPEND_SYSTEM_SENTINEL')
 await writeFile(
   wrapper,
   `#!/usr/bin/env node
@@ -99,7 +99,7 @@ try {
       acpMessages = client.messages
       await client.request('initialize', {
         protocolVersion: 1,
-        clientInfo: { name: 'zed-eval', version: '1' },
+        clientInfo: { name: 'acp-client-eval', version: '1' },
         clientCapabilities: { elicitation: { form: {} }, _meta: { terminal_output: true } }
       })
       const { sessionId } = await client.request('session/new', { cwd: root, mcpServers: [] })
@@ -581,4 +581,4 @@ assert.ok(
   checks.every(c => c.passed),
   'ACP evaluation failures (see checks above)'
 )
-console.log('Real Pi + fake subagents host evaluation passed; stock host and live Zed UI not exercised here.')
+console.log('Real Pi + fake subagents host evaluation passed; stock host and live client UI not exercised here.')

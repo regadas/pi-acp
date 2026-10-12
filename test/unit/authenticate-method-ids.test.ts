@@ -10,6 +10,39 @@ const isInvalidParams = (e: any) => {
   return true
 }
 
+for (const name of ['generic-client', 'zed', undefined]) {
+  for (const capabilities of [
+    { auth: false, meta: false },
+    { auth: false, meta: true },
+    { auth: true, meta: false },
+    { auth: true, meta: true }
+  ]) {
+    test(`initialize: terminal auth depends on capabilities, not client name ${name ?? '(absent)'} (${capabilities.auth}/${capabilities.meta})`, async () => {
+      const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+      try {
+        const init = await agent.initialize({
+          protocolVersion: 1,
+          ...(name ? { clientInfo: { name, version: '1' } } : {}),
+          clientCapabilities: {
+            auth: { terminal: capabilities.auth },
+            _meta: { 'terminal-auth': capabilities.meta }
+          }
+        })
+        assert.equal(init.authMethods?.length, capabilities.auth ? 1 : 0)
+        if (capabilities.auth) {
+          assert.equal(init.authMethods?.[0]?.id, PI_SETUP_METHOD_ID)
+          assert.equal(Boolean(init.authMethods?.[0]?._meta?.['terminal-auth']), capabilities.meta)
+          await assert.doesNotReject(() => agent.authenticate({ methodId: PI_SETUP_METHOD_ID }))
+        } else {
+          await assert.rejects(() => agent.authenticate({ methodId: PI_SETUP_METHOD_ID }), isInvalidParams)
+        }
+      } finally {
+        agent.dispose()
+      }
+    })
+  }
+}
+
 test('authenticate: accepts only the method IDs advertised at initialize', async () => {
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
   const init = await agent.initialize({

@@ -1273,5 +1273,5 @@ console.log(
   `Owned-completion evaluation passed on pi ${identity.piVersion} with pi-subagents git ${identity.before.head} loaded via ${identity.declaredEntry}.`
 )
 console.log(
-  'Evidence limits: bounded probes may add provider calls; completion and supervisor delivery each use a 30s window; workflow async children are delivered only by their native notice (bg_wait is not delivery); automatic steering recovery is not reproduced; no live Zed/Windows client was driven.'
+  'Evidence limits: bounded probes may add provider calls; completion and supervisor delivery each use a 30s window; workflow async children are delivered only by their native notice (bg_wait is not delivery); automatic steering recovery is not reproduced; no live client UI or Windows client was driven.'
 )

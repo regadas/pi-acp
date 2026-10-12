@@ -152,9 +152,8 @@ export class PiAcpAgent implements ACPAgent {
   private authMethods: AuthMethod[] = []
   private advertisedAuthMethodIds = new Set<string>()
 
-  // Negotiated at initialize. Zed advertises `_meta.terminal_output` for its
-  // display-only terminal rendering convention; other clients get standard
-  // text/image tool content instead. Defaults are strict (off) so nothing
+  // Negotiated at initialize: `_meta.terminal_output` enables display-only
+  // terminal rendering; clients without it get standard text/image content. Defaults are strict (off) so nothing
   // non-standard leaks before initialization.
   private supportsTerminalOutputMeta = false
   private supportsElicitationForm = false
@@ -583,7 +582,7 @@ export class PiAcpAgent implements ACPAgent {
     this.supportsTerminalOutputMeta = clientCapabilities?._meta?.['terminal_output'] === true
     this.supportsElicitationForm = clientCapabilities?.elicitation?.form != null
     // Terminal auth methods are advertised only against the stable v1
-    // `auth.terminal` capability; the Zed `_meta["terminal-auth"]`
+    // `auth.terminal` capability; the optional `_meta["terminal-auth"]`
     // launch spec is added only when the client also declared its meta flag.
     this.authMethods = getAuthMethods({
       supportsTerminalAuth: clientCapabilities?.auth?.terminal === true,
@@ -1114,7 +1113,7 @@ export class PiAcpAgent implements ACPAgent {
 
   /**
    * Send `available_commands_update` after the current request's response has
-   * been delivered. Some clients (e.g. Zed) ignore notifications for a
+   * been delivered. Some clients ignore notifications for a
    * sessionId they have not yet confirmed.
    */
   // Test seam: deferred scheduling for post-response notifications. Tests

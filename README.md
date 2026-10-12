@@ -12,17 +12,17 @@ The project is separate from the original repository and the unscoped `pi-acp` n
 
 `pi-acp` targets the stable ACP v1 core using the current `@agentclientprotocol/sdk` builder API. It implements the baseline prompt lifecycle plus stable session list, load, resume, close, and delete methods. It is not fully ACP v1 conformant because client-provided stdio MCP servers are not supported: pi itself has no MCP support, so requests with a non-empty `mcpServers` list are rejected explicitly instead of being silently ignored; see [Limitations](#limitations).
 
-Development is centered around [Zed](https://zed.dev) editor support, and other clients may have varying levels of compatibility. Expect some minor breaking changes.
+The design targets ACP clients generically. Optional extensions are enabled only by negotiated capabilities, never by client identity; standard ACP content remains the fallback. [Zed](https://zed.dev) is a compatibility benchmark, not the design target. Client support may vary; expect some minor breaking changes.
 
 ## Features
 
 - Streams assistant text as ACP `agent_message_chunk` and extended thinking as `agent_thought_chunk`
 - Maps pi tool execution to ACP `tool_call` / `tool_call_update`
   - First reports include the canonical backend tool name when known, separately from the display title (a stable v1 SHOULD, supported but still annotated experimental in SDK 1.4.0)
-  - Bash output uses Zed's negotiated `_meta.terminal_output` display convention when the client advertises it (`clientCapabilities._meta.terminal_output: true`); other clients receive the output as standard text content, so nothing is lost
+  - Bash output uses the negotiated `_meta.terminal_output` display extension when the client advertises it (`clientCapabilities._meta.terminal_output: true`); other clients receive the output as standard text content, so nothing is lost
   - Tool-result image content is preserved as ACP image content
   - Tool call locations are surfaced when available for ACP clients that support opening the referenced file/context
-  - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables follow-along features in clients like Zed
+  - Relative file paths from pi are resolved against the session cwd before being emitted as ACP tool locations, which enables client follow-along features
   - For `edit`, `pi-acp` attempts to infer a 1-based line number from a unique `oldText` match in the pre-edit file snapshot and includes it in the emitted tool location when possible
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
 - Stable ACP v1 session lifecycle
@@ -41,7 +41,6 @@ Development is centered around [Zed](https://zed.dev) editor support, and other 
 - Pi extension select/confirm UI maps to ACP permissions. Input/editor UI maps to stable v1 form elicitation only when the client negotiates it; otherwise pi receives cancellation
   - Native dialog timeouts cancel the ACP request and complete permission cards; late answers are ignored without replying to an expired pi dialog. Explicit answers and cancellation still send the appropriate native response
 - Stable context-window/cost updates and unstable SDK prompt-response cumulative token totals are published when pi reports finite values
-- (Zed) Session history is supported in Zed starting with [`v0.225.0`](https://zed.dev/releases/preview/0.225.0). Session loading / history maps to pi's session files. Sessions can be resumed both in `pi` and in the ACP client.
 
 ## Prerequisites
 
@@ -74,7 +73,11 @@ To expose the existing `pi-acp` executable on your `PATH`, link the package:
 npm link
 ```
 
-Then configure a custom agent in [Zed](https://zed.dev/docs/agents/external-agents/):
+Configure your ACP client to launch `pi-acp` over stdio, or `node /path/to/pi-acp/dist/index.js` without linking the package.
+
+#### Zed compatibility example
+
+In [Zed](https://zed.dev/docs/agents/external-agents/), configure a custom agent:
 
 ```json
 {
@@ -128,16 +131,15 @@ Pi discovers and expands file prompts, skills, and extension commands after appl
 
 Other built-in commands:
 
-- `/model` - maps to model selector in Zed
-- `/thinking` - maps to the thinking (`thought_level`) config option selector in Zed
+- `/model` - maps to the standard ACP `model` session config option
+- `/thinking` - maps to the standard ACP `thought_level` session config option
 - `/clear` - not implemented (use ACP client 'new' command)
 
 Pi-provided skill and extension commands appear when pi includes them in `get_commands`.
 
 ## Authentication (ACP client support)
 
-This agent supports **Terminal Auth** for ACP clients that negotiate it.
-In Zed, this will show an **Authenticate** banner that launches pi in a terminal.
+This agent supports **Terminal Auth** when the client advertises `clientCapabilities.auth.terminal: true`. The optional `_meta["terminal-auth"]` launch specification is included only when the client also negotiates that extension. Rendering and launch UI are client-owned.
 Launch pi in a terminal for interactive login/setup:
 
 ```bash
@@ -157,6 +159,8 @@ npm run lint
 npm run test
 ```
 
+`npm run eval:acp` runs the generic stdio compatibility harness with real Pi and a deterministic local provider. See the [ACP compatibility audit](docs/acp-compatibility-audit.md) for evidence and limits; it does not drive a live editor UI.
+
 Project layout:
 
 - `src/acp/*` – ACP server + translation layer
@@ -164,8 +168,8 @@ Project layout:
 
 ## Limitations
 
-- No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally. Bash tool calls are rendered through Zed's `_meta.terminal_output` convention only when the client negotiates it; otherwise output is plain tool content.
-- Terminal login uses stable v1 `clientCapabilities.auth.terminal`; Zed's `_meta["terminal-auth"]` launch banner is a separately negotiated extension.
+- No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally. Bash tool calls use the `_meta.terminal_output` display extension only when the client negotiates it; otherwise output is plain tool content.
+- Terminal login uses stable v1 `clientCapabilities.auth.terminal`; the `_meta["terminal-auth"]` launch specification is a separately negotiated extension.
 - Dialog timeout mirroring starts when the adapter receives the pi event, after native transport, so it cannot exactly reproduce the native deadline. Zero and NaN disable native timeouts; finite negative, sub-millisecond, and overflowing Node delays expire at 1 ms, and other finite delays are truncated to integer milliseconds. JSON serializes nonfinite numbers as null: the adapter cannot distinguish a native Infinity timeout (which Node expires) from a disabled/absent timeout. No blanket turn-end UI cancellation is applied; nontimed session-scoped dialogs remain until answered or explicitly cancelled.
 - ACP permits session updates outside prompt turns. Autonomous assistant/tool progress is published as session-scoped updates, never as the result or permission request of an unrelated foreground prompt. Idle custom messages without an observed run remain buffered until a prompt or autonomous run starts.
 - ACP v1 requires agents to connect client-provided stdio MCP servers, but pi has no MCP support (it would require a pi extension to bridge them). `pi-acp` therefore rejects `session/new`, `session/load`, and `session/resume` requests that carry a non-empty `mcpServers` list with an explicit `invalid params` error instead of silently ignoring the requested servers; empty lists are accepted. This remains an explicit protocol conformance gap. Installing the [pi MCP adapter](https://github.com/nicobailon/pi-mcp-adapter) makes separately configured MCP servers available to pi, but does not wire the ACP request's `mcpServers` automatically.

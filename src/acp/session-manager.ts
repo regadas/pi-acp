@@ -15,7 +15,7 @@ type SessionCreateParams = {
   cwd: string
   conn: AcpClient
   piCommand?: string
-  /** Client negotiated Zed's `_meta.terminal_output` tool rendering convention. */
+  /** Client negotiated the `_meta.terminal_output` tool rendering extension. */
   supportsTerminalOutputMeta?: boolean
   /** Auth methods the owning agent advertised at initialize (for auth-required errors). */
   authMethods?: AuthMethod[]

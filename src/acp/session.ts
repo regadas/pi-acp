@@ -232,7 +232,7 @@ export class PiAcpSession {
   private readonly supportsElicitationForm: boolean
   private readonly pendingUiRequests = new Map<string, PendingUiRequest>()
   // Fabricated terminal references and terminal_* metadata are a negotiated
-  // Zed convention; never expose them to a client that did not opt in.
+  // extension; never expose them to a client that did not opt in.
   private readonly supportsTerminalOutputMeta: boolean
   // Auth methods the owning agent advertised at initialize; auth-required
   // errors raised from this session must advertise exactly these.
@@ -929,8 +929,7 @@ export class PiAcpSession {
   }
 
   private emitQueuedNotice(): void {
-    // Best-effort: notify client that work was queued.
-    // This doesn't work in Zed yet, needs to be revisited
+    // Best-effort: notify the client that work was queued.
     this.emit({
       sessionUpdate: 'agent_message_chunk',
       content: {
@@ -942,7 +941,7 @@ export class PiAcpSession {
     this.publishQueueState(true, this.turnQueue.length)
   }
 
-  /** Publish queue depth via session info metadata. (Not visible in Zed yet.) */
+  /** Publish queue depth via session info metadata; rendering is client-owned. */
   private publishQueueState(running: boolean, queueDepth: number): void {
     this.emit({
       sessionUpdate: 'session_info_update',
@@ -2002,7 +2001,7 @@ export class PiAcpSession {
           break
         }
 
-        // Surface tool calls ASAP so clients (e.g. Zed) can show a tool-in-use/loading UI
+        // Surface tool calls ASAP so clients can show a tool-in-use/loading UI
         // while the model is still streaming tool call args.
         if (ame?.type === 'toolcall_start' || ame?.type === 'toolcall_delta' || ame?.type === 'toolcall_end') {
           const contentIndex = typeof ame.contentIndex === 'number' ? ame.contentIndex : 0

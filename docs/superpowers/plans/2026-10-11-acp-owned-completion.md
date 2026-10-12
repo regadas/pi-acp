@@ -130,10 +130,10 @@ Parent stages: capture baseline → worker executes Tasks 1–3 → fresh full-m
 
 **Files:**
 
-- Modify: `scripts/eval-zed-acp.mjs`, `scripts/fixtures/zed-harness-extension.ts`.
+- Modify: `scripts/eval-acp-client.mjs`, `scripts/fixtures/acp-harness-extension.ts`.
 - Create: `scripts/eval-subagents-completion.mjs`, `scripts/fixtures/subagents-completion-provider.ts`, following the existing stock-cancellation eval/provider patterns. Reuse their infrastructure where safe; these files are a deterministic assertion-based self-check, not a new test framework.
 - Accept `PI_ACP_EVAL_SUBAGENTS` as an explicit git checkout root; record and verify revision `29284cd943c0c7ee852593c6e02d2a60febf6ba4`, clean source status and its declared `index.ts` entry. Use the installed checkout read-only. Explicitly retarget the existing cancellation eval to this same user-approved git revision; do not install, shim or investigate historical subagents versions.
-- Modify: `README.md`, `docs/zed-acp-audit.md`; script runner/export configuration only if necessary to invoke the new evidence.
+- Modify: `README.md`, `docs/acp-compatibility-audit.md`; script runner/export configuration only if necessary to invoke the new evidence.
 
 **Interfaces:**
 
@@ -151,7 +151,7 @@ Parent stages: capture baseline → worker executes Tasks 1–3 → fresh full-m
   Confirm the baseline fails this discriminating scenario. Record event order, not elapsed-time guesses.
 
 - [ ] **Step 2: Exercise the real detach schema/dispatch.** Add explicit detach, mixed/foreign work, cancel during the boundary, queued supervisor wake, delayed/fast delivery, terminal root/live descendant, missing/ambiguous proof and resume. Assert exact cancellation IDs and that old/foreign roots do not affect new ownership. Add APPEND_SYSTEM/provider sentinel assertions for new/resumed requests.
-- [ ] **Step 3: Run real-runtime evidence on Pi 1.1.0.** Run `node scripts/eval-zed-acp.mjs`, `node scripts/eval-subagents-completion.mjs` and the explicitly retargeted cancellation eval with installed Pi 1.1.0, isolated fixture state and `PI_ACP_EVAL_SUBAGENTS` selecting the user's git-main checkout at `29284cd943c0c7ee852593c6e02d2a60febf6ba4`. Record/revalidate exact revision, clean status and loaded `index.ts`, proving notification/status behavior rather than a fake host or an npm package label. Include a genuinely fast scripted provider whose native notice queues after a probe, and demonstrate valid runnable waiting drafts. Record possible extra model calls and clock/deadline limits. Missing metadata cases may use clearly labeled public fixture-injected negative messages, not claims about an untested historical runner. If capabilities are unavailable, report the precise blocker; no invented coverage or further version archaeology.
+- [ ] **Step 3: Run real-runtime evidence on Pi 1.1.0.** Run `node scripts/eval-acp-client.mjs`, `node scripts/eval-subagents-completion.mjs` and the explicitly retargeted cancellation eval with installed Pi 1.1.0, isolated fixture state and `PI_ACP_EVAL_SUBAGENTS` selecting the user's git-main checkout at `29284cd943c0c7ee852593c6e02d2a60febf6ba4`. Record/revalidate exact revision, clean status and loaded `index.ts`, proving notification/status behavior rather than a fake host or an npm package label. Include a genuinely fast scripted provider whose native notice queues after a probe, and demonstrate valid runnable waiting drafts. Record possible extra model calls and clock/deadline limits. Missing metadata cases may use clearly labeled public fixture-injected negative messages, not claims about an untested historical runner. If capabilities are unavailable, report the precise blocker; no invented coverage or further version archaeology.
 - [ ] **Step 4: Update docs with proven behavior.** Explain Pi 1.1.0 floor, explicit detach, FIFO/cancel trade-offs, runtime capability limits, terminal-only delivery deadline and bounded probes' possible extra provider calls/latency. Replace stale aggregate-completion claims in the audit without rewriting historical receipts. Do not claim a live Zed spinner/bell trace exists.
 - [ ] **Step 5: Format only touched files.** Parent spec/plan and unrelated dirty work are protected. Use the installed Prettier with an explicit touched-file list; whole-worktree formatting is permitted only if all affected paths are authorized.
 - [ ] **Step 6: Run final checks.** `npm run format:check`, `npm run typecheck`, `npm run lint`, `npm test`, `npm run build`, `npm run smoke`, and the relevant deterministic eval commands. Capture bounded output/evidence. Any skip/failure is reported, not replaced by model confidence.
@@ -159,7 +159,7 @@ Parent stages: capture baseline → worker executes Tasks 1–3 → fresh full-m
 
 ### Task 4: Apply parent-accepted first-review fixes
 
-**Files:** `src/pi-rpc/acp-extension.ts`, `test/unit/acp-extension.test.ts`, connected completion/cancel/Zed evals and their existing fixtures, `README.md`, `docs/zed-acp-audit.md`. The parent captures exact writable overlap before the single fix worker starts; spec/plan and all other dirty paths remain protected.
+**Files:** `src/pi-rpc/acp-extension.ts`, `test/unit/acp-extension.test.ts`, connected completion/cancel/client evals and their existing fixtures, `README.md`, `docs/acp-compatibility-audit.md`. The parent captures exact writable overlap before the single fix worker starts; spec/plan and all other dirty paths remain protected.
 
 **Interfaces:** Extend the existing capture/delivery state, public status and structured message observation; do not add a new queue protocol, change FIFO failure policy, alter installed runners or read private state.
 

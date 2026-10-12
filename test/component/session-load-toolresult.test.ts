@@ -122,81 +122,88 @@ function mockSpawn(snapshot: unknown) {
     }) as any
 }
 
-test('PiAcpAgent: loadSession replays toolResult with negotiated Zed terminal metadata', async () => {
-  const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(bashResultSnapshot)
+for (const name of ['generic-client', 'zed', undefined]) {
+  test(`PiAcpAgent: loadSession replays negotiated terminal metadata regardless of client name ${name ?? '(absent)'}`, async () => {
+    const originalSpawn = PiRpcProcess.spawn
+    ;(PiRpcProcess as any).spawn = mockSpawn(bashResultSnapshot)
 
-  try {
-    const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    try {
+      const conn = new FakeAgentSideConnection()
+      const agent = new PiAcpAgent(asAgentConn(conn))
+      ;(agent as any).store = new FakeStore()
 
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: { _meta: { terminal_output: true } }
-    } as any)
-    const loaded = await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
-    assert.deepEqual(loaded._meta, { piAcp: { startupInfo: null } })
+      await agent.initialize({
+        protocolVersion: 1,
+        ...(name ? { clientInfo: { name, version: '1' } } : {}),
+        clientCapabilities: { _meta: { terminal_output: true } }
+      })
+      const loaded = await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
+      assert.deepEqual(loaded._meta, { piAcp: { startupInfo: null } })
 
-    const updates = conn.updates.map(u => u.update)
+      const updates = conn.updates.map(u => u.update)
 
-    const toolCall = updates.find(u => u.sessionUpdate === 'tool_call')
-    assert.ok(toolCall)
-    assert.equal(toolCall.name, 'bash')
-    assert.equal(toolCall.toolCallId, 'call_1')
-    assert.equal(toolCall.title, 'echo hello')
-    assert.equal(toolCall.kind, 'execute')
-    assert.equal(toolCall.status, 'in_progress')
-    assert.deepEqual(toolCall.content, [{ type: 'terminal', terminalId: 'call_1' }])
-    assert.deepEqual(toolCall._meta, { terminal_info: { terminal_id: 'call_1', cwd: TEST_CWD } })
-    assert.equal(toolCall.rawOutput, undefined)
+      const toolCall = updates.find(u => u.sessionUpdate === 'tool_call')
+      assert.ok(toolCall)
+      assert.equal(toolCall.name, 'bash')
+      assert.equal(toolCall.toolCallId, 'call_1')
+      assert.equal(toolCall.title, 'echo hello')
+      assert.equal(toolCall.kind, 'execute')
+      assert.equal(toolCall.status, 'in_progress')
+      assert.deepEqual(toolCall.content, [{ type: 'terminal', terminalId: 'call_1' }])
+      assert.deepEqual(toolCall._meta, { terminal_info: { terminal_id: 'call_1', cwd: TEST_CWD } })
+      assert.equal(toolCall.rawOutput, undefined)
 
-    const toolCallUpdate = updates.find(u => u?.sessionUpdate === 'tool_call_update')
-    assert.ok(toolCallUpdate)
-    assert.equal(toolCallUpdate.toolCallId, 'call_1')
-    assert.equal(toolCallUpdate.status, 'completed')
-    assert.deepEqual(toolCallUpdate._meta, {
-      terminal_output: { terminal_id: 'call_1', data: 'hello from bash' },
-      terminal_exit: { terminal_id: 'call_1', exit_code: 0, signal: null }
-    })
-    assert.equal(toolCallUpdate.rawOutput, undefined)
-  } finally {
-    PiRpcProcess.spawn = originalSpawn
-  }
-})
+      const toolCallUpdate = updates.find(u => u?.sessionUpdate === 'tool_call_update')
+      assert.ok(toolCallUpdate)
+      assert.equal(toolCallUpdate.toolCallId, 'call_1')
+      assert.equal(toolCallUpdate.status, 'completed')
+      assert.deepEqual(toolCallUpdate._meta, {
+        terminal_output: { terminal_id: 'call_1', data: 'hello from bash' },
+        terminal_exit: { terminal_id: 'call_1', exit_code: 0, signal: null }
+      })
+      assert.equal(toolCallUpdate.rawOutput, undefined)
+    } finally {
+      PiRpcProcess.spawn = originalSpawn
+    }
+  })
 
-test('PiAcpAgent: loadSession replays bash output as standard content without negotiation', async () => {
-  const originalSpawn = PiRpcProcess.spawn
-  ;(PiRpcProcess as any).spawn = mockSpawn(bashResultSnapshot)
+  test(`PiAcpAgent: loadSession uses standard content without negotiation regardless of client name ${name ?? '(absent)'}`, async () => {
+    const originalSpawn = PiRpcProcess.spawn
+    ;(PiRpcProcess as any).spawn = mockSpawn(bashResultSnapshot)
 
-  try {
-    const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    try {
+      const conn = new FakeAgentSideConnection()
+      const agent = new PiAcpAgent(asAgentConn(conn))
+      ;(agent as any).store = new FakeStore()
 
-    await agent.initialize({ protocolVersion: 1, clientCapabilities: {} } as any)
-    await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
+      await agent.initialize({
+        protocolVersion: 1,
+        ...(name ? { clientInfo: { name, version: '1' } } : {}),
+        clientCapabilities: {}
+      })
+      await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
 
-    const updates = conn.updates.map(u => (u as any).update)
+      const updates = conn.updates.map(u => (u as any).update)
 
-    const toolCall = updates.find(u => u?.sessionUpdate === 'tool_call')
-    assert.ok(toolCall)
-    assert.equal(toolCall.kind, 'execute')
-    assert.equal(toolCall.status, 'in_progress')
-    assert.equal(toolCall.content, undefined, 'no fabricated terminal reference for generic clients')
-    assert.equal(toolCall._meta, undefined)
+      const toolCall = updates.find(u => u?.sessionUpdate === 'tool_call')
+      assert.ok(toolCall)
+      assert.equal(toolCall.kind, 'execute')
+      assert.equal(toolCall.status, 'in_progress')
+      assert.equal(toolCall.content, undefined, 'no fabricated terminal reference for generic clients')
+      assert.equal(toolCall._meta, undefined)
 
-    const toolCallUpdate = updates.find(u => u?.sessionUpdate === 'tool_call_update')
-    assert.ok(toolCallUpdate)
-    assert.equal(toolCallUpdate.status, 'completed')
-    assert.equal(toolCallUpdate._meta, undefined, 'no terminal_* metadata for generic clients')
-    assert.deepEqual(toolCallUpdate.content, [
-      { type: 'content', content: { type: 'text', text: '```console\nhello from bash\n```' } }
-    ])
-  } finally {
-    PiRpcProcess.spawn = originalSpawn
-  }
-})
+      const toolCallUpdate = updates.find(u => u?.sessionUpdate === 'tool_call_update')
+      assert.ok(toolCallUpdate)
+      assert.equal(toolCallUpdate.status, 'completed')
+      assert.equal(toolCallUpdate._meta, undefined, 'no terminal_* metadata for generic clients')
+      assert.deepEqual(toolCallUpdate.content, [
+        { type: 'content', content: { type: 'text', text: '```console\nhello from bash\n```' } }
+      ])
+    } finally {
+      PiRpcProcess.spawn = originalSpawn
+    }
+  })
+}
 
 const bashImageResultSnapshot = {
   entries: [

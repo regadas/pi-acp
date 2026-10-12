@@ -296,7 +296,7 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
     proc: proc as any,
     conn: asAgentConn(conn),
     fileCommands: [],
-    // This test locks in the negotiated Zed terminal_output convention.
+    // This test locks in the negotiated terminal_output extension.
     supportsTerminalOutputMeta: true
   })
 

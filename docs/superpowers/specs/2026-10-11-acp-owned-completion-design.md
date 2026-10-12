@@ -2,7 +2,7 @@
 
 ## Intent
 
-Keep an ACP end-to-end task busy while its required async work is outstanding, then release the prompt after completion delivery and the parent's response to it. Avoid Zed's premature completion indication without replacing async execution with synchronous children or treating every session job as this task's dependency.
+Keep an ACP end-to-end task busy while its required async work is outstanding, then release the prompt after completion delivery and the parent's response to it. Avoid premature ACP completion indications without replacing async execution with synchronous children or treating every session job as this task's dependency.
 
 This is one adapter lifecycle change, not a general task framework or an ACP protocol extension. Model interpretation still selects user intent and the final answer; the adapter enforces the lifetime of observed required work.
 
@@ -93,7 +93,7 @@ Bounded snapshots may not prove an arbitrary descendant tree. Missing roots, tru
 
 Likely code: `src/pi-rpc/acp-extension.ts`, `src/pi-rpc/process.ts`, `src/pi-rpc/version.ts`; touch `src/acp/session.ts` only for a demonstrated lifecycle/error attribution need. Keep existing layers and avoid dependencies or new generic frameworks.
 
-Tests/callers: extension and version unit tests; background, native-admission, responsiveness and cancellation component suites; scripted real-Pi eval and fixtures. Update README and stale `docs/zed-acp-audit.md` claims. The new detach tool must be exercised through real Pi's schema/dispatch path, not just a fake registration.
+Tests/callers: extension and version unit tests; background, native-admission, responsiveness and cancellation component suites; scripted real-Pi eval and fixtures. Update README and stale `docs/acp-compatibility-audit.md` claims. The new detach tool must be exercised through real Pi's schema/dispatch path, not just a fake registration.
 
 ## Acceptance evidence
 
