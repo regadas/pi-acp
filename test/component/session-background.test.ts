@@ -82,6 +82,77 @@ test('background failures are visible and quarantine instead of releasing delaye
   assert.ok(conn.updates.some(n => n.update.sessionUpdate === 'agent_message_chunk'))
 })
 
+test('owned completion failure fails the prompt at settlement without disposing the shared Pi channel', async () => {
+  const { conn, proc, session, lifecycle } = harness()
+  const prompt = session.prompt('launch')
+  const queued = session.prompt('next')
+  proc.emit({ type: 'agent_start' })
+  const owner = (session as any).pendingTurn.owner
+  lifecycle('active', owner)
+  lifecycle('failed', 'foreign-owner')
+  lifecycle('failed', owner)
+  let settled = false
+  void prompt.then(
+    () => (settled = true),
+    () => (settled = true)
+  )
+  await tick()
+  assert.equal(settled, false, 'Pi still owns the run until its native settlement')
+  // A later successful provider completion cannot erase the barrier failure.
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop' } })
+  proc.emit({ type: 'agent_settled' })
+  await assert.rejects(prompt, /Background harness/)
+  await assert.rejects(queued)
+  assert.equal(proc.disposed, false, 'detached and foreign work keep their Pi process')
+  assert.ok(
+    conn.updates.some(
+      n =>
+        n.update.sessionUpdate === 'agent_message_chunk' && /Background harness/.test(JSON.stringify(n.update.content))
+    )
+  )
+  const next = session.prompt('after failure')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await next, 'end_turn', 'the next owner starts clean on the same channel')
+})
+
+test('barrier continuation widget correlates the next native agent_start with the owning turn', async () => {
+  const { proc, session, lifecycle } = harness()
+  const prompt = session.prompt('launch')
+  proc.emit({ type: 'agent_start' })
+  const owner = (session as any).pendingTurn.owner
+  lifecycle('active', owner)
+  // The yielding run ends with an empty native queue; the owned-completion barrier
+  // then returns a native continuation for a queued custom notice, which Pi starts
+  // as a new low-level run without any queue_update precursor.
+  proc.emit({ type: 'agent_end' })
+  lifecycle('continuing', owner)
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'synthesis' } })
+  proc.emit({ type: 'agent_settled' })
+  lifecycle('idle', owner)
+  await tick()
+  assert.equal(await prompt, 'end_turn')
+  assert.equal((session as any).lifecycleAmbiguity, null)
+  assert.equal(proc.disposed, false)
+})
+
+test('owned completion failure racing cancellation keeps the cancelled classification', async () => {
+  const { proc, session, lifecycle } = harness()
+  const prompt = session.prompt('launch')
+  proc.emit({ type: 'agent_start' })
+  const owner = (session as any).pendingTurn.owner
+  lifecycle('active', owner)
+  const cancel = session.cancel()
+  await tick()
+  lifecycle('failed', owner)
+  proc.emit({ type: 'agent_settled' })
+  lifecycle('cancelled', owner)
+  await cancel
+  assert.equal(await prompt, 'cancelled')
+  assert.equal(proc.disposed, false)
+})
+
 test('background cancellation forwards the exact owner and cancels FIFO', async () => {
   const { proc, session, lifecycle } = harness()
   const prompt = session.prompt('launch')

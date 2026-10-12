@@ -51,6 +51,8 @@ type PendingTurn = {
   owner: string
   requestOwner?: symbol
   backgroundActive: boolean
+  // Owned-completion failure from the lifecycle extension; Pi still settles the run.
+  completionFailure?: Error
   cancellationPending: boolean
   piSettled: boolean
   agentRunEverObserved: boolean
@@ -2546,8 +2548,9 @@ export class PiAcpSession {
         // pi has fully settled this prompt: no automatic retry, compaction
         // retry, or queued continuation remains. This is the safe boundary to
         // resolve (or fail) the ACP `session/prompt`.
-        if (this.turnFailure && !this.cancelRequested) {
-          this.failTurn(activeTurn, this.turnFailure, true)
+        const failure = this.turnFailure ?? activeTurn.completionFailure
+        if (failure && !this.cancelRequested) {
+          this.failTurn(activeTurn, failure, true)
         } else {
           this.completeTurn(activeTurn)
         }
@@ -2644,6 +2647,11 @@ export class PiAcpSession {
             this.clearDeferredDispatch()
             this.dispatchPrompt(turn, deferred.message, deferred.images)
           }
+        } else if (state.state === 'continuing') {
+          // The owned-completion barrier returns a native continuation (queued
+          // notice, waiting-draft probe or post-delivery cycle). Custom steers
+          // emit no queue_update, so this widget is the only agent_start precursor.
+          this.continuationExpected = true
         } else if (state.state === 'error') {
           const error = new Error(`Background harness: ${String(state.error ?? 'lifecycle failed')}`)
           this.emit({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: error.message } })
@@ -2653,6 +2661,15 @@ export class PiAcpSession {
           this.dispose({ expected: false })
           if (this.cancelRequested) this.completeTurn(turn)
           else this.failTurn(turn, error)
+        } else if (state.state === 'failed') {
+          // Scoped to this owner's work: no disposal, detached/foreign work keeps its channel.
+          turn.completionFailure ??= new Error(
+            `Background harness: ${String(state.error ?? 'owned completion failed')}`
+          )
+          this.emit({
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: turn.completionFailure.message }
+          })
         } else if (state.state === 'active') {
           turn.backgroundActive = true
         } else if (state.state === 'idle' || state.state === 'cancelled') {

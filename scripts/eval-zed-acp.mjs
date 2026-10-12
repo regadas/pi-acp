@@ -26,6 +26,8 @@ await writeFile(
     compaction: { reserveTokens: 10, keepRecentTokens: 10 }
   })
 )
+// A user resource discovered natively from the isolated agent directory (no CLI injection).
+await writeFile(join(root, 'agent', 'APPEND_SYSTEM.md'), 'ZED_HARNESS_APPEND_SYSTEM_SENTINEL')
 await writeFile(
   wrapper,
   `#!/usr/bin/env node
@@ -213,23 +215,18 @@ try {
         )
       )
       const asyncStart = (await trace()).length
-      let settled = false
+      let launchSettled = false
       const asyncTurn = prompt('launch async').then(result => {
-        settled = true
+        launchSettled = true
         return result
       })
       await waitTrace(backgroundActive, asyncStart)
       const terminal = await waitTrace(e => e.statusKey === 'eval-terminal', asyncStart)
-      assert.equal((await asyncTurn).stopReason, 'end_turn')
-      check('ACP releases foreground independently of terminal-pending-delivery child', settled)
-      const idleChildStart = (await trace()).length
-      assert.equal((await prompt('ordinary question while child is live')).stopReason, 'end_turn')
-      check(
-        'idle model admits ordinary input without adopting live child',
-        !(await trace()).slice(idleChildStart).some(e => e.statusKey === 'eval-stopped')
-      )
+      // Owned completion: terminal status without a consumed notice must hold the request open.
+      assert.equal(launchSettled, false, 'a terminal-pending-delivery child must hold the foreground request')
       await writeFile(join(root, 'deliver-async'), terminal.statusText)
-      await waitTrace(e => e.type === 'agent_settled', (await trace()).length)
+      assert.equal((await asyncTurn).stopReason, 'end_turn')
+      check('held foreground releases only after delayed structured delivery and synthesis', launchSettled)
       check(
         'real Pi emits delayed subagent-contract message',
         (await trace()).some(e => e.type === 'message_end' && e.message?.content === 'ASYNC_COMPLETION')
@@ -239,46 +236,56 @@ try {
         'async triggered assistant response delivered',
         texts().split('HARNESS_RESPONSE').length > initialResponseCount + 1
       )
+      const systemRows = (await trace()).filter(e => e.statusKey === 'eval-system-prompt')
+      assert.ok(systemRows.length > 0, 'the harness must observe rendered system prompts')
+      assert.ok(
+        systemRows.every(row => {
+          const observed = JSON.parse(row.statusText)
+          return observed.sentinel && observed.policy
+        }),
+        'the discovered APPEND_SYSTEM.md sentinel and the adapter completion policy must reach every model run'
+      )
+      check('discovered APPEND_SYSTEM.md sentinel and adapter completion policy reach every model run', true)
       const busyIdentity = JSON.parse((await trace()).findLast(e => e.statusKey === 'eval-session').statusText)
       const busyStart = (await trace()).length
       assert.equal((await prompt('/eval-hold-autonomous')).stopReason, 'end_turn')
-      const heldLaunch = prompt('launch async')
+      let heldSettled = false
+      const heldLaunch = prompt('launch async').then(result => {
+        heldSettled = true
+        return result
+      })
+      await waitTrace(backgroundActive, busyStart)
       const heldTerminal = await waitTrace(e => e.statusKey === 'eval-terminal', busyStart)
-      assert.equal((await heldLaunch).stopReason, 'end_turn')
+      assert.equal(heldSettled, false, 'the second held request stays open through pending delivery')
+      const admittedAt = Date.now()
+      const busyQuestion = prompt('ordinary question after autonomous progress')
+      await sleep(150)
+      assert.ok(texts().includes('Queued message'), 'ordinary input queues locally while the completion barrier holds')
+      assert.ok(
+        !(await trace())
+          .slice(busyStart)
+          .some(e => e.direction === 'in' && e.message === 'ordinary question after autonomous progress'),
+        'the queued question is not admitted before the held request completes'
+      )
       await writeFile(join(root, 'deliver-async'), heldTerminal.statusText)
       await waitTrace(
         e => e.type === 'message_update' && e.assistantMessageEvent?.delta === 'AUTONOMOUS_PROGRESS',
         busyStart
       )
-      const busyQuestionStart = (await trace()).length
-      const withdrawn = prompt('withdraw this ordinary question')
-      await waitTrace(
-        e => e.widgetKey === 'pi-acp-lifecycle' && JSON.parse(e.widgetLines[0]).state === 'waiting',
-        busyQuestionStart
-      )
-      client.notify('session/cancel', { sessionId })
-      assert.equal((await withdrawn).stopReason, 'cancelled')
-      const withdrawalRecords = (await trace()).slice(busyQuestionStart)
-      assert.ok(!withdrawalRecords.some(e => e.direction === 'in' && ['abort', 'clear_queue'].includes(e.type)))
-      assert.ok(!withdrawalRecords.some(e => e.direction === 'in' && e.message === 'withdraw this ordinary question'))
-      const admittedAt = Date.now()
-      const busyQuestion = prompt('ordinary question after autonomous progress')
-      await waitTrace(
-        e => e.widgetKey === 'pi-acp-lifecycle' && JSON.parse(e.widgetLines[0]).state === 'waiting',
-        busyQuestionStart + withdrawalRecords.length
-      )
-      await sleep(100)
-      assert.ok(texts().includes('AUTONOMOUS_PROGRESS'))
-      assert.ok(texts().includes('Input queued'))
       await writeFile(join(root, 'finish-autonomous'), 'release')
+      assert.equal((await heldLaunch).stopReason, 'end_turn')
+      await waitTrace(
+        e => e.direction === 'in' && e.message === 'ordinary question after autonomous progress',
+        busyStart
+      )
       assert.equal((await busyQuestion).stopReason, 'end_turn')
-      const admittedRecords = (await trace()).slice(busyQuestionStart)
-      const userPrompt = admittedRecords.find(
+      const busyRecords = (await trace()).slice(busyStart)
+      const userPrompt = busyRecords.find(
         e => e.direction === 'in' && e.message === 'ordinary question after autonomous progress'
       )
       assert.ok(userPrompt && !('streamingBehavior' in userPrompt))
       assert.ok(
-        admittedRecords.some(
+        busyRecords.some(
           e =>
             e.type === 'message_start' &&
             e.message?.role === 'user' &&
@@ -286,19 +293,20 @@ try {
         )
       )
       assert.equal(
-        admittedRecords.filter(e => e.direction === 'in' && e.message === 'ordinary question after autonomous progress')
+        busyRecords.filter(e => e.direction === 'in' && e.message === 'ordinary question after autonomous progress')
           .length,
         1
       )
-      assert.ok(admittedRecords.some(e => e.type === 'response' && e.id === userPrompt.id && e.success))
-      assert.ok(admittedRecords.some(e => e.type === 'agent_settled'))
-      assert.ok(Date.now() - admittedAt < 5000, 'delivery follows model settlement, not delegated pipeline drain')
-      assert.equal((await prompt('/eval-confirm')).stopReason, 'end_turn')
+      assert.ok(busyRecords.some(e => e.type === 'response' && e.id === userPrompt.id && e.success))
+      assert.ok(busyRecords.some(e => e.type === 'agent_settled'))
+      assert.ok(Date.now() - admittedAt < 30_000, 'admission must follow the held completion, not hang')
       const busySurvivor = JSON.parse((await trace()).findLast(e => e.statusKey === 'eval-session').statusText)
       assert.equal(busySurvivor.pid, busyIdentity.pid)
-      console.log(`Staged native follow-up latency: ${Date.now() - admittedAt}ms; Pi PID survived: ${busySurvivor.pid}`)
+      console.log(
+        `Held completion with queued follow-up latency: ${Date.now() - admittedAt}ms; Pi PID survived: ${busySurvivor.pid}`
+      )
       check(
-        'real Pi autonomous progress, native staged admission, exact withdrawal and correlated follow-up survive on one subprocess',
+        'real Pi autonomous progress after structured delivery, FIFO admission of ordinary input and one subprocess survive',
         true
       )
       const raceStart = (await trace()).length
@@ -483,7 +491,13 @@ try {
         queuedRecords.filter(e => e.statusKey === 'eval-stop-retry').map(e => e.statusText),
         ['not_found', 'invalid_state']
       )
-      assert.ok(texts().includes('detached work may still be running'))
+      // Exact snapshot proof of the stopped required run covers unrelated liveness;
+      // quiescence no longer needs the aggregate detached-work disclaimer.
+      assert.equal(
+        texts().includes('detached work may still be running'),
+        false,
+        'exact stop proof must cover unrelated liveness without a detached-work disclaimer'
+      )
       assert.equal(
         (
           await client.request('session/prompt', {
@@ -494,7 +508,7 @@ try {
         'end_turn'
       )
       check(
-        'queued stop retries remain exactly scoped; unrelated liveness is explicitly unconfirmed and recovery works',
+        'queued stop retries stay exactly scoped; exact stop proof covers unrelated liveness and recovery works',
         queuedRecords.some(e => e.statusKey === 'eval-stopped')
       )
       await client.request('session/close', { sessionId: queuedSession.sessionId })

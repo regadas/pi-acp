@@ -1,14 +1,36 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { withSmokeAgent } from './smoke-client.mjs'
 
-// Explicitly opt-in local stock-package evaluation; no installed source is changed.
-const stock = resolve(process.env.PI_ACP_EVAL_SUBAGENTS ?? join(homedir(), '.pi/agent/npm/node_modules/pi-subagents'))
-assert.equal(JSON.parse(await readFile(join(stock, 'package.json'), 'utf8')).version, '0.67.0')
+// Genuine installed Pi + the user's clean read-only git-main pi-subagents checkout.
+// The package version label is not runtime identity: the exact git revision is verified.
+const stock = process.env.PI_ACP_EVAL_SUBAGENTS
+if (!stock) throw new Error('Set PI_ACP_EVAL_SUBAGENTS to the clean pi-subagents git checkout root')
+const STOCK_REVISION = '29284cd943c0c7ee852593c6e02d2a60febf6ba4'
+const stockGit = (...args) => execFileSync('git', ['-C', stock, ...args], { encoding: 'utf8' }).trim()
+const verifyStock = when => {
+  const head = stockGit('rev-parse', 'HEAD')
+  const status = stockGit('status', '--porcelain')
+  assert.equal(head, STOCK_REVISION, `${when}: pi-subagents must be at the approved git revision`)
+  assert.equal(status, '', `${when}: pi-subagents checkout must be clean`)
+  return { when, head, status }
+}
+const identity = { before: verifyStock('before tests') }
+const stockPackage = JSON.parse(await readFile(join(stock, 'package.json'), 'utf8'))
+const declaredEntry = stockPackage.exports?.['.'] ?? stockPackage.main
+assert.equal(declaredEntry, './index.ts', 'the approved checkout must declare its index.ts entry')
+const stockEntry = join(stock, 'index.ts')
+assert.ok(existsSync(stockEntry), 'declared stock entry is missing')
+identity.declaredEntry = declaredEntry
+assert.ok(existsSync('dist/index.js'), 'Run npm run build first: this eval drives the built adapter')
 const pi = process.env.PI_ACP_EVAL_PI ?? execFileSync('which', ['pi'], { encoding: 'utf8' }).trim()
+identity.piVersion = execFileSync(pi, ['--version'], { encoding: 'utf8' }).trim()
+const [piMajor, piMinor] = identity.piVersion.split(/[.\s]/).map(Number)
+assert.ok(piMajor > 1 || (piMajor === 1 && piMinor >= 1), `pi >= 1.1.0 is required, found ${identity.piVersion}`)
 const root = await mkdtemp(join(tmpdir(), 'pi-acp-stock-cancel-'))
 const fixture = resolve('scripts/fixtures/subagents-cancel-provider.ts')
 const wrapper = join(root, 'pi-wrapper.mjs')
@@ -28,16 +50,18 @@ const wait = async predicate => {
 }
 try {
   await mkdir(join(root, 'agent', 'agents'), { recursive: true })
+  await mkdir(join(root, 'agent', 'extensions', 'subagent'), { recursive: true })
   await mkdir(join(root, 'tmp'))
   await writeFile(
     join(root, 'agent', 'settings.json'),
+    JSON.stringify({ defaultProvider: 'stock-eval', defaultModel: 'local' })
+  )
+  // git-main pi-subagents reads its own config from <agentDir>/extensions/subagent/config.json.
+  await writeFile(
+    join(root, 'agent', 'extensions', 'subagent', 'config.json'),
     JSON.stringify({
-      defaultProvider: 'stock-eval',
-      defaultModel: 'local',
-      subagents: {
-        intercomBridge: { mode: 'off' },
-        completionBatch: { enabled: true, debounceMs: 150, maxWaitMs: 1000 }
-      }
+      intercomBridge: { mode: 'off' },
+      completionBatch: { enabled: true, debounceMs: 150, maxWaitMs: 1000 }
     })
   )
   for (const name of ['eval-root', 'eval-leaf'])
@@ -110,6 +134,8 @@ child.on('exit', code => process.exit(code ?? 1));
           const leaf = await wait(rows => rows.slice(before).find(row => row.event === 'leaf-live'))
           assert.equal(settled, false)
           checks.push({ scenario, assertion: 'actual stock nested child is live', evidence: leaf, passed: true })
+          // git-main keeps the root job running until its whole nested subtree drains;
+          // the 0.67-era terminal-root/live-child shape never occurs there.
           await wait(rows =>
             rows
               .slice(before)
@@ -119,11 +145,11 @@ child.on('exit', code => process.exit(code ?? 1));
                   row.sessionId === parent.sessionId &&
                   row.live &&
                   row.reply?.data?.asyncSnapshot?.runs?.some(
-                    run => run.id === id && run.state === 'complete' && JSON.stringify(run.children).includes('running')
+                    run => run.id === id && run.state === 'running' && (run.children ?? []).length > 0
                   )
               )
           )
-          assert.equal(settled, false, 'terminal root with live descendant must retain the ACP turn')
+          assert.equal(settled, false, 'a running root with a live nested subtree must retain the ACP turn')
         }
         const cancelAt = Date.now()
         client.notify('session/cancel', { sessionId })
@@ -149,37 +175,41 @@ child.on('exit', code => process.exit(code ?? 1));
         })
         if (scenario === 'nested') {
           const leafEnd = after.find(row => row.event === 'leaf-settled')
-          assert.ok(leafEnd, 'nested execution must settle before ACP cancellation, not only acknowledge interrupt')
+          // A leaf ending at its own 15s gate timeout is not cancellation proof.
+          assert.ok(leafEnd, 'nested execution must settle before ACP cancellation, not only acknowledge a stop')
           assert.equal(leafEnd.aborted, true)
           assert.equal(leafEnd.gateReleased, false)
           assert.ok(leafEnd.at <= settledAt, 'leaf execution must settle before the ACP cancellation response')
-          const interrupt = after.find(row => row.event === 'interrupt-reply')
-          assert.equal(interrupt?.request.source?.extension, 'pi-acp', 'only the adapter issues nested interrupt')
-          assert.equal(interrupt?.reply.success, true)
+          const controls = after.filter(row => row.event === 'stop-reply' || row.event === 'interrupt-reply')
+          assert.ok(controls.length > 0, 'cancellation must exercise the public stop control')
+          assert.ok(
+            controls.every(row => (row.request.params ?? {}).id === id),
+            'every public stop/interrupt targets exactly the required root; nested and foreign runs are never stopped'
+          )
           checks.push({
             scenario,
-            assertion: 'adapter public interrupt quiesced the nested execution before ACP response',
-            evidence: { leafEnd, interrupt, settledAt },
+            assertion: 'nested cancellation stops exactly the required root and bounds its subtree',
+            evidence: {
+              leafSettledAt: leafEnd.at,
+              leafAborted: leafEnd.aborted,
+              gateReleased: leafEnd.gateReleased,
+              stopCount: controls.length,
+              firstStopAt: controls[0].at
+            },
             passed: true
           })
-          const terminalWithLiveNested = after.find(
-            row =>
-              row.event === 'snapshot' &&
-              row.sessionId === parent.sessionId &&
-              row.live &&
-              row.reply?.data?.asyncSnapshot?.runs?.some(
-                run =>
-                  run.id === id &&
-                  ['complete', 'stopped', 'paused'].includes(run.state) &&
-                  JSON.stringify(run.children).includes('running')
-              )
-          )
-          assert.ok(terminalWithLiveNested, 'stock terminal root must coexist with its live nested descendant')
+          // git-main keeps the root running until its subtree drains and exposes nested steps
+          // as kind 'step' children, so the 0.67-era public interrupt of nested runs never fires.
           checks.push({
             scenario,
-            observation: 'terminal root/live nested descendant handled by adapter public interrupt',
+            observation:
+              'git-main stop of the required root aborts its nested leaf; no public interrupt of step-kind children occurs',
             reproduced: true,
-            evidence: terminalWithLiveNested
+            evidence: {
+              firstStopAt: controls.find(row => row.event === 'stop-reply')?.at,
+              leafSettledAt: leafEnd.at,
+              interruptCount: after.filter(row => row.event === 'interrupt-reply').length
+            }
           })
         }
         await client.request('session/close', { sessionId })
@@ -236,10 +266,11 @@ child.on('exit', code => process.exit(code ?? 1));
     passed: livePids.length === 0
   })
   const destination = process.env.PI_ACP_EVAL_LOG_DIR
+  identity.after = verifyStock('after tests')
   if (destination) {
     await mkdir(destination, { recursive: true })
     await writeFile(join(destination, 'stock-trace.jsonl'), await readFile(join(root, 'stock.jsonl')).catch(() => ''))
-    await writeFile(join(destination, 'stock-checks.json'), JSON.stringify(checks, null, 2) + '\n')
+    await writeFile(join(destination, 'stock-checks.json'), JSON.stringify({ identity, checks }, null, 2) + '\n')
     await writeFile(
       join(destination, 'stock-acp-trace.jsonl'),
       acpMessages

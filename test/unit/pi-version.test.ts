@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -17,11 +17,10 @@ import { PiRpcProcess, PiRpcSpawnError } from '../../src/pi-rpc/process.js'
 
 const isWindows = process.platform === 'win32'
 
-test('minimum-version feature matrix keeps only newer thinking discovery behind fallback', () => {
-  for (const [feature, version] of Object.entries(PI_FEATURE_MIN_VERSION)) {
-    if (feature === 'getAvailableThinkingLevels') assert.ok(comparePiVersions(version, MIN_PI_VERSION) > 0)
-    else assert.ok(comparePiVersions(version, MIN_PI_VERSION) <= 0, `${feature} must exist at the supported floor`)
-  }
+test('supported Pi floor is 1.1.0 and covers every historical feature floor', () => {
+  assert.equal(MIN_PI_VERSION, '1.1.0')
+  for (const [feature, version] of Object.entries(PI_FEATURE_MIN_VERSION))
+    assert.ok(comparePiVersions(version, MIN_PI_VERSION) <= 0, `${feature} must exist at the supported floor`)
 })
 
 function makePiStubIn(dir: string, name: string, versionOutput: string, versionExitCode = 0): string {
@@ -223,6 +222,40 @@ test('PiRpcProcess.spawn observes a child that exits immediately after spawn', {
   }
 })
 
+for (const resumed of [false, true]) {
+  test(
+    `PiRpcProcess.spawn leaves prompt resources to Pi for ${resumed ? 'resumed' : 'new'} sessions`,
+    { skip: isWindows },
+    async () => {
+      clearPiVersionCacheForTests()
+      const dir = mkdtempSync(join(tmpdir(), 'pi-acp-argv-'))
+      const stub = join(dir, 'pi-args')
+      const capture = join(dir, 'args.json')
+      writeFileSync(
+        stub,
+        '#!/usr/bin/env node\n' +
+          `if (process.argv[2] === '--version') console.log(${JSON.stringify(MIN_PI_VERSION)});\n` +
+          `else require('node:fs').writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2)));\n`
+      )
+      chmodSync(stub, 0o755)
+      const sessionPath = join(dir, 'session.jsonl')
+      let proc: PiRpcProcess | undefined
+      try {
+        proc = await PiRpcProcess.spawn({ cwd: dir, piCommand: stub, ...(resumed ? { sessionPath } : {}) })
+        await proc.whenTerminated()
+        const args: string[] = JSON.parse(readFileSync(capture, 'utf8'))
+        assert.equal(args.includes('--append-system-prompt'), false, 'adapter argv must not override APPEND_SYSTEM')
+        assert.deepEqual(args.slice(0, 4), ['--mode', 'rpc', '--no-themes', '--extension'])
+        assert.match(args[4] ?? '', /acp-extension\.(ts|js)$/)
+        assert.deepEqual(args.slice(5), resumed ? ['--session', sessionPath] : [])
+      } finally {
+        proc?.dispose()
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  )
+}
+
 test('assertSupportedPiVersion aborts an in-flight version child', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
   const controller = new AbortController()
@@ -254,19 +287,19 @@ test('one version caller abort does not kill a probe used by another caller', { 
 test('assertSupportedPiVersion accepts the minimum and newer versions', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
   assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-min', MIN_PI_VERSION)), MIN_PI_VERSION)
-  assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-newer', '0.80.6')), '0.80.6')
+  assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-newer', '1.1.1')), '1.1.1')
 })
 
 test('assertSupportedPiVersion fails closed on versions older than the minimum', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
-  const stub = makePiStub('pi-old', '0.80.3')
+  const stub = makePiStub('pi-old', '1.0.4')
   await assert.rejects(
     assertSupportedPiVersion(stub),
     (err: unknown) =>
       err instanceof PiVersionError &&
-      err.message.includes('0.80.3') &&
+      err.message.includes('1.0.4') &&
       err.message.includes(MIN_PI_VERSION) &&
-      err.message.includes('agent_settled')
+      err.message.includes('agent_before_settle')
   )
 })
 
@@ -286,13 +319,13 @@ test(
     clearPiVersionCacheForTests()
     const supportedDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-cwd-supported-'))
     const oldDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-cwd-old-'))
-    makePiStubIn(supportedDir, 'pi-relative', '0.80.6')
-    makePiStubIn(oldDir, 'pi-relative', '0.80.3')
+    makePiStubIn(supportedDir, 'pi-relative', '1.1.1')
+    makePiStubIn(oldDir, 'pi-relative', '1.0.4')
 
-    assert.equal(await assertSupportedPiVersion('./pi-relative', supportedDir), '0.80.6')
+    assert.equal(await assertSupportedPiVersion('./pi-relative', supportedDir), '1.1.1')
     await assert.rejects(
       assertSupportedPiVersion('./pi-relative', oldDir),
-      (err: unknown) => err instanceof PiVersionError && err.message.includes('0.80.3')
+      (err: unknown) => err instanceof PiVersionError && err.message.includes('1.0.4')
     )
   }
 )
@@ -372,14 +405,14 @@ test('PiRpcProcess.spawn proceeds for supported pi versions', { skip: isWindows 
   clearPiVersionCacheForTests()
   // The stub exits immediately in RPC mode; the best-effort get_state
   // handshake tolerates that, so spawn itself must succeed.
-  const stub = makePiStub('pi-supported-spawn', '0.80.6')
+  const stub = makePiStub('pi-supported-spawn', '1.1.1')
   const proc = await PiRpcProcess.spawn({ cwd: process.cwd(), piCommand: stub })
   proc.dispose()
 })
 
 test('PiRpcProcess.spawn reports the child to its owner before resolving', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
-  const stub = makePiStub('pi-onprocess-spawn', '0.80.6')
+  const stub = makePiStub('pi-onprocess-spawn', '1.1.1')
   const reported: PiRpcProcess[] = []
 
   const spawning = PiRpcProcess.spawn({
@@ -398,7 +431,7 @@ test('PiRpcProcess.spawn reports the child to its owner before resolving', { ski
 
 test('PiRpcProcess.spawn disposes the child when its ownership hook throws', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
-  const stub = makePiStub('pi-onprocess-throws', '0.80.6')
+  const stub = makePiStub('pi-onprocess-throws', '1.1.1')
   const reported: PiRpcProcess[] = []
 
   await assert.rejects(

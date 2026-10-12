@@ -12,10 +12,10 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
   let launchMode = ''
   let stopAttempts = 0
   let unrelated = false
+  let noticeSent = false
   let reportLaunching: ((id: string) => void) | undefined
   let reportRetry: ((code: string) => void) | undefined
   let completion: ReturnType<typeof setTimeout> | undefined
-  let delivery: ReturnType<typeof setTimeout> | undefined
   let currentRun = ''
   let reportStop: ((id: string) => void) | undefined
   let reportTerminal: ((id: string) => void) | undefined
@@ -56,6 +56,8 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
           asyncSnapshot: {
             kind: 'pi-subagents.async-status-snapshot',
             version: 1,
+            caps: { maxStringLength: 1000 },
+            omitted: { runs: 0, children: 0, byteLimitExceeded: false },
             runs: [{ id: currentRun, state: runState }, ...(unrelated ? [{ id: 'unrelated', state: 'running' }] : [])]
           }
         }
@@ -82,7 +84,6 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       return
     }
     clearTimeout(completion)
-    clearTimeout(delivery)
     runState = 'stopped'
     active = false
     reportStop?.(currentRun)
@@ -103,6 +104,7 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       currentRun = crypto.randomUUID()
       runState = launchMode === 'queued' ? 'queued' : 'running'
       stopAttempts = 0
+      noticeSent = false
       unrelated = launchMode === 'queued'
       if (launchMode === 'late') {
         reportLaunching?.(currentRun)
@@ -116,19 +118,6 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
           // A terminal child may still have a batched completion awaiting delivery.
           runState = 'complete'
           reportTerminal?.(currentRun)
-          delivery = setInterval(() => {
-            try {
-              if (readFileSync(deliveryGate, 'utf8') !== currentRun) return
-            } catch {
-              return
-            }
-            clearInterval(delivery)
-            pi.sendMessage(
-              { customType: 'subagent-notify', content: 'ASYNC_COMPLETION', display: true },
-              { triggerTurn: true }
-            )
-            active = false
-          }, 10)
         }, 500)
       return {
         content: [{ type: 'text', text: 'Async work scheduled' }],
@@ -153,6 +142,27 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
     ],
     streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream()
+      // Deliver the structured notice mid-stream: pi's steer path is the only
+      // custom-message route that emits the message_start the adapter consumes.
+      if (active && currentRun && !noticeSent) {
+        try {
+          if (readFileSync(deliveryGate, 'utf8') === currentRun) {
+            noticeSent = true
+            active = false
+            pi.sendMessage(
+              {
+                customType: 'subagent-notify',
+                content: 'ASYNC_COMPLETION',
+                display: true,
+                details: { runs: [{ runId: currentRun, status: 'complete' }] }
+              },
+              { triggerTurn: true }
+            )
+          }
+        } catch {
+          /* Delivery gate not written yet. */
+        }
+      }
       const message = {
         role: 'assistant' as const,
         content: [{ type: 'text' as const, text: 'HARNESS_RESPONSE' }],
@@ -321,10 +331,17 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       pi.sendMessage({ customType: 'eval-race', content: 'RACE_AUTONOMOUS', display: true }, { triggerTurn: true })
     }
   })
-  pi.on('before_agent_start', event => {
+  pi.on('before_agent_start', (event, ctx) => {
     launchMode = event.prompt.includes('async late') ? 'late' : event.prompt.includes('async queued') ? 'queued' : ''
     if (event.prompt.includes('native queue'))
       setTimeout(() => pi.sendUserMessage('NATIVE_QUEUED', { deliverAs: 'followUp' }), 10)
+    ctx.ui.setStatus(
+      'eval-system-prompt',
+      JSON.stringify({
+        sentinel: event.systemPrompt?.includes('ZED_HARNESS_APPEND_SYSTEM_SENTINEL') ?? false,
+        policy: event.systemPrompt?.includes('ACP completion policy (pi-acp)') ?? false
+      })
+    )
   })
   pi.on('session_before_compact', async (_event, ctx) => {
     await ctx.ui.confirm('Compaction gate', 'Compact?')
@@ -332,6 +349,5 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
   })
   pi.on('session_shutdown', () => {
     clearTimeout(completion)
-    clearTimeout(delivery)
   })
 }

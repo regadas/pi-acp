@@ -766,11 +766,15 @@ for (const finish of [true, false]) {
           if (final) {
             mock.stdout.write(controlWidget('cancelled'))
             reply()
-          } else
-            setTimeout(() => {
+          } else {
+            const stopping = () => {
               mock.stdout.write(controlWidget('stopping'))
               reply()
-            }, 8500)
+            }
+            // Only the first (pre-abort) cancel is slow; the rest share what remains of the deadline.
+            if (commands.filter(c => c.type === 'prompt').length === 1) setTimeout(stopping, 8500)
+            else stopping()
+          }
         }
       } else reply()
     })
@@ -787,7 +791,9 @@ for (const finish of [true, false]) {
     assert.equal(mock.killed, !finish)
     assert.deepEqual(
       commands.map(c => c.type),
-      finish ? ['clear_queue', 'abort', 'prompt', 'clear_queue', 'abort', 'prompt'] : ['clear_queue', 'abort', 'prompt']
+      finish
+        ? ['clear_queue', 'prompt', 'abort', 'prompt', 'clear_queue', 'abort', 'prompt']
+        : ['clear_queue', 'prompt']
     )
     assert.equal(proc.hasPendingRequests(), false)
     mock.emit('close', 0, null)
@@ -869,7 +875,7 @@ test('PiRpcProcess: last-stop synthesis is reconciled after native abort before 
       stops++
       quiescent = false // Each stop can enqueue/start synthesis.
       mock.stdout.write(controlWidget('stopping'))
-    } else if (phase === 'abort' && stops === 2) quiescent = true
+    } else if (phase === 'abort' && stops === 3) quiescent = true
     else if (phase === 'check') {
       assert.equal(phases.at(-2), 'abort')
       mock.stdout.write(controlWidget(quiescent ? 'cancelled' : 'pending'))
@@ -885,6 +891,7 @@ test('PiRpcProcess: last-stop synthesis is reconciled after native abort before 
   await cancellation
   assert.deepEqual(phases, [
     'clear_queue',
+    'cancel',
     'abort',
     'cancel',
     'clear_queue',
@@ -943,7 +950,8 @@ for (const boundary of ['clear_queue', 'abort']) {
       release()
       await Promise.all([initial, upgraded])
       await tick()
-      assert.equal(commands.filter(c => c.type === 'prompt').length, 2)
+      // An owner known before native abort also wakes an awaited settlement boundary first.
+      assert.equal(commands.filter(c => c.type === 'prompt').length, boundary === 'clear_queue' ? 3 : 2)
       assert.equal(mock.killed, close)
       mock.emit('close', 0, null)
     })
@@ -1116,4 +1124,41 @@ test('PiRpcProcess: live admission timer pauses and resumes only its remaining i
   const error = await stage
   assert.ok(error instanceof PiRpcRequestTimeoutError)
   assert.equal(proc.hasPendingRequests(), false)
+})
+
+test('PiRpcProcess: owner cancel control releases an awaited settlement boundary before native abort', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'] })
+  const mock = new MockChild()
+  const proc = PiRpcProcess.fromChild(asChild(mock))
+  const phases: string[] = []
+  let boundaryReleased = false
+  let heldAbort: (() => void) | undefined
+  mock.stdin.on('data', chunk => {
+    const command = JSON.parse(String(chunk))
+    const phase = command.message?.split(' ')[1] ?? command.type
+    phases.push(phase)
+    const reply = () =>
+      mock.stdout.write(
+        JSON.stringify({ type: 'response', id: command.id, command: command.type, success: true }) + '\n'
+      )
+    if (phase === 'abort' && !boundaryReleased) {
+      // Pi's native abort awaits agent_before_settle, which cannot observe abort itself.
+      heldAbort = reply
+      return
+    }
+    if (phase === 'cancel') {
+      boundaryReleased = true
+      heldAbort?.()
+      mock.stdout.write(controlWidget('stopping'))
+    }
+    if (phase === 'check') mock.stdout.write(controlWidget('cancelled'))
+    reply()
+  })
+  const cancellation = proc.abort(lifecycleOwner)
+  for (let i = 0; i < 20; i++) await tick()
+  t.mock.timers.tick(10_000)
+  await cancellation
+  assert.equal(mock.killed, false, 'the bounded abort must not quarantine a healthy boundary')
+  assert.deepEqual(phases.slice(0, 3), ['clear_queue', 'cancel', 'abort'])
+  assert.equal(phases.at(-1), 'check')
 })

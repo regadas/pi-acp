@@ -354,7 +354,7 @@ export class PiRpcProcess {
 
     // Fail closed on unsupported/unknown pi versions before spawning the RPC
     // subprocess (see MIN_PI_VERSION): the ACP prompt lifecycle depends on
-    // pi's `agent_settled` event. Launch failures return null here and are
+    // pi's settlement boundaries. Launch failures return null here and are
     // surfaced by the detailed spawn error handling below instead.
     try {
       await assertSupportedPiVersion(cmd, params.cwd, params.signal)
@@ -787,6 +787,9 @@ export class PiRpcProcess {
   private async runAbort(deadline: number): Promise<void> {
     const remaining = () => Math.max(1, deadline - Date.now())
     await this.call({ type: 'clear_queue' }, remaining())
+    // Native abort awaits agent_before_settle, where the owned-completion barrier
+    // has no abort signal; the owner's cancel control wakes it first.
+    if (this.abortOwner) await this.control('cancel', this.abortOwner, remaining(), deadline)
     // Native abort is the tool_result barrier. Read the owner afterward so close
     // or cancellation can upgrade an already-running ownerless transaction.
     await this.call({ type: 'abort' }, remaining())

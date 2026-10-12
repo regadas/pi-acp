@@ -78,7 +78,8 @@ function harness(options: { restoredChild?: boolean; foreignQueueRace?: boolean;
       },
       registerCommand: (_name, command) => {
         companionCommand = command.handler
-      }
+      },
+      registerTool: () => {}
     })
     const registry = globals[registryKey] as {
       register(provider: { name: string; sessionId: string; isActive(): boolean }): () => void

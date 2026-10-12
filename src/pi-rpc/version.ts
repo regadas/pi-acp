@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process'
 import { buildPiInvocation } from './command.js'
 
-/** agent_settled is the lifecycle floor; newer commands use explicit fallbacks. */
-export const MIN_PI_VERSION = '0.80.4'
+/** Owned ACP completion needs awaited agent_before_settle boundaries and rendered-prompt hooks. */
+export const MIN_PI_VERSION = '1.1.0'
+const MIN_PI_REASON = 'awaited `agent_before_settle` boundaries and rendered system-prompt hooks'
 
 export const PI_FEATURE_MIN_VERSION = {
   agentSettled: '0.80.4',
@@ -90,7 +91,7 @@ export function clearPiVersionCacheForTests(): void {
 function versionFailure(command: string, cwd: string, detail: string): PiVersionError {
   return new PiVersionError(
     `Could not determine the pi version: \`${command} --version\` ${detail} from ${cwd}. ` +
-      `pi-acp requires pi >= ${MIN_PI_VERSION} (for the \`agent_settled\` RPC event).`
+      `pi-acp requires pi >= ${MIN_PI_VERSION} (for ${MIN_PI_REASON}).`
   )
 }
 
@@ -171,8 +172,8 @@ function startVersionProbe(piCommand: string, cwd: string): VersionProbe {
       if (comparePiVersions(version, MIN_PI_VERSION) < 0) {
         settle({
           error: new PiVersionError(
-            `Unsupported pi version ${version} (command: ${piCommand}). pi-acp requires pi >= ${MIN_PI_VERSION}, ` +
-              'which adds the `agent_settled` RPC event used to close ACP prompt turns safely.'
+            `Unsupported pi version ${version} (command: ${piCommand}). pi-acp requires pi >= ${MIN_PI_VERSION} ` +
+              `for ${MIN_PI_REASON} used to keep ACP prompt turns open through owned async work.`
           )
         })
         return
