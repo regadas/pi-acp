@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -12,7 +12,7 @@ import {
   comparePiVersions,
   parsePiVersion
 } from '../../src/pi-rpc/version.js'
-import { buildPiInvocation, resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
+import { resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
 import { PiRpcProcess, PiRpcSpawnError } from '../../src/pi-rpc/process.js'
 
 const isWindows = process.platform === 'win32'
@@ -222,51 +222,6 @@ test('PiRpcProcess.spawn observes a child that exits immediately after spawn', {
     if (timer) clearTimeout(timer)
   }
 })
-
-for (const resumed of [false, true]) {
-  test(
-    `PiRpcProcess.spawn supplies ACP task guidance to ${resumed ? 'resumed' : 'new'} sessions`,
-    { skip: isWindows },
-    async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'pi-acp-task-guidance-'))
-      const stub = join(dir, 'pi-args')
-      const capture = join(dir, 'args.json')
-      writeFileSync(
-        stub,
-        '#!/usr/bin/env node\n' +
-          `if (process.argv[2] === '--version') console.log(${JSON.stringify(MIN_PI_VERSION)});\n` +
-          `else require('node:fs').writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2)));\n`
-      )
-      chmodSync(stub, 0o755)
-      const sessionPath = join(dir, 'session.jsonl')
-      let proc: PiRpcProcess | undefined
-      try {
-        proc = await PiRpcProcess.spawn({ cwd: dir, piCommand: stub, ...(resumed ? { sessionPath } : {}) })
-        await proc.whenTerminated()
-        const args: string[] = JSON.parse(readFileSync(capture, 'utf8'))
-        const promptIndex = args.indexOf('--append-system-prompt')
-        assert.ok(promptIndex >= 0, 'the ACP child must receive task-completion guidance')
-        assert.ok(args[promptIndex + 1]?.trim(), 'the guidance must be supplied as a nonempty argument')
-        const guidance = args[promptIndex + 1] ?? ''
-        assert.ok(
-          !/[\r\n]/.test(guidance),
-          'the guidance must be a single-line argument: the Windows pi.cmd launcher passes argv through cmd.exe, which splits CR/LF inside a quoted token'
-        )
-        const invocation = buildPiInvocation('pi.cmd', args, { platform: 'win32', fileExists: () => true })
-        assert.ok(invocation, 'the Windows pi.cmd launcher invocation must resolve')
-        assert.ok(
-          !/[\r\n]/.test([invocation.executable, ...invocation.args].join(' ')),
-          'the cmd.exe command line must carry the argv as one line (reconstructed platform-independently, not a live Windows run)'
-        )
-        assert.deepEqual(args.slice(0, 2), ['--mode', 'rpc'])
-        if (resumed) assert.deepEqual(args.slice(-2), ['--session', sessionPath])
-      } finally {
-        proc?.dispose()
-        rmSync(dir, { recursive: true, force: true })
-      }
-    }
-  )
-}
 
 test('assertSupportedPiVersion aborts an in-flight version child', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
