@@ -24,6 +24,7 @@ Use `@agentclientprotocol/sdk`:
 
 ## Implementation constraints / decisions
 
+- Prefer Bun portably when available: the `src/index.ts` entry replaces its process with `bun` via `execve` (same PID, stdio and signal handling; a once-guard env marker stops Node-backed `bun` shim loops and is scrubbed before `src/main.ts` loads so child processes never inherit it) and keeps the Node shebang and Windows launchers unchanged, and default direct-JS `pi` installs (recognized Node/Bun shebang entries) launch via Bun through `buildPiInvocation`; explicit `PI_ACP_PI_COMMAND` overrides stay verbatim. Version probing and spawning share the same invocation resolution.
 - Do **not** implement ACP client-side FS/terminal delegation in MVP. Pi already reads/writes and executes locally.
 - Reject non-empty `mcpServers` explicitly on session/new, session/load, and session/resume (pi has no MCP support); empty lists are accepted.
 - Stream all pi assistant output as ACP `agent_message_chunk` initially.

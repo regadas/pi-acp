@@ -102,11 +102,11 @@ function abortReason(signal: AbortSignal): unknown {
   return error
 }
 
-function startVersionProbe(piCommand: string, cwd: string): VersionProbe {
+function startVersionProbe(piCommand: string, cwd: string, defaultCommand = false): VersionProbe {
   const controller = new AbortController()
   const signal = controller.signal
   const promise = new Promise<string | null>((resolve, reject) => {
-    const invocation = buildPiInvocation(piCommand, ['--version'], { cwd })
+    const invocation = buildPiInvocation(piCommand, ['--version'], { cwd, defaultCommand })
     if (!invocation) return resolve(null)
 
     let stdout = ''
@@ -264,13 +264,16 @@ function consumeVersionProbe(probe: VersionProbe, signal?: AbortSignal): Promise
 export function assertSupportedPiVersion(
   piCommand: string,
   cwd = process.cwd(),
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  defaultCommand = false
 ): Promise<string | null> {
   if (signal?.aborted) return Promise.reject(abortReason(signal))
-  const cacheKey = JSON.stringify([piCommand, cwd])
+  // defaultCommand is part of the cache identity: the same command resolves
+  // to a different runtime (Bun-preferred default vs verbatim override).
+  const cacheKey = JSON.stringify([piCommand, cwd, defaultCommand])
   let probe = versionCache.get(cacheKey)
   if (!probe || probe.aborting) {
-    probe = startVersionProbe(piCommand, cwd)
+    probe = startVersionProbe(piCommand, cwd, defaultCommand)
     versionCache.set(cacheKey, probe)
     void probe.promise.then(
       version => {

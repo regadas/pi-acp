@@ -1,8 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   MIN_PI_VERSION,
   PI_FEATURE_MIN_VERSION,
@@ -12,10 +12,12 @@ import {
   comparePiVersions,
   parsePiVersion
 } from '../../src/pi-rpc/version.js'
-import { resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
+import { findExecutableOnPath, resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
 import { PiRpcProcess, PiRpcSpawnError } from '../../src/pi-rpc/process.js'
 
 const isWindows = process.platform === 'win32'
+const hostBun = isWindows ? null : findExecutableOnPath('bun')
+const bunDir = hostBun ? dirname(hostBun) : ''
 
 test('supported Pi floor is 1.1.0 and covers every historical feature floor', () => {
   assert.equal(MIN_PI_VERSION, '1.1.0')
@@ -449,3 +451,209 @@ test('PiRpcProcess.spawn disposes the child when its ownership hook throws', { s
   // Failing closed: the child is torn down rather than left running unowned.
   await reported[0]!.whenTerminated()
 })
+
+/** npm-style `pi` symlink to a JavaScript entry, printing its runtime's marker version. */
+function makeJsPiStub(dir: string, bunVersion: string, nodeVersion: string): void {
+  const cli = join(dir, 'cli.mjs')
+  writeFileSync(
+    cli,
+    '#!/usr/bin/env node\n' +
+      `if (process.argv.includes('--version')) console.log(process.versions.bun ? ${JSON.stringify(bunVersion)} : ${JSON.stringify(nodeVersion)})\n` +
+      'else process.exit(0)\n',
+    'utf-8'
+  )
+  chmodSync(cli, 0o755)
+  symlinkSync(cli, join(dir, 'pi'))
+}
+
+/**
+ * A PATH entry holding only `node` (as a symlink), so shebang-based probes
+ * stay hermetic even when the host keeps Node and Bun in one bin directory.
+ */
+function makeNodeOnlyPath(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-node-only-'))
+  symlinkSync(process.execPath, join(dir, 'node'))
+  return dir
+}
+
+function withPath<T>(entries: readonly string[], run: () => Promise<T>): Promise<T> {
+  const previousPath = process.env.PATH
+  process.env.PATH = entries.join(':')
+  return run().finally(() => {
+    if (previousPath === undefined) delete process.env.PATH
+    else process.env.PATH = previousPath
+    clearPiVersionCacheForTests()
+  })
+}
+
+test('assertSupportedPiVersion probes a default JavaScript Pi install through Bun', { skip: !hostBun }, async () => {
+  clearPiVersionCacheForTests()
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-bun-probe-'))
+  const nodeDir = makeNodeOnlyPath()
+  try {
+    makeJsPiStub(dir, '1.1.1', '1.1.2')
+
+    // The fixture comes first so a real `pi` in Bun's bin dir cannot shadow it.
+    await withPath([dir, bunDir, nodeDir], async () => {
+      assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.1')
+    })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(nodeDir, { recursive: true, force: true })
+  }
+})
+
+test(
+  'assertSupportedPiVersion probes a JavaScript Pi install through its Node shebang without Bun',
+  {
+    skip: isWindows
+  },
+  async () => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-node-probe-'))
+    const nodeDir = makeNodeOnlyPath()
+    try {
+      makeJsPiStub(dir, '1.1.1', '1.1.2')
+
+      await withPath([dir, nodeDir], async () => {
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.2')
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(nodeDir, { recursive: true, force: true })
+    }
+  }
+)
+
+test(
+  'assertSupportedPiVersion preserves explicit command overrides even with Bun installed',
+  {
+    skip: !hostBun
+  },
+  async () => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-bun-override-'))
+    const nodeDir = makeNodeOnlyPath()
+    try {
+      const cli = join(dir, 'cli.mjs')
+      makeJsPiStub(dir, '1.1.1', '1.1.2')
+
+      await withPath([nodeDir, bunDir], async () => {
+        assert.equal(await assertSupportedPiVersion(cli), '1.1.2')
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(nodeDir, { recursive: true, force: true })
+    }
+  }
+)
+
+test(
+  'assertSupportedPiVersion caches default and override probes separately',
+  {
+    skip: !hostBun
+  },
+  async () => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-bun-cache-'))
+    const nodeDir = makeNodeOnlyPath()
+    try {
+      makeJsPiStub(dir, '1.1.1', '1.1.2')
+
+      await withPath([dir, bunDir, nodeDir], async () => {
+        // Both call orders share one cache: the probes must stay
+        // runtime-separated instead of the first result winning.
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, false), '1.1.2')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.1')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, false), '1.1.2')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.1')
+      })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(nodeDir, { recursive: true, force: true })
+    }
+  }
+)
+
+test(
+  'PiRpcProcess.spawn keeps an explicit bare `pi` override on its own runtime even with Bun on PATH',
+  {
+    skip: isWindows
+  },
+  async () => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-bun-bare-override-'))
+    const nodeDir = makeNodeOnlyPath()
+    const captured = join(dir, 'argv.json')
+    const cli = join(dir, 'cli.mjs')
+    writeFileSync(
+      cli,
+      '#!/usr/bin/env node\n' +
+        `import { writeFileSync } from 'node:fs'\n` +
+        `if (process.argv.includes('--version')) console.log(process.versions.bun ? '1.1.1' : '1.1.2')\n` +
+        `else writeFileSync(${JSON.stringify(captured)}, JSON.stringify({ argv: process.argv.slice(2), runtime: process.versions.bun ?? 'node' }))\n`,
+      'utf-8'
+    )
+    chmodSync(cli, 0o755)
+    symlinkSync(cli, join(dir, 'pi'))
+    // A `bun` on PATH proves the override stays verbatim instead of rerouting;
+    // the fake bun records nothing, so a wrongful reroute fails the capture.
+    writeFileSync(join(dir, 'bun'), '#!/bin/sh\nexit 0\n', 'utf-8')
+    chmodSync(join(dir, 'bun'), 0o755)
+
+    let proc: PiRpcProcess | undefined
+    try {
+      proc = await withPath([dir, nodeDir], () => PiRpcProcess.spawn({ cwd: dir, piCommand: 'pi' }))
+      await proc.whenTerminated()
+      const capture = JSON.parse(readFileSync(captured, 'utf8')) as { argv: string[]; runtime: string }
+      assert.equal(capture.runtime, 'node', 'an explicit bare `pi` override must not reroute to Bun')
+      assert.deepEqual(capture.argv.slice(0, 4), ['--mode', 'rpc', '--no-themes', '--extension'])
+    } finally {
+      proc?.dispose()
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(nodeDir, { recursive: true, force: true })
+    }
+  }
+)
+
+test(
+  'PiRpcProcess.spawn passes adapter args to a default JavaScript Pi install under Bun',
+  {
+    skip: !hostBun
+  },
+  async () => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-bun-spawn-'))
+    const nodeDir = makeNodeOnlyPath()
+    const captured = join(dir, 'argv.json')
+    const cli = join(dir, 'cli.mjs')
+    writeFileSync(
+      cli,
+      '#!/usr/bin/env node\n' +
+        `import { writeFileSync } from 'node:fs'\n` +
+        `if (process.argv.includes('--version')) console.log(process.versions.bun ? '1.1.1' : '1.1.2')\n` +
+        `else writeFileSync(${JSON.stringify(captured)}, JSON.stringify({ argv: process.argv.slice(2), runtime: process.versions.bun ?? 'node' }))\n`,
+      'utf-8'
+    )
+    chmodSync(cli, 0o755)
+    symlinkSync(cli, join(dir, 'pi'))
+
+    let proc: PiRpcProcess | undefined
+    try {
+      proc = await withPath([dir, bunDir, nodeDir], () => PiRpcProcess.spawn({ cwd: dir }))
+      await proc.whenTerminated()
+      const capture = JSON.parse(readFileSync(captured, 'utf8')) as { argv: string[]; runtime: string }
+      assert.match(capture.runtime, /\d/, 'the RPC child must actually run under Bun')
+      assert.deepEqual(capture.argv.slice(0, 4), ['--mode', 'rpc', '--no-themes', '--extension'])
+      assert.match(
+        capture.argv[4] ?? '',
+        /acp-extension\.(ts|js)$/,
+        'adapter args reach the Bun-launched entry unchanged'
+      )
+    } finally {
+      proc?.dispose()
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(nodeDir, { recursive: true, force: true })
+    }
+  }
+)

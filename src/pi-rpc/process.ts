@@ -351,13 +351,16 @@ export class PiRpcProcess {
   static async spawn(params: SpawnParams): Promise<PiRpcProcess> {
     // On Windows, npm commonly creates pi.cmd / pi.bat launcher scripts.
     const cmd = getPiCommand(params.piCommand)
+    // Default discovery (no PI_ACP_PI_COMMAND override) lets direct-JS Pi
+    // installs run under Bun; overrides always launch exactly as configured.
+    const defaultCommand = params.piCommand === undefined
 
     // Fail closed on unsupported/unknown pi versions before spawning the RPC
     // subprocess (see MIN_PI_VERSION): the ACP prompt lifecycle depends on
     // pi's settlement boundaries. Launch failures return null here and are
     // surfaced by the detailed spawn error handling below instead.
     try {
-      await assertSupportedPiVersion(cmd, params.cwd, params.signal)
+      await assertSupportedPiVersion(cmd, params.cwd, params.signal, defaultCommand)
     } catch (e) {
       if (e instanceof PiVersionError) {
         throw new PiRpcSpawnError(e.message, { code: 'UNSUPPORTED_PI_VERSION', cause: e })
@@ -397,7 +400,7 @@ export class PiRpcProcess {
       }
     }
 
-    const invocation = buildPiInvocation(cmd, args, { cwd: params.cwd })
+    const invocation = buildPiInvocation(cmd, args, { cwd: params.cwd, defaultCommand })
     if (!invocation) {
       cleanupEmptySession()
       throw piExecutableNotFoundError(cmd)

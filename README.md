@@ -51,6 +51,7 @@ npm install -g @earendil-works/pi-coding-agent
 ```
 
 - Node.js >= 22.19.0
+- Optional: `bun` on your `PATH`. When it is available, the adapter replaces its Node process in place with `execve` (the client keeps the PID, stdio and signal handling it launched), and default direct-JavaScript `pi` installs (npm symlinks to a Node- or Bun-shebang `.js` entry) also run under Bun. It stays on Node when `bun` is missing or `process.execve` is unavailable; an `execve` failure itself (e.g. an unusable `bun` binary) aborts the launch instead of falling back to Node, and a `bun` that starts but crashes is not retried on Node. Explicit `PI_ACP_PI_COMMAND` overrides, shell launchers (including the managed `~/.pi/agent/bin/pi`), standalone binaries, interpreter-flag or unrecognized shebang entries, and Windows always launch unchanged
 - pi >= 1.1.0 installed and available on your `PATH` (the adapter runs the `pi` executable). The async-subagent completion integration is tested only against Pi 1.1.0 with the `nicobailon/pi-subagents` git-main checkout at `29284cd943c0c7ee852593c6e02d2a60febf6ba4` (entry `./index.ts`); other pi-subagents versions are not claimed compatible. Completion notices without structured run IDs are rejected with an explicit error
 - Configure `pi` separately for your model providers/API keys
 

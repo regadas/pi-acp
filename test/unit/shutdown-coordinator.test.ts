@@ -4,7 +4,7 @@ import { createShutdownCoordinator } from '../../src/acp/shutdown.js'
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
 
-// The stdio entrypoint's shutdown seam. `src/index.ts` only wires this to
+// The stdio entrypoint's shutdown seam. `src/main.ts` only wires this to
 // process signals, so the behavior is exercised here instead of importing an
 // effectful entrypoint.
 

@@ -1,90 +1,48 @@
-import { ndJsonStream } from '@agentclientprotocol/sdk'
-import { createPiAcpAgentApp } from './acp/app.js'
-import type { PiAcpAgent } from './acp/agent.js'
-import { createShutdownCoordinator } from './acp/shutdown.js'
-import { buildPiInvocation, getPiCommand } from './pi-rpc/command.js'
-// Terminal Auth entrypoint. The ACP client launches the agent with `--terminal-login`.
-if (process.argv.includes('--terminal-login')) {
-  const { spawnSync } = await import('node:child_process')
-  const cmd = getPiCommand(process.env.PI_ACP_PI_COMMAND)
-  const invocation = buildPiInvocation(cmd, [], { cwd: process.cwd() })
-  if (!invocation) {
-    process.stderr.write(`pi-acp: could not start pi (command not found: ${cmd}).\n`)
-    process.exit(1)
-  }
-  const res = spawnSync(invocation.executable, invocation.args, {
-    stdio: 'inherit',
-    env: process.env,
-    shell: false,
-    windowsVerbatimArguments: invocation.windowsVerbatimArguments
-  })
+import { realpathSync } from 'node:fs'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { findExecutableOnPath } from './pi-rpc/command.js'
 
-  if ((res.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
-    process.stderr.write(
-      `pi-acp: could not start pi (command not found: ${cmd}). Install it via \`npm install -g @earendil-works/pi-coding-agent\` or ensure \`pi\` is on your PATH.\n`
+function isEntryModule(): boolean {
+  const entryArg = process.argv[1]
+  if (!entryArg) return false
+  try {
+    // Node resolves the ESM entry through symlinks while argv[1] keeps the
+    // invoked path (e.g. the npm bin link), so accept either form.
+    return (
+      import.meta.url === pathToFileURL(entryArg).href || import.meta.url === pathToFileURL(realpathSync(entryArg)).href
     )
-    process.exit(1)
+  } catch {
+    return false
   }
-
-  process.exit(typeof res.status === 'number' ? res.status : 1)
 }
 
-const input = new WritableStream<Uint8Array>({
-  write(chunk) {
-    return new Promise<void>(resolve => {
-      if (process.stdout.destroyed || !process.stdout.writable) return resolve()
-
-      try {
-        process.stdout.write(chunk, err => {
-          void err
-          resolve()
-        })
-      } catch {
-        // Common: ERR_STREAM_DESTROYED ("Cannot call write after a stream was destroyed").
-        resolve()
-      }
-    })
-  }
-})
-
-const output = new ReadableStream<Uint8Array>({
-  start(controller) {
-    process.stdin.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)))
-    process.stdin.on('end', () => controller.close())
-    process.stdin.on('error', err => controller.error(err))
-  }
-})
-
-const stream = ndJsonStream(input, output)
-
-// Covers the shared 10s cancellation deadline plus the 2s SIGTERM -> SIGKILL
-// grace, with 1s for shutdown bookkeeping.
-const SHUTDOWN_TERMINATION_TIMEOUT_MS = 13_000
-
-// Disposes session subprocesses, then gives them a bounded window to actually
-// terminate: exiting immediately would preempt the SIGTERM -> SIGKILL
-// escalation and orphan a pi child that ignores SIGTERM.
-const coordinator = createShutdownCoordinator<PiAcpAgent>({
-  timeoutMs: SHUTDOWN_TERMINATION_TIMEOUT_MS,
-  exit: () => {
+// The npm executable prefers Bun when available and otherwise stays on Node.
+// The re-exec replaces this process in place with execve, so the client keeps
+// its PID, stdio and signal handling: the Bun adapter receives SIGTERM/SIGINT
+// directly instead of the Node process dying under it. An execve(2) failure
+// (e.g. an unusable `bun` binary) aborts this process and cannot be caught, so
+// such a launch fails outright rather than falling back to Node. The
+// once-guard env marker stops a second pass through this entry (a `bun` that
+// is really a Node shim) from looping.
+// shortcut: Windows stays on Node (the Bun re-exec is unverified there); revisit once tested.
+const runningUnderBun = (process.versions as NodeJS.ProcessVersions & { bun?: string }).bun !== undefined
+if (!runningUnderBun && process.platform !== 'win32' && isEntryModule() && !process.env.PI_ACP_REEXEC) {
+  const bun = findExecutableOnPath('bun')
+  if (bun) {
     try {
-      process.exit(0)
+      process.execve?.(bun, [bun, fileURLToPath(import.meta.url), ...process.argv.slice(2)], {
+        ...process.env,
+        PI_ACP_REEXEC: '1'
+      })
     } catch {
-      // ignore
+      // Only JS-side throws (argument validation) land here; an execve(2)
+      // failure aborts the process instead of returning to this entry.
     }
   }
-})
+}
 
-createPiAcpAgentApp({ onAgent: agent => coordinator.trackAgent(agent) }).connect(stream)
+// Consume the once-marker before main loads so pi children and nested
+// adapters never inherit it (the shim's second pass above already used it).
+delete process.env.PI_ACP_REEXEC
 
-const shutdown = () => coordinator.shutdown()
-
-process.stdin.on('end', shutdown)
-process.stdin.on('close', shutdown)
-
-process.stdin.resume()
-process.on('SIGINT', shutdown)
-process.on('SIGTERM', shutdown)
-
-// Avoid crashing if the client closes stdout early.
-process.stdout.on('error', shutdown)
+await import('./main.js')

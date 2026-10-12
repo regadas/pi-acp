@@ -54,15 +54,23 @@ export function getAuthMethods(opts?: {
   return [method]
 }
 
-function terminalAuthLaunchSpec(): { command: string; args: string[] } {
-  // If we were launched as `node /path/to/dist/index.js`, reuse that.
-  // This also supports local development and custom client configurations.
-  const argv0 = process.argv[0] || 'node'
-  const argv1 = process.argv[1]
+/**
+ * The launch spec advertised via `_meta["terminal-auth"]`: reuse the actual
+ * runtime + entry launch (`node|bun /path/to/dist/index.js`), including after
+ * the entry re-exec'd itself under Bun. Anything else falls back to `pi-acp`
+ * on PATH.
+ */
+export function terminalAuthLaunchSpec(argv: readonly string[] = process.argv): { command: string; args: string[] } {
+  const argv0 = argv[0] || 'node'
+  const argv1 = argv[1]
   if (argv1 && argv0) {
-    const isNode = argv0.includes('node')
+    // Plain runtime binaries only (`node`, `nodejs`, `bun`, optionally
+    // version-suffixed like `node-22`): arbitrary names merely containing
+    // "node" (e.g. `envnode`) must not advertise themselves as the runtime.
+    const basename = argv0.split(/[\\/]/).pop() ?? argv0
+    const isRuntime = /^(node|nodejs|bun)([-.\d]*)?(\.exe)?$/i.test(basename)
     const isJs = argv1.endsWith('.js')
-    if (isNode && isJs) {
+    if (isRuntime && isJs) {
       return { command: argv0, args: [argv1, '--terminal-login'] }
     }
   }
