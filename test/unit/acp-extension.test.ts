@@ -65,16 +65,14 @@ function harness() {
 }
 const owner = '11111111-1111-4111-8111-111111111111'
 
-test('before_agent_start supplements the rendered prompt once without dropping resources', t => {
+test('before_agent_start leaves the rendered system prompt unchanged; acp_detach stays exposed', t => {
   const h = harness()
   t.after(() => h.emit('session_shutdown'))
   const rendered = 'Base prompt\n\nGLOBAL_APPEND_SENTINEL\n\nProject context'
   const result = h.emit('before_agent_start', { prompt: 'question', systemPrompt: rendered })
-  assert.ok(result.systemPrompt.startsWith(rendered), 'rendered resources and earlier hook changes are preserved')
-  assert.ok(result.systemPrompt.includes('acp_detach'))
-  const again = h.emit('before_agent_start', { prompt: 'question', systemPrompt: result.systemPrompt })
-  assert.equal(again?.systemPrompt, undefined, 'an already supplemented prompt is not appended again')
+  assert.equal(result?.systemPrompt, undefined, 'no replacement system prompt is returned')
   assert.equal(h.tools.get('acp_detach')?.parameters.required[0], 'runIds')
+  assert.match(h.tools.get('acp_detach')!.description, /explicitly asked for background or fire-and-forget/)
 })
 
 for (const residual of ['pending-delivery', 'last-stop-synthesis', 'nested-descendant']) {

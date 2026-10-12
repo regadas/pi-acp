@@ -241,11 +241,14 @@ try {
       assert.ok(
         systemRows.every(row => {
           const observed = JSON.parse(row.statusText)
-          return observed.sentinel && observed.policy
+          return observed.sentinel && !observed.policy
         }),
-        'the discovered APPEND_SYSTEM.md sentinel and the adapter completion policy must reach every model run'
+        'every model run keeps the discovered APPEND_SYSTEM.md sentinel and carries no adapter system-prompt appendix'
       )
-      check('discovered APPEND_SYSTEM.md sentinel and adapter completion policy reach every model run', true)
+      check(
+        'discovered APPEND_SYSTEM.md sentinel retained and no adapter system-prompt appendix on every model run',
+        true
+      )
       const busyIdentity = JSON.parse((await trace()).findLast(e => e.statusKey === 'eval-session').statusText)
       const busyStart = (await trace()).length
       assert.equal((await prompt('/eval-hold-autonomous')).stopReason, 'end_turn')

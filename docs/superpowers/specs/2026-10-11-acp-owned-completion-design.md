@@ -6,6 +6,12 @@ Keep an ACP end-to-end task busy while its required async work is outstanding, t
 
 This is one adapter lifecycle change, not a general task framework or an ACP protocol extension. Model interpretation still selects user intent and the final answer; the adapter enforces the lifetime of observed required work.
 
+## Post-publication prompt amendment (2026-10-12)
+
+After publishing the separate revert `ec97c418` and implementation `7526f148`, the user approved removing the system-prompt appendix in one additional commit/push and Nix pin/build. This supersedes the earlier requirement that adapter policy reach the provider. Do not append or replace system-prompt content through the extension, CLI flags, tool prompt snippets/guidelines, or a substitute resource file. Preserve `before_agent_start` input/image correlation, discovered resources, required-work enforcement, detach descriptions and conversation waiting drafts. Real-model background-detach behavior without the appendix remains unmeasured.
+
+Update the unchanged-prompt unit assertion first and observe semantic RED, then remove only the constant and supplementation clause. Verify GREEN, native validation/smoke, focused new/resumed resource and lifecycle ordering checks, and fresh targeted review before publication. The parent retains approval/publication authority; no broader redesign, dependencies, upstream/host edits, backoff, weaker proof or activation.
+
 ## User-approved decisions
 
 - Implementation stays inside `pi-acp`; do not modify `pi-subagents`, Pi, Zed, Nix, or global configuration.
@@ -61,7 +67,7 @@ Expose `acp_detach` with parameters `{ runIds: string[] }`.
 - Remove only those roots and their associated obligations from completion and cancellation authority. Do not stop or interrupt them.
 - Reject previously detached or historical targets. Detach descendants only through their captured root, never an arbitrary child ID.
 - Unmentioned/new roots remain required. Ordinary explicit background requests should return promptly after this tool succeeds.
-- Supplementary model instructions explain that the tool is only for user-requested detachment. Calling it is the explicit operational signal; it is not proof that natural language was interpreted correctly.
+- The tool description explains that it is only for user-requested detachment. Calling it is the explicit operational signal; it is not proof that natural language was interpreted correctly.
 
 ## Cancellation and errors
 
@@ -73,7 +79,7 @@ Publish current-owner lifecycle errors through the existing widget/error path; t
 
 ## Prompt resources
 
-Remove adapter-generated `--append-system-prompt` from RPC argv. Append supplementary adapter instructions to the already-rendered `event.systemPrompt` in `before_agent_start`. Preserve user prompt resources, project trust decisions, other extensions' prompt changes, and new/resumed behavior without reimplementing Pi resource discovery.
+Remove adapter-generated `--append-system-prompt` from RPC argv. The original rendered-prompt appendix is superseded by the 2026-10-12 amendment: `before_agent_start` retains admission correlation but returns no replacement system prompt. Preserve user prompt resources, project trust decisions, other extensions' prompt changes, and new/resumed behavior without reimplementing Pi resource discovery.
 
 ## Compatibility and limits
 
@@ -96,7 +102,7 @@ Tests/callers: extension and version unit tests; background, native-admission, r
 - Mixed and foreign work: only required captured roots affect completion; cancellation never uses aggregate unrelated liveness as its predicate.
 - Fast completion, wake during boundary, partial deliveries, new roots from synthesis, final text preceding delivery, duplicate/stale notices, and queued supervisor work have correct ordering and no spin loop.
 - Terminal root/live descendant, malformed or omitted snapshots, missing metadata, runner failure, delivery deadline, owner/session replacement and cancel race do not become successful drain.
-- APPEND_SYSTEM content and adapter policy both reach a deterministic provider, including resumed sessions; argv does not suppress discovery.
+- APPEND_SYSTEM content reaches a deterministic provider, including resumed sessions; no adapter completion-policy text is injected and argv does not suppress discovery. The extension does not return a replacement system prompt.
 - Formatting, typecheck, lint, full tests, build, ACP smoke, and representative deterministic real-Pi eval pass on Pi `1.1.0`. Explicitly exercise a fast provider with a notice queued after a probe, partial deliveries while another root remains running, probe rate/count/deadline bounds, and genuine draft validation. Acquire fixture runtimes only in disposable temporary directories, without changing project dependencies or host configuration.
 - Fresh full-mode reviewers inspect actual changed source, with actual model/effort/family recorded. Parent accepts findings; one fix worker applies accepted scope and material fixes receive targeted re-review.
 

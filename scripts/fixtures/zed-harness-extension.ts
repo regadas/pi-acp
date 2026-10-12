@@ -339,6 +339,7 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       'eval-system-prompt',
       JSON.stringify({
         sentinel: event.systemPrompt?.includes('ZED_HARNESS_APPEND_SYSTEM_SENTINEL') ?? false,
+        // Marker of the removed adapter appendix; it must stay absent.
         policy: event.systemPrompt?.includes('ACP completion policy (pi-acp)') ?? false
       })
     )

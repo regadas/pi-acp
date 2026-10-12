@@ -99,12 +99,6 @@ const NOTICE = 'subagent-notify'
 const SUPERVISOR_REQUEST = 'subagent_supervisor_request'
 const SUPERVISOR_WAKE_EVENT = 'pi-intercom:detach-request'
 const WAITING_TYPE = 'pi-acp-completion-wait'
-export const ACP_COMPLETION_POLICY =
-  'ACP completion policy (pi-acp): this session serves an Agent Client Protocol client such as Zed, where ending the foreground request tells the user the task is finished. ' +
-  'Async subagent runs you launch or revive for the current request are required by default: the adapter keeps the request open until each run finishes, its completion notice reaches you, and you respond to it. ' +
-  'Keep delegated work asynchronous; no blocking wait tool is needed, and a brief waiting reply is fine when asked to wait. ' +
-  'Only when the user explicitly asks for background or fire-and-forget work, call acp_detach with the exact run IDs to release; detached runs keep running and this request neither waits for nor cancels them. ' +
-  'Never detach work that the requested result depends on.'
 
 function readSnapshot(status: Record<string, unknown>): Snapshot & { runs: SnapshotNode[] } {
   const snapshot = status.asyncSnapshot as Snapshot | undefined
@@ -630,9 +624,6 @@ export default function acpExtension(pi: Pi): void {
           ? { text: event.prompt, hasImages: Array.isArray(event.images) && event.images.length > 0 }
           : undefined
     }
-    // Supplement Pi's rendered prompt so user/project resources and earlier hooks survive.
-    if (typeof event.systemPrompt === 'string' && !event.systemPrompt.includes(ACP_COMPLETION_POLICY))
-      return { systemPrompt: `${event.systemPrompt}\n\n${ACP_COMPLETION_POLICY}` }
   })
   const unsubscribeWake = pi.events.on(SUPERVISOR_WAKE_EVENT, raw => {
     const wakeEvent = raw as { requestId?: unknown; runId?: unknown } | undefined

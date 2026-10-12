@@ -4,11 +4,21 @@
 
 **Goal:** Prevent ACP foreground completion while observed required async work or its delivery remains outstanding, while preserving explicit detachment.
 
-**Architecture:** Extend the existing adapter-owned Pi extension with a before-settlement barrier, exact required-root/delivery bookkeeping, and an `acp_detach` tool. Keep native `agent_settled` as the eventual ACP release signal. Add supplementary policy through Pi's rendered prompt rather than CLI append arguments.
+**Architecture:** Extend the existing adapter-owned Pi extension with a before-settlement barrier, exact required-root/delivery bookkeeping, and an `acp_detach` tool. Keep native `agent_settled` as the eventual ACP release signal. The post-publication amendment removes supplementary system-prompt policy while preserving the admission/correlation hook; older steps below record the superseded initial approach.
 
 **Tech Stack:** TypeScript, Node 22.19+, ACP SDK 1.4, public Pi extension APIs at 1.1.0+, existing optional subagents v1 status/notification surfaces, node:test, scripted local providers.
 
 **Spec:** `docs/superpowers/specs/2026-10-11-acp-owned-completion-design.md` (approved by the user).
+
+## Approved prompt-only follow-up (2026-10-12)
+
+The user approved one additional commit/push and Nix pin/build after the post-publication assessment. Remove only the system-prompt appendix; preserve the lifecycle barrier, `acp_detach` description, input/image correlation and discovered resources. Do not move guidance into CLI flags, tool prompt snippets/guidelines or a substitute resource. No new configuration, backoff, weaker validation, upstream/host changes or activation.
+
+- [ ] Capture clean published baseline; parent amends spec/plan, then captures the worker baseline with both parent documents protected.
+- [ ] One retained writer changes the prompt test first and proves semantic RED; removes the constant/supplement clause and updates related fixture/eval assertions and truthful README/audit documentation.
+- [ ] Narrow formatting, extension/unit GREEN, native validation/smoke; focused real-Pi new/resumed resource and lifecycle-ordering checks on final bytes. No unchanged cancel matrix repeat.
+- [ ] Fresh targeted reviewers verify the removal, correlation/resource preservation and evidence; parent accepts findings before one additional commit/push.
+- [ ] Parent updates/builds the Nix pin without activation. Report real-model detach and live Zed/Windows limitations honestly.
 
 ## Global Constraints
 

@@ -389,12 +389,17 @@ const scenarios = [
         probeCount: probeRows.length
       })
       const parentRows = (await records()).filter(row => row.event === 'provider' && row.marker === 'S_LATE')
-      assert.ok(parentRows.length > 0 && parentRows.every(row => row.systemSentinel && row.systemPolicy))
+      assert.ok(parentRows.length > 0 && parentRows.every(row => row.systemSentinel && !row.systemPolicy))
       const session = (await records()).find(row => row.event === 'session')
       assert.equal(session.cliAppend, false, 'no CLI append flag: the sentinel comes from discovered APPEND_SYSTEM.md')
-      check('S_LATE', 'discovered APPEND_SYSTEM.md content and adapter policy reach the provider', true, {
-        rows: parentRows.length
-      })
+      check(
+        'S_LATE',
+        'discovered APPEND_SYSTEM.md content reaches the provider; no adapter system-prompt appendix',
+        true,
+        {
+          rows: parentRows.length
+        }
+      )
     }
   },
   {
@@ -1130,8 +1135,8 @@ const scenarios = [
       const restoredRow = await providerRow('RESUMED_PLAIN')
       assert.equal((await restored).stopReason, 'end_turn')
       assert.ok(
-        restoredRow.systemSentinel && restoredRow.systemPolicy && resumedSession.cliAppend === false,
-        'resumed requests keep the discovered APPEND_SYSTEM.md content and policy'
+        restoredRow.systemSentinel && !restoredRow.systemPolicy && resumedSession.cliAppend === false,
+        'resumed requests keep the discovered APPEND_SYSTEM.md content with no adapter system-prompt appendix'
       )
       const stops = (await records()).filter(row => row.event === 'stop-reply')
       assert.equal(stops.length, 0, 'the restored prompt must not stop detached work')

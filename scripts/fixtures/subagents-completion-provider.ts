@@ -193,8 +193,12 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       ]
       const probe = last?.role === 'user' && lastText.includes(WAITING)
       const notice = last?.role === 'user' && !probe && /Parent action:/.test(lastText)
-      // normalizeContext folds the rendered system prompt into a leading system message.
-      const systemText = textOf(messages.find(message => message.role === 'system'))
+      // Pi 1.1 carries the rendered prompt as structured system-message sections; an extension-forced
+      // systemPrompt is text content instead. Record every system message and any context-level prompt.
+      const systemText = JSON.stringify([
+        (context as { systemPrompt?: unknown }).systemPrompt ?? null,
+        ...messages.filter(message => message.role === 'system')
+      ])
       const launch = (task: string, agent = 'eval-leaf') => ({
         type: 'toolCall',
         id: crypto.randomUUID(),
@@ -371,6 +375,7 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
         unanswered,
         noticeText: notice ? lastText.slice(0, 600) : undefined,
         systemSentinel: systemText.includes('GLOBAL_APPEND_SENTINEL') ?? false,
+        // Marker of the removed adapter appendix; it must stay absent.
         systemPolicy: systemText.includes('ACP completion policy (pi-acp)') ?? false,
         response: content.map(
           part =>
