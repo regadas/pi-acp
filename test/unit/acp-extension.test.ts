@@ -1521,8 +1521,8 @@ for (const shape of ['omitted-children', 'missing-accounting', 'preserved-latch'
   })
 }
 
-for (const shape of ['late-consumption', 'late-preview', 'timely-slow-synthesis']) {
-  test(`delivery window governs consumption, not synthesis: ${shape}`, async t => {
+for (const shape of ['held-expiry-consumption', 'slow-probe-turn', 'slow-preview', 'timely-slow-synthesis']) {
+  test(`ACP waiting window governs consumption, not synthesis: ${shape}`, async t => {
     timers(t)
     const h = harness()
     t.after(() => h.emit('session_shutdown'))
@@ -1530,17 +1530,38 @@ for (const shape of ['late-consumption', 'late-preview', 'timely-slow-synthesis'
     await foreground(h)
     launch(h, rootA)
     await flush()
-    if (shape === 'late-preview') {
+    if (shape === 'slow-preview') {
+      // Slow parent work outside the barrier; the notice queued meanwhile is previewed at entry.
       t.mock.timers.tick(31_000)
       await flush()
       const preview = boundary({ pendingMessages: [{ role: 'custom', customType: 'subagent-notify' }] })
-      assert.equal(await settle(h, preview), undefined, 'an expired notice in the preview is not a continuation')
-      assert.match(failures(h).at(-1)?.error ?? '', /30s/)
+      assert.deepEqual(await settle(h, preview), { continue: true }, 'outside time never expires a queued notice')
+      assert.deepEqual(failures(h), [])
+      notice(h, [rootA])
+      reply(h)
+      assert.deepEqual(await drive(t, settle(h), 1_000), { done: true, value: undefined })
+      assert.equal(h.updates.at(-1).state, 'idle')
       return
     }
     assert.ok(isProbe((await drive(t, settle(h), 100)).value))
+    if (shape === 'held-expiry-consumption') {
+      reply(h)
+      // Re-entry inside the probe interval waits in the barrier; all 31s pass inside this owner's wait.
+      const holding = settle(h)
+      await flush()
+      t.mock.timers.tick(31_000)
+      notice(h, [rootA])
+      reply(h)
+      assert.deepEqual(await drive(t, holding, 1_000), { done: true, value: undefined })
+      assert.match(
+        failures(h).at(-1)?.error ?? '',
+        new RegExp(`completion notice for required run ${rootA} was not consumed within 30s of ACP waiting`)
+      )
+      assert.notEqual(h.updates.at(-1).state, 'idle')
+      return
+    }
     // The probe's provider call is slow; the notice queues and is consumed only afterwards.
-    t.mock.timers.tick(shape === 'late-consumption' ? 31_000 : 5_000)
+    t.mock.timers.tick(shape === 'slow-probe-turn' ? 31_000 : 5_000)
     await flush()
     notice(h, [rootA])
     if (shape === 'timely-slow-synthesis') {
@@ -1552,13 +1573,161 @@ for (const shape of ['late-consumption', 'late-preview', 'timely-slow-synthesis'
     reply(h)
     const result = await drive(t, settle(h), 1_000)
     assert.deepEqual(result, { done: true, value: undefined })
-    if (shape === 'late-consumption') {
-      assert.match(failures(h).at(-1)?.error ?? '', /30s/)
-      assert.notEqual(h.updates.at(-1).state, 'idle')
-    } else {
-      assert.deepEqual(failures(h), [])
-      assert.equal(h.updates.at(-1).state, 'idle')
+    assert.deepEqual(failures(h), [])
+    assert.equal(h.updates.at(-1).state, 'idle')
+  })
+}
+
+// Pi drains queued native messages only after provider, tool and awaited-hook work returns;
+// only this owner's before-settle wait is metered as ACP waiting.
+const outside = async (t: any, ms: number) => {
+  t.mock.timers.tick(ms)
+  await flush()
+}
+for (const shape of ['provider', 'tool']) {
+  test(`slow initial parent ${shape} work over 30s is not ACP waiting; the later notice is delivery`, async t => {
+    timers(t)
+    const h = harness()
+    t.after(() => h.emit('session_shutdown'))
+    const status = host(h, [{ id: rootA, state: 'complete' }])
+    await foreground(h)
+    launch(h, rootA)
+    await flush()
+    if (shape === 'tool') h.emit('tool_call', { toolName: 'read', toolCallId: 'slow-read', input: { path: 'x' } })
+    await outside(t, 35_000)
+    if (shape === 'tool')
+      h.emit('tool_result', { toolName: 'read', toolCallId: 'slow-read', input: { path: 'x' }, isError: false })
+    notice(h, [rootA])
+    reply(h)
+    assert.deepEqual(await drive(t, settle(h), 1_000), { done: true, value: undefined })
+    assert.deepEqual(failures(h), [])
+    assert.equal(h.updates.at(-1).state, 'idle')
+    assert.deepEqual(status.stops, [])
+  })
+}
+
+test('a supervisor request queued during long parent work is consumed afterwards within its ACP waiting window', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [{ id: rootA, state: 'running' }])
+  await foreground(h)
+  launch(h, rootA)
+  await flush()
+  ask(h, 'req-long', rootA) // the wake arrives while the parent provider is still busy
+  await outside(t, 35_000)
+  answer(h, 'req-long', rootA)
+  reply(h)
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 3_000)).done, false, 'the answered child still holds')
+  assert.deepEqual(failures(h), [])
+  status.rows.get(rootA)!.state = 'complete'
+  assert.ok(isProbe((await drive(t, holding, 3_000)).value))
+  notice(h, [rootA])
+  reply(h)
+  assert.deepEqual(await drive(t, settle(h), 3_000), { done: true, value: undefined })
+  assert.deepEqual(failures(h), [])
+  assert.equal(h.updates.at(-1).state, 'idle')
+})
+
+test('ACP waiting accumulates across continuations; outside time neither spends nor refreshes it', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [{ id: rootA, state: 'complete' }])
+  await foreground(h)
+  launch(h, rootA)
+  await flush()
+  let probes = 0
+  let inside = 0
+  let last = 0
+  let final: any
+  for (let i = 0; i < 40; i++) {
+    const start = Date.now()
+    const result = await drive(t, settle(h), 40_000, 50)
+    last = Date.now() - start
+    inside += last
+    assert.equal(result.done, true)
+    if (!isProbe(result.value)) {
+      final = result
+      break
     }
+    probes++
+    if (probes === 20) assert.deepEqual(failures(h), [], 'no failure after well over 30s of wall time')
+    // Alternate slow probe provider turns (outside) with fast ones (the next entry waits for the cadence).
+    if (probes % 2) await outside(t, 10_000)
+    reply(h)
+  }
+  assert.equal(probes, 30, 'the probe count stays bounded')
+  assert.equal(final.value, undefined)
+  assert.ok(Date.now() >= 150_000, 'outside time passed without failing the owner')
+  assert.ok(inside >= 30_000 && inside < 31_500, `expiry after 30s of ACP waiting (${inside}ms)`)
+  assert.ok(last < 20_000, `spent waiting carried across continuations (${last}ms in the final wait)`)
+  assert.match(
+    failures(h).at(-1)?.error ?? '',
+    new RegExp(`completion notice for required run ${rootA} was not consumed within 30s of ACP waiting`)
+  )
+  assert.notEqual(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(status.stops, [])
+})
+
+for (const shape of ['delivered', 'missing', 'overlapping']) {
+  test(`a replaced owner's stale barrier cannot move the replacement's ACP waiting clock: ${shape}`, async t => {
+    timers(t)
+    const h = harness()
+    t.after(() => h.emit('session_shutdown'))
+    const status = host(h, [
+      { id: rootA, state: 'running' },
+      { id: rootB, state: 'complete' }
+    ])
+    await foreground(h)
+    launch(h, rootA)
+    await flush()
+    const stale = settle(h)
+    assert.equal((await drive(t, stale, 25_000, 1_000)).done, false, 'the first owner waits 25s in its barrier')
+    const next = '77777777-7777-4777-8777-777777777777'
+    let waiting: Promise<any> | undefined
+    if (shape === 'overlapping') {
+      // Synchronous replacement: its wait starts before the stale wait's finalizer runs.
+      void h.command(`begin ${next}`)
+      h.emit('input', { source: 'rpc', text: 'next work' })
+      h.emit('before_agent_start', { prompt: 'next work', systemPrompt: 'rendered' })
+      h.emit('agent_start')
+      h.emit('message_start', { message: { role: 'user', content: 'next work' } })
+      launch(h, rootB)
+      waiting = settle(h)
+    } else await foreground(h, next)
+    assert.deepEqual(await drive(t, stale, 100), { done: true, value: undefined })
+    if (!waiting) launch(h, rootB)
+    await flush()
+    if (shape === 'delivered') {
+      await outside(t, 35_000)
+      notice(h, [rootB])
+      reply(h)
+      assert.deepEqual(await drive(t, settle(h), 1_000), { done: true, value: undefined })
+      assert.deepEqual(failures(h), [])
+      assert.equal(h.updates.at(-1).owner, next)
+      assert.equal(h.updates.at(-1).state, 'idle')
+    } else {
+      let inside = 0
+      for (let i = 0; i < 40; i++) {
+        const start = Date.now()
+        const result = await drive(t, waiting ?? settle(h), 40_000, 50)
+        waiting = undefined
+        inside += Date.now() - start
+        if (!isProbe(result.value)) break
+        reply(h)
+      }
+      assert.ok(inside >= 30_000 && inside < 31_500, `the replacement gets its own full window (${inside}ms)`)
+      assert.match(failures(h).at(-1)?.error ?? '', new RegExp(`required run ${rootB} .*30s of ACP waiting`))
+      assert.equal(failures(h).at(-1)?.owner, next)
+    }
+    assert.equal(
+      h.updates.some(update => update.owner === owner && ['idle', 'failed'].includes(update.state)),
+      false,
+      'the stale owner gains no outcome'
+    )
+    assert.deepEqual(status.stops, [])
   })
 }
 
@@ -1754,6 +1923,39 @@ test('supervisor wake bounds: 30 attempts at 1 second cadence, then visible 30 s
   assert.deepEqual(status.stops, [])
 })
 
+test('a supervisor request opened after >30s of ACP waiting gets its own window from opening', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [{ id: rootA, state: 'running' }])
+  await foreground(h)
+  launch(h, rootA)
+  await flush()
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 35_000, 1_000)).done, false, 'the running root spends 35s in the barrier')
+  ask(h, 'req-late', rootA)
+  assert.ok(isProbe((await drive(t, holding, 1_000)).value), 'the late request is exactly attributed and probed')
+  answer(h, 'req-late', rootA)
+  reply(h)
+  const next = settle(h)
+  assert.equal((await drive(t, next, 2_000)).done, false, 'timely consumption; the running root still holds')
+  assert.deepEqual(failures(h), [])
+  ask(h, 'req-fresh', rootA)
+  let inside = 0
+  let pending: Promise<any> = next
+  for (let i = 0; i < 40; i++) {
+    const start = Date.now()
+    const result = await drive(t, pending, 40_000, 50)
+    inside += Date.now() - start
+    if (!isProbe(result.value)) break
+    reply(h)
+    pending = settle(h)
+  }
+  assert.ok(inside >= 30_000 && inside < 31_500, `an unanswered request gets a full window from opening (${inside}ms)`)
+  assert.match(failures(h).at(-1)?.error ?? '', /supervisor request req-fresh from required run .* 30s of ACP waiting/)
+  assert.deepEqual(status.stops, [])
+})
+
 test('supervisor and completion-delivery probes share one owner cadence', async t => {
   timers(t)
   const h = harness()
@@ -1824,7 +2026,7 @@ for (const shape of ['foreign', 'detached', 'stale-consumed', 'old-owner', 'canc
   })
 }
 
-test('supervisor attention from a proven descendant opens a window; late consumption fails visibly', async t => {
+test('supervisor attention from a proven descendant opens a window; consumption after 30s of ACP waiting fails visibly', async t => {
   timers(t)
   const h = harness()
   t.after(() => h.emit('session_shutdown'))
@@ -1841,12 +2043,39 @@ test('supervisor attention from a proven descendant opens a window; late consump
   assert.equal((await drive(t, holding, 2_000)).done, false)
   ask(h, 'req-d', 'child-run')
   assert.ok(isProbe((await drive(t, holding, 1_000)).value), 'descendant attention is owned through its root')
-  t.mock.timers.tick(31_000) // slow provider: the queued request is consumed after the window
+  reply(h)
+  // Re-entry inside the probe interval waits in the barrier; all 31s pass inside this owner's wait.
+  const waiting = settle(h)
   await flush()
+  t.mock.timers.tick(31_000)
   answer(h, 'req-d', 'child-run')
   reply(h)
-  assert.deepEqual(await drive(t, settle(h), 3_000), { done: true, value: undefined })
-  assert.match(failures(h).at(-1)?.error ?? '', /supervisor request req-d .*30s/)
+  assert.deepEqual(await drive(t, waiting, 3_000), { done: true, value: undefined })
+  assert.match(failures(h).at(-1)?.error ?? '', /supervisor request req-d .*30s of ACP waiting/)
+})
+
+test('a slow parent turn outside the barrier never expires a descendant supervisor request', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  host(h, [
+    { id: rootA, state: 'complete' },
+    { id: 'child-run', state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA)
+  await flush()
+  notice(h, [promoted(rootA, 'child-run')])
+  reply(h)
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false)
+  ask(h, 'req-d', 'child-run')
+  assert.ok(isProbe((await drive(t, holding, 1_000)).value))
+  await outside(t, 31_000) // slow probe provider turn: the queued request is consumed afterwards
+  answer(h, 'req-d', 'child-run')
+  reply(h)
+  assert.equal((await drive(t, settle(h), 3_000)).done, false, 'the running descendant still holds')
+  assert.deepEqual(failures(h), [])
 })
 
 // git-main explicit async workflow child: dispatch notice maps runId to workflowKey; the child's own native notice follows later.
@@ -2108,6 +2337,37 @@ test("a workflow child's native completion notice after folding is its delivery"
   notice(h, [wfChild])
   reply(h)
   assert.deepEqual(await drive(t, settle(h), 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+})
+
+test('slow parent turns around a workflow dispatch keep the promoted child required until its own notice', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, state: 'complete', kind: 'workflow' },
+    { id: wfChild, state: 'running', kind: 'subagent' }
+  ])
+  await foreground(h)
+  launch(h, rootA)
+  await flush()
+  await outside(t, 35_000) // the dispatch completes while a slow parent provider request is in flight
+  dispatch(h)
+  reply(h) // the dispatch synthesis is not the final descendant synthesis
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false, 'the promoted live child holds')
+  assert.deepEqual(failures(h), [])
+  status.rows.delete(wfChild)
+  status.rows.get(rootA)!.children = [folded()]
+  assert.ok(isProbe((await drive(t, holding, 3_000)).value))
+  await outside(t, 35_000) // a slow probe provider turn; the child's native notice queues behind it
+  reply(h)
+  const waiting = settle(h)
+  assert.ok(isProbe((await drive(t, waiting, 3_000)).value), 'collection or elapsed time never substitutes')
+  notice(h, [wfChild])
+  reply(h)
+  assert.deepEqual(await drive(t, settle(h), 3_000), { done: true, value: undefined })
+  assert.deepEqual(failures(h), [])
   assert.equal(h.updates.at(-1).state, 'idle')
 })
 

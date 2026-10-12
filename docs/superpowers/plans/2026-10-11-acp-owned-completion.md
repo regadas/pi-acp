@@ -170,6 +170,17 @@ Parent stages: capture baseline → worker executes Tasks 1–3 → fresh full-m
 - [ ] **Step 5: Correct documentation and validate.** Scoped completion failures preserve the channel; retain existing queued-turn rejection semantics. Correct historical Zed fixture count to 25, separating new check counts and fixture evidence from live Zed/Windows claims. Narrow-format touched files, run focused tests, typecheck/lint, full `npm run validate`, smoke, and affected real-runtime scenarios on Pi `1.1.0` / clean git-main `29284cd` without a historical matrix. Required checks may be completed in serial retained-worker phases to avoid runner timeouts; no premature reviewer launch.
 - [ ] **Step 6: Parent accepts evidence and launches fresh targeted re-review.** Supply exact reviewed fix bytes, before/after evidence and actual Pi `1.1.0` boundary source rather than a `1.0.4` proxy. Verify actual final models/efforts/families, adjudicate residual findings and report completion or a concrete blocker. No publication.
 
+### Task 5: Meter delivery windows in ACP waiting time
+
+**Files:** `src/pi-rpc/acp-extension.ts`, `test/unit/acp-extension.test.ts`, `scripts/eval-subagents-completion.mjs`, `scripts/fixtures/subagents-completion-provider.ts`, `README.md`, `docs/acp-compatibility-audit.md`, this plan and the design spec.
+
+Incident: an async workflow dispatch reached terminal status during a 33s parent provider request; Pi consumed its correct native notice 7ms after that response and the wall-clock window had already expired.
+
+- [x] **Step 1: Reproduce on actual runtime.** Deterministic 35s parent provider on Pi `1.1.0` / git-main `29284cd` rejects with the exact error; a 20s control and S_LATE deliver.
+- [x] **Step 2: RED.** Unit regressions for slow initial provider/tool work, a slow probe turn, a slow preview, a supervisor request during long parent work, a workflow child across slow turns, spent budget across continuations and a replacement owner's clock; native S_SLOW, S_SLOWTOOL, S_SLOWHOOK and S_SLOWWF scenarios fail on the pre-change build.
+- [x] **Step 3: GREEN.** One owner-scoped clock advances only inside the owner's before-settle wait; every delivery and supervisor-attention expiry is measured on it from the obligation's or episode's own origin. 30s, 30 probes and the 1s cadence are unchanged; missing-notice, held-expiry, foreign, cancellation and detach guards remain.
+- [ ] **Step 4: Fresh review and parent acceptance.**
+
 ## Fresh Review and Fix Handoff
 
 Parent verifies candidate bytes/baseline preservation and supplies the actual changed paths, relevant contracts, source/test entry points and runtime evidence. Reviewers are fresh and read-only: Sol 6.1/xhigh correctness, Opus/medium lifecycle, Sonnet/xhigh tests, Gemini/high operability. Verify actual native models/families; incomplete coverage is not approval.

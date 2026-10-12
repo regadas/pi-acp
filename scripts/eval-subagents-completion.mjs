@@ -53,7 +53,8 @@ const RELEASE_GATES = [
   'supervisor',
   'workflow',
   'wfcancel',
-  'wfearly'
+  'wfearly',
+  'slowwf'
 ]
 const isLive = pid => {
   try {
@@ -120,7 +121,7 @@ const runScenario = async scenario => {
     // A user resource discovered natively from the isolated agent directory (no CLI injection).
     await writeFile(join(root, 'agent', 'APPEND_SYSTEM.md'), APPEND_SENTINEL)
     // Explicit async workflow child: dispatch completes while the child keeps running as a promoted row.
-    for (const name of ['workflow', 'wfcancel'])
+    for (const name of ['workflow', 'wfcancel', 'slowwf'])
       await writeFile(
         join(root, `${name}.js`),
         `const [child] = await runs.all([{ key: 'child', agent: 'eval-leaf', task: 'LEAF_GATED:${name}', async: true }]);\nreturn child.runId;\n`
@@ -266,7 +267,170 @@ const promptResponseIndexOf = client => {
   return index
 }
 
+// Pi drains queued native notices only after provider, tool and awaited-hook work returns; that time
+// is not ACP waiting, so a terminal run whose notice queues behind >30s of such work is still delivered.
+// Fixture-local terminal proxy mirroring the adapter's drain rule for plain roots: the first exhaustive
+// status snapshot whose row and every child row are terminal (a queued/running step keeps it live).
+const TERMINAL_STATES = new Set(['complete', 'failed', 'partial', 'paused', 'stopped', 'rejected'])
+const fullyTerminal = node => TERMINAL_STATES.has(node?.state) && (node.children ?? []).every(fullyTerminal)
+assert.equal(fullyTerminal({ state: 'complete', children: [{ state: 'queued' }] }), false)
+assert.equal(fullyTerminal({ state: 'complete', children: [{ state: 'running' }] }), false)
+assert.equal(fullyTerminal({ state: 'complete', children: [{ state: 'complete' }] }), true)
+const terminalSnapshot = (rows, id) =>
+  rows.find(
+    row =>
+      row.event === 'snapshot' &&
+      row.omitted?.runs === 0 &&
+      row.omitted?.children === 0 &&
+      row.omitted?.byteLimitExceeded === false &&
+      row.runs.some(run => run.id === id && fullyTerminal(run))
+  )
+const slowYield = row => row.response?.some(text => text.startsWith('SLOW_YIELD:'))
+const slowInterval = rows => ({
+  start: rows.find(row => row.event === 'slow-start') ?? rows.find(row => row.event === 'provider' && slowYield(row)),
+  end: rows.find(row => row.event === 'slow-end') ?? rows.find(row => row.event === 'provider-finish' && slowYield(row))
+})
+const harnessFailure = client =>
+  client.updates.some(
+    update => update.sessionUpdate === 'agent_message_chunk' && update.content?.text?.includes('Background harness')
+  )
+const slowRoot = (name, kind) => ({
+  name,
+  timeoutMs: 150_000,
+  async drive({ client, prompt, records, wait, launchRow, providerRow, check }) {
+    const label = name.slice(2).toLowerCase()
+    // A rejected prompt is recorded, not left unhandled, so it fails the end_turn assertion below.
+    const turn = prompt(name).then(
+      result => result,
+      error => ({ rejection: String(error) })
+    )
+    const launched = await launchRow()
+    const id = launched.details.asyncId
+    const notice = await wait(
+      rows =>
+        rows.find(
+          row =>
+            row.event === 'custom' &&
+            row.customType === 'subagent-notify' &&
+            row.details?.runs?.some(run => run.runId === id)
+        ),
+      `structured completion notice for ${id}`,
+      90_000
+    )
+    const synthesis = await providerRow(`FINAL_SYNTHESIS:${label}`)
+    const result = await turn
+    assert.equal(result.stopReason, 'end_turn', result.rejection ?? 'delivery after slow parent work is success')
+    const rows = (await records()).filter(row => row.pid === launched.pid)
+    const position = row => rows.findIndex(entry => JSON.stringify(entry) === JSON.stringify(row))
+    const terminal = terminalSnapshot(rows, id)
+    const slow = slowInterval(rows)
+    assert.ok(terminal && slow.start && slow.end, 'terminal status and the slow interval are traced')
+    assert.ok(slow.start.at < terminal.at, `the run reached terminal status during the slow ${kind}`)
+    assert.ok(slow.end.at - terminal.at >= 33_000, `the slow ${kind} outlasted 30s after terminal status`)
+    assert.ok(position(slow.end) < position(notice), 'Pi consumed the queued notice only after the slow work')
+    assert.ok(position(notice) < position(synthesis) && synthesis.notice, 'a later provider cycle answered it')
+    const responseIndex = promptResponseIndexOf(client)
+    const synthesisChunk = indexChunk(client, `FINAL_SYNTHESIS:${label}`)
+    assert.ok(synthesisChunk >= 0 && synthesisChunk < responseIndex)
+    assert.equal(harnessFailure(client), false)
+    check(name, `notice queued behind a >30s ${kind} is delivered, then synthesis and end_turn`, true, {
+      runId: id,
+      terminalAt: terminal.at,
+      slowStartAt: slow.start.at,
+      slowEndAt: slow.end.at,
+      outsideAfterTerminalMs: slow.end.at - terminal.at,
+      noticeAt: notice.at,
+      synthesisAt: synthesis.at,
+      synthesisChunk,
+      responseIndex
+    })
+  }
+})
+
 const scenarios = [
+  slowRoot('S_SLOW', 'initial provider request'),
+  slowRoot('S_SLOWTOOL', 'tool execution'),
+  slowRoot('S_SLOWHOOK', 'awaited turn_end hook of another extension'),
+  {
+    name: 'S_SLOWWF',
+    // The stock's batched notices queue after the probe for the folded child starts, so it waits behind that probe.
+    batch: { enabled: true, debounceMs: 4000, maxWaitMs: 4000 },
+    timeoutMs: 180_000,
+    async drive({ client, root, prompt, records, wait, launchRow, providerRow, check }) {
+      let settledAt
+      let rejection
+      // A rejected prompt is recorded, not left unhandled, so it fails the hold and end_turn assertions below.
+      const turn = prompt('S_SLOWWF').then(
+        result => {
+          settledAt = Date.now()
+          return result
+        },
+        error => {
+          settledAt = Date.now()
+          rejection = String(error)
+          return {}
+        }
+      )
+      const launched = await launchRow()
+      const workflowId = launched.details.asyncId
+      const isNotice = (row, id) =>
+        row.event === 'custom' &&
+        row.customType === 'subagent-notify' &&
+        row.details?.runs?.some(run => run.runId === id)
+      const dispatched = await wait(rows => rows.find(row => isNotice(row, workflowId)), 'dispatch notice', 60_000)
+      const run = dispatched.details.runs.find(entry => entry.runId === workflowId)
+      const child = (run.childRuns ?? []).find(entry => entry.status === 'running')
+      assert.equal(run.workflowRunId, workflowId)
+      assert.ok(child?.runId && child.workflowKey === 'child', 'dispatch maps the live promoted child to its key')
+      const ack = await providerRow('WORKFLOW_ACK:slowwf')
+      await sleep(3_000)
+      assert.equal(settledAt, undefined, `the dispatch synthesis is not final; the promoted child holds (${rejection})`)
+      let rows = (await records()).filter(row => row.pid === launched.pid)
+      const position = row => rows.findIndex(entry => JSON.stringify(entry) === JSON.stringify(row))
+      const terminal = rows.find(
+        row => row.event === 'snapshot' && row.runs.some(entry => entry.id === workflowId && entry.state === 'complete')
+      )
+      const slow = slowInterval(rows)
+      assert.ok(terminal && slow.start && slow.end)
+      assert.ok(slow.start.at < terminal.at && slow.end.at - terminal.at >= 33_000, 'dispatch ended in a >30s request')
+      assert.ok(position(slow.end) < position(dispatched) && position(dispatched) < position(ack) && ack.notice)
+      check('S_SLOWWF', 'dispatch notice queued behind a >30s provider request is delivered; child still held', true, {
+        workflowId,
+        childRunId: child.runId,
+        workflowKey: child.workflowKey,
+        terminalAt: terminal.at,
+        slowEndAt: slow.end.at,
+        outsideAfterTerminalMs: slow.end.at - terminal.at,
+        dispatchNoticeAt: dispatched.at
+      })
+      await writeFile(join(root, 'release-slowwf'), 'release')
+      const childNotice = await wait(rows => rows.find(row => isNotice(row, child.runId)), 'child notice', 90_000)
+      const synthesis = await providerRow('FINAL_SYNTHESIS:slowwf')
+      assert.equal((await turn).stopReason, 'end_turn', rejection)
+      rows = (await records()).filter(row => row.pid === launched.pid)
+      const probes = rows.filter(row => row.event === 'provider' && row.probe)
+      const slowProbe = rows.find(
+        row => row.event === 'provider-finish' && row.marker === 'S_SLOWWF' && row.response?.includes('WAITING_PROBE')
+      )
+      const slowProbeStart = probes.find(row => row.marker === 'S_SLOWWF')
+      assert.ok(slowProbe && slowProbeStart && slowProbe.at - slowProbeStart.at >= 33_000, 'the probe turn was slow')
+      assert.ok(position(slowProbe) < position(childNotice), 'the child notice was consumed only after the slow probe')
+      assert.ok(position(childNotice) < position(synthesis) && synthesis.notice, 'synthesis answered the child notice')
+      assert.ok(settledAt > childNotice.at, 'the request stayed open until the child notice')
+      const responseIndex = promptResponseIndexOf(client)
+      const synthesisChunk = indexChunk(client, 'FINAL_SYNTHESIS:slowwf')
+      assert.ok(synthesisChunk >= 0 && synthesisChunk < responseIndex)
+      assert.equal(harnessFailure(client), false)
+      check('S_SLOWWF', 'the promoted child notice, then a distinct synthesis, precede end_turn', true, {
+        childNoticeAt: childNotice.at,
+        probes: probes.map(row => row.at),
+        slowProbeStartAt: slowProbeStart.at,
+        slowProbeFinishAt: slowProbe.at,
+        synthesisAt: synthesis.at,
+        responseAt: settledAt
+      })
+    }
+  },
   {
     name: 'S_EARLY',
     batch: { enabled: true, debounceMs: 4000, maxWaitMs: 4000 },
@@ -1212,7 +1376,7 @@ const scenarios = [
         () => assert.fail('a missing delivery within the deadline must fail, never succeed'),
         error => error
       )
-      assert.match(String(rejection), /was not consumed within 30s of terminal status/)
+      assert.match(String(rejection), /was not consumed within 30s of ACP waiting after terminal status/)
       const probeRows = (await records()).filter(row => row.event === 'provider' && row.probe)
       assert.ok(probeRows.length >= 20, 'the deadline window is spanned by bounded probes')
       assert.ok(probeRows.length <= 30, 'probes are capped at 30 per terminal capture')
@@ -1273,5 +1437,5 @@ console.log(
   `Owned-completion evaluation passed on pi ${identity.piVersion} with pi-subagents git ${identity.before.head} loaded via ${identity.declaredEntry}.`
 )
 console.log(
-  'Evidence limits: bounded probes may add provider calls; completion and supervisor delivery each use a 30s window; workflow async children are delivered only by their native notice (bg_wait is not delivery); automatic steering recovery is not reproduced; no live client UI or Windows client was driven.'
+  'Evidence limits: bounded probes may add provider calls; completion and supervisor delivery each use a 30s window of ACP waiting (time inside the adapter barrier, not provider, tool or other-hook time); workflow async children are delivered only by their native notice (bg_wait is not delivery); automatic steering recovery is not reproduced; no live client UI or Windows client was driven.'
 )

@@ -6,6 +6,9 @@ import { join } from 'node:path'
 const FOREIGN_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
 const WAITING = 'ACP is keeping this request open'
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+// Deterministic parent work longer than the 30s ACP waiting window, outside the adapter's barrier.
+const SLOW_MS = 40_000
+const SLOW_ROOTS = ['S_SLOW', 'S_SLOWHOOK', 'S_SLOWTOOL']
 
 type Part = { type: string; text?: string; name?: string; id?: string }
 type Message = { role: string; content: string | Part[]; isError?: boolean; toolName?: string }
@@ -77,7 +80,7 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
   pi.on('agent_settled', event => log({ event: 'agent_settled', sessionId, scenario, aborted: event.aborted }))
   pi.on('tool_result', event => {
     if (
-      !['subagent', 'acp_detach', 'subagent_supervisor', 'contact_supervisor', 'read', 'bg_wait'].includes(
+      !['subagent', 'acp_detach', 'subagent_supervisor', 'contact_supervisor', 'read', 'bg_wait', 'eval_slow'].includes(
         event.toolName
       )
     )
@@ -128,6 +131,28 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
     const started = Date.now()
     while (Date.now() - started < 2_500) await sleep(20)
     scenario = 'S_ENTRY_DONE'
+  })
+  // Another extension's slow awaited turn_end handler: Pi drains queued notices only after it returns.
+  let slowHookDone = false
+  pi.on('turn_end', async event => {
+    const results = (event as { toolResults?: Array<{ toolName?: string }> }).toolResults ?? []
+    if (scenario !== 'S_SLOWHOOK' || slowHookDone || !results.some(result => result.toolName === 'subagent')) return
+    slowHookDone = true
+    log({ event: 'slow-start', sessionId, scenario })
+    await sleep(SLOW_MS)
+    log({ event: 'slow-end', sessionId, scenario })
+  })
+  pi.registerTool({
+    name: 'eval_slow',
+    label: 'Deterministic slow tool',
+    description: 'Product-test fixture tool that takes longer than the ACP waiting window',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    async execute() {
+      log({ event: 'slow-start', sessionId, scenario })
+      await sleep(SLOW_MS)
+      log({ event: 'slow-end', sessionId, scenario })
+      return { content: [{ type: 'text', text: 'SLOW_TOOL_DONE' }], details: {} }
+    }
   })
   pi.registerCommand('eval-foreign', {
     description: 'Launch a foreign async run through the public v1 spawn RPC (never a tool_result)',
@@ -239,7 +264,8 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
             text: textOf(last).includes('Replied to supervisor') ? 'SUPERVISOR_REPLIED' : 'EARLY_YIELD:supervisor'
           }
         ]
-      else if (probe && marker !== 'S_WORKFLOW') content = [{ type: 'text', text: 'WAITING_PROBE' }]
+      else if (probe && marker !== 'S_WORKFLOW' && marker !== 'S_SLOWWF')
+        content = [{ type: 'text', text: 'WAITING_PROBE' }]
       else if (
         marker === 'S_EARLY' ||
         marker === 'S_LATE' ||
@@ -273,6 +299,32 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
           content = [{ type: 'text', text: `WAKE_SYNTHESIS:${name}` }]
         else if (notice) content = [{ type: 'text', text: `FINAL_SYNTHESIS:${name}` }]
         else content = [{ type: 'text', text: `EARLY_YIELD:${name}` }]
+      } else if (SLOW_ROOTS.includes(marker)) {
+        const name = marker.slice(2).toLowerCase()
+        const slowed = messages.some(message => message.role === 'toolResult' && message.toolName === 'eval_slow')
+        if (last?.role === 'user' && !notice && !probe && !launches.length) content = [launch(`LEAF_QUICK:${name}`)]
+        else if (notice) content = [{ type: 'text', text: `FINAL_SYNTHESIS:${name}` }]
+        else if (marker === 'S_SLOWTOOL' && last?.role === 'toolResult' && !slowed) content = [call('eval_slow', {})]
+        else {
+          content = [{ type: 'text', text: `SLOW_YIELD:${name}` }]
+          // A slow initial provider request, including time to first token: its start event follows the delay.
+          if (marker === 'S_SLOW') delay = SLOW_MS
+        }
+      } else if (marker === 'S_SLOWWF') {
+        if (last?.role === 'user' && !notice && !probe && !launches.length)
+          content = [call('subagent', { workflow: './slowwf.js', async: true })]
+        else if (notice && lastText.includes('LEAF_DONE:slowwf'))
+          content = [{ type: 'text', text: 'FINAL_SYNTHESIS:slowwf' }]
+        else if (notice) content = [{ type: 'text', text: 'WORKFLOW_ACK:slowwf' }]
+        else if (probe) {
+          // A slow probe continuation: the child's native notice queues behind it.
+          content = [{ type: 'text', text: 'WAITING_PROBE' }]
+          delay = SLOW_MS
+        } else {
+          // The workflow dispatch completes while this slow parent request is in flight.
+          content = [{ type: 'text', text: 'SLOW_YIELD:slowwf' }]
+          delay = SLOW_MS
+        }
       } else if (marker === 'S_SUPERVISOR') {
         content =
           last?.role === 'user' && !notice && !probe && !launches.length
@@ -403,6 +455,12 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       if (gate) log({ event: 'leaf-live', marker })
       const finish = () => {
         const aborted = options?.signal?.aborted
+        log({
+          event: 'provider-finish',
+          sessionId,
+          marker,
+          response: content.map(part => (part as Part).text ?? (part as Part).name)
+        })
         if (gate) log({ event: 'leaf-settled', marker, aborted, gateReleased: existsSync(gate) })
         stream.push({ type: 'start', partial: message as never })
         if (aborted)

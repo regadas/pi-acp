@@ -70,13 +70,15 @@ type Obligation = {
   id: string
   observed: boolean
   terminalAt?: number
+  // ACP waiting clock reading when terminal proof latched; the delivery window is metered from here.
+  terminalHeld?: number
   delivered: boolean
   probes: number
   // git-main explicit async workflow child: its finished row folds back under the root as this keyed step.
   workflowKey?: string
 }
 // One supervisor request episode from owned work; the (requestId, runId) pair is its identity.
-type Attention = { id: string; runId: string; openedAt: number; delivered: boolean; probes: number }
+type Attention = { id: string; runId: string; openedHeld: number; delivered: boolean; probes: number }
 type NoticeRun = { runId?: unknown; workflowRunId?: unknown; childRuns?: unknown }
 type Capture = Obligation & {
   unsupported?: string
@@ -192,6 +194,10 @@ export default function acpExtension(pi: Pi): void {
   let deliverySeq = 0
   let providerSeq = 0
   let lastProbeAt = -Infinity
+  // Owner-scoped ACP waiting clock: advances only inside this owner's before-settle wait, because Pi
+  // cannot drain queued native messages during provider, tool or other awaited-hook work.
+  let clock: { spent: number; since?: number } = { spent: 0 }
+  const held = () => clock.spent + (clock.since === undefined ? 0 : Date.now() - clock.since)
   let wakers: Array<() => void> = []
   let runGeneration = 0
   const interrupted = new Set<string>()
@@ -253,19 +259,21 @@ export default function acpExtension(pi: Pi): void {
   const obligations = () => [...required.values()].flatMap(capture => [capture, ...capture.descendants.values()])
   const controlledIds = () => [...required.values()].flatMap(capture => [capture.id, ...capture.descendants.keys()])
   const lateDelivery = (obligation: Obligation) =>
-    `completion notice for required run ${obligation.id} was not consumed within 30s of terminal status`
+    `completion notice for required run ${obligation.id} was not consumed within 30s of ACP waiting after terminal status`
+  const lateAttention = (item: Attention) =>
+    `supervisor request ${item.id} from required run ${item.runId} was not consumed within 30s of ACP waiting`
   const openAttention = () =>
     [...required.values()].flatMap(capture => [...capture.attention.values()]).filter(item => !item.delivered)
-  const overdue = (now: number) => {
+  const overdue = (spent: number) => {
     const expired = obligations().find(
       obligation =>
-        obligation.terminalAt !== undefined &&
+        obligation.terminalHeld !== undefined &&
         !obligation.delivered &&
-        now - obligation.terminalAt >= DELIVERY_DEADLINE_MS
+        spent - obligation.terminalHeld >= DELIVERY_DEADLINE_MS
     )
     if (expired) return lateDelivery(expired)
-    const asking = openAttention().find(item => now - item.openedAt >= DELIVERY_DEADLINE_MS)
-    if (asking) return `supervisor request ${asking.id} from required run ${asking.runId} was not consumed within 30s`
+    const asking = openAttention().find(item => spent - item.openedHeld >= DELIVERY_DEADLINE_MS)
+    if (asking) return lateAttention(asking)
   }
   const assess = (capture: Capture, snapshot: Snapshot & { runs: SnapshotNode[] }, now: number) => {
     const omitted = snapshot.omitted
@@ -286,7 +294,10 @@ export default function acpExtension(pi: Pi): void {
       else if (tree === 'terminal' && obligation.terminalAt === undefined) {
         if (lossy || (omitted.children as number) > 0)
           capture.unsupported ??= `bounded status cannot prove descendants of ${obligation.id} drained`
-        else obligation.terminalAt = now
+        else {
+          obligation.terminalAt = now
+          obligation.terminalHeld = held()
+        }
       }
     }
     const node = find(capture.id)
@@ -441,6 +452,7 @@ export default function acpExtension(pi: Pi): void {
           expectedInput = undefined
           deliverySeq = providerSeq = 0
           lastProbeAt = -Infinity
+          clock = { spent: 0 }
         }
         expectedInput = undefined
         owner = id
@@ -638,7 +650,7 @@ export default function acpExtension(pi: Pi): void {
     capture.attention.set(supervisorKey(requestId, runId), {
       id: requestId,
       runId,
-      openedAt: Date.now(),
+      openedHeld: held(),
       delivered: false,
       probes: 0
     })
@@ -651,7 +663,7 @@ export default function acpExtension(pi: Pi): void {
     const workflow = capture.id === id && run.workflowRunId === id
     // Only the first consumption is checked or fenced; duplicates reopen nothing.
     if (!obligation.delivered) {
-      if (obligation.terminalAt !== undefined && Date.now() - obligation.terminalAt >= DELIVERY_DEADLINE_MS)
+      if (obligation.terminalHeld !== undefined && held() - obligation.terminalHeld >= DELIVERY_DEADLINE_MS)
         capture.unsupported ??= lateDelivery(obligation)
       else {
         obligation.delivered = true
@@ -719,8 +731,7 @@ export default function acpExtension(pi: Pi): void {
       for (const capture of required.values()) {
         const item = capture.attention.get(supervisorKey(requestId, runId))
         if (!item || item.delivered) continue
-        if (Date.now() - item.openedAt >= DELIVERY_DEADLINE_MS)
-          capture.unsupported ??= `supervisor request ${requestId} from required run ${item.runId} was not consumed within 30s`
+        if (held() - item.openedHeld >= DELIVERY_DEADLINE_MS) capture.unsupported ??= lateAttention(item)
         else item.delivered = true
       }
       wake()
@@ -848,53 +859,62 @@ export default function acpExtension(pi: Pi): void {
         ? { continue: true }
         : { entries: [...(event.entries ?? []), waitingDraft(pending, asking)], continue: true }
     }
-    // Entry-time preview only: queued notices remain invisible while this handler awaits.
-    if (event.context?.pendingMessages?.length && required.size) {
-      const expired = overdue(Date.now())
-      if (expired) return fail(expired)
-      emit('continuing')
-      return { continue: true }
-    }
-    for (;;) {
-      if (stale()) return
-      if (failure) return fail(failure)
-      if (!required.size) return
-      if ([...required.values()].some(capture => !settledCapture(capture))) {
-        let error: unknown
-        await Promise.race([poll().catch(e => (error = e)), nap(6_000)])
+    // Finalizers touch only this owner's clock, so a stale wait cannot move a replacement owner's budget.
+    const ownClock = clock
+    ownClock.since = Date.now()
+    try {
+      // Entry-time preview only: queued notices remain invisible while this handler awaits.
+      if (event.context?.pendingMessages?.length && required.size) {
+        const expired = overdue(held())
+        if (expired) return fail(expired)
+        emit('continuing')
+        return { continue: true }
+      }
+      for (;;) {
         if (stale()) return
-        if (error) return fail(error instanceof Error ? error.message : String(error))
+        if (failure) return fail(failure)
+        if (!required.size) return
+        if ([...required.values()].some(capture => !settledCapture(capture))) {
+          let error: unknown
+          await Promise.race([poll().catch(e => (error = e)), nap(6_000)])
+          if (stale()) return
+          if (error) return fail(error instanceof Error ? error.message : String(error))
+        }
+        const captures = [...required.values()]
+        const unsupported = captures.find(capture => capture.unsupported)
+        if (unsupported) return fail(unsupported.unsupported!)
+        const now = Date.now()
+        const spent = held()
+        const pending = obligations()
+        const awaiting = pending.filter(obligation => obligation.terminalHeld !== undefined && !obligation.delivered)
+        const asking = openAttention()
+        const expired = overdue(spent)
+        if (expired) return fail(expired)
+        if (captures.every(settledCapture) && pending.every(obligation => obligation.delivered) && !asking.length) {
+          // Ordering evidence only: a provider cycle after the last consumed notice, not proof of synthesis.
+          if (deliverySeq > providerSeq) return resume(pending)
+          release()
+          emit('idle')
+          return
+        }
+        const probeable = awaiting.filter(capture => capture.probes < MAX_PROBES)
+        const probeableAsks = asking.filter(item => item.probes < MAX_PROBES)
+        if ((probeable.length || probeableAsks.length) && now - lastProbeAt >= PROBE_INTERVAL_MS) {
+          // shortcut: each probe may cost a provider call; a public queued-message signal can replace probing.
+          lastProbeAt = now
+          for (const item of [...probeable, ...probeableAsks]) item.probes++
+          return resume(probeable, probeableAsks)
+        }
+        const deadlines = [
+          ...awaiting.map(capture => capture.terminalHeld! + DELIVERY_DEADLINE_MS - spent),
+          ...asking.map(item => item.openedHeld + DELIVERY_DEADLINE_MS - spent)
+        ]
+        if (probeable.length || probeableAsks.length) deadlines.push(lastProbeAt + PROBE_INTERVAL_MS - now)
+        await nap(Math.min(STATUS_POLL_MS, ...deadlines))
       }
-      const captures = [...required.values()]
-      const unsupported = captures.find(capture => capture.unsupported)
-      if (unsupported) return fail(unsupported.unsupported!)
-      const now = Date.now()
-      const pending = obligations()
-      const awaiting = pending.filter(obligation => obligation.terminalAt !== undefined && !obligation.delivered)
-      const asking = openAttention()
-      const expired = overdue(now)
-      if (expired) return fail(expired)
-      if (captures.every(settledCapture) && pending.every(obligation => obligation.delivered) && !asking.length) {
-        // Ordering evidence only: a provider cycle after the last consumed notice, not proof of synthesis.
-        if (deliverySeq > providerSeq) return resume(pending)
-        release()
-        emit('idle')
-        return
-      }
-      const probeable = awaiting.filter(capture => capture.probes < MAX_PROBES)
-      const probeableAsks = asking.filter(item => item.probes < MAX_PROBES)
-      if ((probeable.length || probeableAsks.length) && now - lastProbeAt >= PROBE_INTERVAL_MS) {
-        // shortcut: each probe may cost a provider call; a public queued-message signal can replace probing.
-        lastProbeAt = now
-        for (const item of [...probeable, ...probeableAsks]) item.probes++
-        return resume(probeable, probeableAsks)
-      }
-      const deadlines = [
-        ...awaiting.map(capture => capture.terminalAt! + DELIVERY_DEADLINE_MS - now),
-        ...asking.map(item => item.openedAt + DELIVERY_DEADLINE_MS - now)
-      ]
-      if (probeable.length || probeableAsks.length) deadlines.push(lastProbeAt + PROBE_INTERVAL_MS - now)
-      await nap(Math.min(STATUS_POLL_MS, ...deadlines))
+    } finally {
+      ownClock.spent += Date.now() - ownClock.since!
+      ownClock.since = undefined
     }
   })
   pi.registerTool({
