@@ -110,6 +110,11 @@ Your ACP client can also invoke this automatically based on the agent's advertis
 ## Auxiliary manual probes
 
 `npm run smoke` remains an isolated, non-provider initialize/new/builtin/cancel/shutdown check.
+`npm test` and `npm run smoke` run under disposable `HOME`, `PI_ACP_DIR`, `PI_CODING_AGENT_DIR` and
+workspace directories (pi's default session directory follows the disposable agent dir), scrub inherited
+`PI_ACP_PI_COMMAND`, `PI_ACP_REEXEC` and `PI_CODING_AGENT_SESSION_DIR` overrides, and clean up their
+temporary roots; `npm run smoke` passes placeholder provider keys only, so no real credentials or provider
+traffic are involved.
 After `npm run build`, the other `scripts/smoke-*.mjs` entrypoints are manual probes, not CI coverage.
 Use disposable `PI_CODING_AGENT_DIR`, `PI_ACP_DIR`, and `PI_CODING_AGENT_SESSION_DIR` directories.
 `smoke-compact.mjs`, `smoke-export.mjs`, and `smoke-acp-load.mjs` can generate provider traffic and require

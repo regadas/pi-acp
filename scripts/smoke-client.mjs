@@ -109,13 +109,13 @@ export async function withSmokeAgent(
   }
 }
 
-export async function newSmokeSession(client) {
+export async function newSmokeSession(client, cwd = process.cwd()) {
   await client.request('initialize', {
     protocolVersion: 1,
     clientCapabilities: {}
   })
   const session = await client.request('session/new', {
-    cwd: process.cwd(),
+    cwd,
     mcpServers: []
   })
   assert.equal(typeof session.sessionId, 'string')
