@@ -121,6 +121,62 @@ test('PiAcpAgent: /autocompact applies explicit aliases and toggles the current 
   assert.deepEqual(applied, [false, true, false])
 })
 
+test('PiAcpAgent: /model, /thinking and /clear are guidance-only and never reach pi as prompts', async () => {
+  const guidance: Record<string, RegExp> = {
+    model:
+      /Model selection is owned by your ACP client's session settings \(the standard "model" session config option\)/,
+    thinking:
+      /Thinking level is owned by your ACP client's session settings \(the standard "thought_level" session config option\)/,
+    clear: /\/clear is not implemented\. Start a new session from your ACP client instead\./
+  }
+  for (const [cmd, pattern] of Object.entries(guidance)) {
+    const conn = new FakeAgentSideConnection()
+    const proc = new FakePiRpcProcess() as any
+    const session = makeSession(conn, proc)
+    const agent = new PiAcpAgent(asAgentConn(conn))
+    ;(agent as any).sessions = new FakeSessions(session) as any
+    try {
+      const res = agent.prompt({
+        sessionId: 's1',
+        prompt: [{ type: 'text', text: `/${cmd} ignored argument` }]
+      } as any)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      assert.equal(proc.prompts.length, 0, `/${cmd} must be answered locally, not sent to pi as a raw prompt`)
+      proc.emit({ type: 'agent_start' })
+      proc.emit({ type: 'agent_settled' })
+      assert.equal((await res).stopReason, 'end_turn')
+      assert.match(lastAgentMessageText(conn), pattern)
+    } finally {
+      session.dispose()
+    }
+  }
+})
+
+test('PiAcpAgent: a slash command outside the builtin inventory still routes to pi verbatim', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  const session = makeSession(conn, proc)
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(session) as any
+  try {
+    const res = agent.prompt({
+      sessionId: 's1',
+      prompt: [{ type: 'text', text: '/pi-extension-template arg' }]
+    } as any)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    assert.equal((await res).stopReason, 'end_turn')
+    assert.deepEqual(
+      proc.prompts.map((item: { message: string }) => item.message),
+      ['/pi-extension-template arg'],
+      'pi-owned commands keep their raw prompt routing for template/extension expansion'
+    )
+  } finally {
+    session.dispose()
+  }
+})
+
 test('PiAcpAgent: /name sets session display name adapter-side', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess() as any

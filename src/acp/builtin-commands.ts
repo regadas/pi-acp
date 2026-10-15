@@ -24,8 +24,29 @@ export function builtinAvailableCommands(): AvailableCommand[] {
       name: 'follow-up',
       description: 'Get/set pi follow-up message delivery mode (how queued follow-up messages are delivered)',
       input: { hint: '(no args to show) all | one-at-a-time' }
-    }
+    },
+    {
+      name: 'model',
+      description:
+        'Guidance only: pick the model from your ACP client session settings (the standard model config option)'
+    },
+    {
+      name: 'thinking',
+      description:
+        'Guidance only: set the thinking level from your ACP client session settings (the standard thought_level config option)'
+    },
+    { name: 'clear', description: 'Not implemented; start a new session from your ACP client instead' }
   ]
+}
+
+// Documented client-control pointers (README / adapter-reference): answered
+// locally, so their text never reaches pi as a prompt for the provider.
+const GUIDANCE_ONLY_COMMANDS: Record<string, string> = {
+  model:
+    'Model selection is owned by your ACP client\'s session settings (the standard "model" session config option); pick the model from your client\'s controls.',
+  thinking:
+    'Thinking level is owned by your ACP client\'s session settings (the standard "thought_level" session config option); set it from your client\'s controls.',
+  clear: '/clear is not implemented. Start a new session from your ACP client instead.'
 }
 
 const AUTOCOMPACT_ON_ALIASES = new Set(['on', 'true', 'enable', 'enabled'])
@@ -52,6 +73,19 @@ export async function runBuiltinCommand(
   args: string[],
   ctx: CommandContext
 ): Promise<PromptResponse> {
+  const guidance = GUIDANCE_ONLY_COMMANDS[cmd]
+  if (guidance) {
+    await ctx.sendSessionUpdate({
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: guidance }
+      }
+    })
+
+    return { stopReason: 'end_turn' }
+  }
+
   if (cmd === 'compact') {
     const customInstructions = args.join(' ').trim() || undefined
     const res = await session.proc.compact(customInstructions)
