@@ -1400,8 +1400,9 @@ for (const normalization of ['unchanged', 'resized', 'failed', 'text-only-prefix
   })
 }
 
-test('an unreleased status poll does not keep the Pi process alive', { timeout: 15_000 }, async () => {
-  const { execFile } = await import('node:child_process')
+// A bare Pi process: markers timestamp the child's own script phases from streamed stdout.
+async function runExtensionChild(body: string): Promise<{ markers: Map<string, number>; exitAt: number }> {
+  const { spawn } = await import('node:child_process')
   const extension = new URL('../../src/pi-rpc/acp-extension.ts', import.meta.url).pathname
   const script = `
     const { default: acpExtension } = await import(${JSON.stringify(extension)})
@@ -1412,14 +1413,57 @@ test('an unreleased status poll does not keep the Pi process alive', { timeout: 
       registerCommand: (_n, c) => { command = c.handler }, registerTool() {} })
     await command('begin 11111111-1111-4111-8111-111111111111', ctx)
     hooks.get('tool_result')({ toolName: 'subagent', details: { asyncId: 'leak' } }, ctx)
+    ${body}
   `
-  const started = Date.now()
-  await new Promise<void>((resolve, reject) =>
-    execFile(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], { timeout: 10_000 }, error =>
-      error ? reject(error) : resolve()
+  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
+    stdio: ['ignore', 'pipe', 'inherit']
+  })
+  const markers = new Map<string, number>()
+  let buffered = ''
+  let exitAt = 0
+  child.stdout.on('data', (chunk: Buffer) => {
+    buffered += String(chunk)
+    const lines = buffered.split('\n')
+    buffered = lines.pop() ?? ''
+    for (const line of lines) if (line && !markers.has(line)) markers.set(line, Date.now())
+  })
+  const kill = setTimeout(() => child.kill(), 30_000)
+  try {
+    await new Promise<void>((resolve, reject) =>
+      child.on('error', reject).on('close', () => {
+        exitAt = Date.now()
+        resolve()
+      })
     )
+  } finally {
+    clearTimeout(kill)
+  }
+  return { markers, exitAt }
+}
+
+test('an unreleased status poll does not keep the Pi process alive', { timeout: 45_000 }, async () => {
+  const child = await runExtensionChild(`console.log('SCRIPT-END')`)
+  assert.ok(child.markers.has('SCRIPT-END'), 'the child reported its script end')
+  const held = child.exitAt - child.markers.get('SCRIPT-END')!
+  assert.ok(
+    held < 1_500,
+    `the unanswered advisory status poll held the event loop open for ${held}ms after the script ended`
   )
-  assert.ok(Date.now() - started < 8_000, 'the advisory poll timer must not hold the event loop open')
+})
+
+test('an unanswered control status holds the process until its deadline rejection', { timeout: 45_000 }, async () => {
+  const child = await runExtensionChild(`
+    console.log('CANCEL-START')
+    const deadline = Date.now() + 9_000
+    await command('cancel 11111111-1111-4111-8111-111111111111 ' + deadline, ctx).catch(() => {})
+    console.log('CANCEL-REJECTED')
+  `)
+  assert.ok(
+    child.markers.has('CANCEL-START') && child.markers.has('CANCEL-REJECTED'),
+    'the control deadline rejection was awaited inside the live process'
+  )
+  const held = child.markers.get('CANCEL-REJECTED')! - child.markers.get('CANCEL-START')!
+  assert.ok(held >= 3_500 && held <= 8_000, `the required control deadline must still meter out, took ${held}ms`)
 })
 
 const promoted = (root: string, child: string) => ({

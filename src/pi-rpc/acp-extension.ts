@@ -336,7 +336,7 @@ export default function acpExtension(pi: Pi): void {
     polling = current
     current.promise = (async () => {
       try {
-        const status = await rpc('status', Date.now() + 5_000)
+        const status = await rpc('status', Date.now() + 5_000, undefined, true)
         if (owner !== token) return
         const snapshot = readSnapshot(status)
         const now = Date.now()
@@ -382,7 +382,7 @@ export default function acpExtension(pi: Pi): void {
       'if one you have not yet acted on is present anywhere in the conversation, act on it now: answer supervisor requests within your existing authority and respond to completion results. ' +
       'Otherwise reply only with a brief waiting status; do not claim results or finish the task.'
   })
-  const rpc = (method: 'stop' | 'status' | 'interrupt', deadline: number, id?: string) =>
+  const rpc = (method: 'stop' | 'status' | 'interrupt', deadline: number, id?: string, advisory = false) =>
     new Promise<Record<string, unknown>>((resolve, reject) => {
       const requestId = randomUUID()
       const event = `subagents:rpc:v1:reply:${requestId}`
@@ -393,6 +393,8 @@ export default function acpExtension(pi: Pi): void {
         },
         Math.max(1, Math.min(5_000, deadline - Date.now()))
       )
+      // Advisory status latching must never hold the Pi process open; control deadlines stay referenced.
+      if (advisory) timeout.unref?.()
       const unsubscribe = pi.events.on(event, raw => {
         const reply = raw as {
           version?: unknown
