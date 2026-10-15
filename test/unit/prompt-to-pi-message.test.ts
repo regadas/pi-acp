@@ -37,6 +37,30 @@ test('promptToPiMessage separates an embedded text resource from the following t
   )
 })
 
+test('promptToPiMessage accepts structurally valid multi-megabyte base64 images without a stack overflow', () => {
+  const data = 'A'.repeat(16_000_000)
+  const result = promptToPiMessage([{ type: 'image', mimeType: 'image/png', data }] as any)
+  assert.equal(result.images.length, 1)
+  assert.equal(result.images[0]?.data, data)
+})
+
+test('promptToPiMessage accepts every canonical base64 padding form', () => {
+  for (const data of ['AAAA', 'AAA=', 'AA==']) {
+    const result = promptToPiMessage([{ type: 'image', mimeType: 'image/png', data }] as any)
+    assert.equal(result.images[0]?.data, data)
+  }
+})
+
+test('promptToPiMessage rejects malformed base64 alphabet and padding', () => {
+  for (const data of ['A', '=', 'AA', 'AA=', 'A===', '====', 'AA=A', 'AAAA=', 'AAAA!', 'A'.repeat(5), 'aGVsbG8']) {
+    assert.throws(
+      () => promptToPiMessage([{ type: 'image', mimeType: 'image/png', data }] as any),
+      /malformed base64/,
+      `data=${data}`
+    )
+  }
+})
+
 test('promptToPiMessage delimits resource links without separating ordinary text chunks', () => {
   assert.equal(
     promptToPiMessage([
