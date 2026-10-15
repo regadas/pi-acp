@@ -2766,8 +2766,9 @@ export class PiAcpSession {
     try {
       const response = await this.conn.createElicitation(
         {
+          // Session-scoped form: no tool call was announced for this dialog, so
+          // the optional toolCallId must stay absent rather than invented.
           sessionId: this.sessionId,
-          toolCallId: `pi-ui-${id}`,
           mode: 'form',
           message: stringProp(ev, 'message') ?? stringProp(ev, 'title') ?? 'Input requested by pi',
           requestedSchema: {

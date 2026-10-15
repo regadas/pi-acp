@@ -299,6 +299,59 @@ test('negotiated input elicitation returns a string and unnegotiated input cance
   assert.deepEqual(conn.updates, [], 'forms do not create synthetic tool cards')
 })
 
+test('input and editor elicitations are session-scoped without an invented toolCallId', async () => {
+  const conn = new FakeAgentSideConnection()
+  const elicitationParams: Array<Record<string, unknown>> = []
+  conn.createElicitation = async (params: Record<string, unknown>) => {
+    elicitationParams.push(params)
+    return { action: 'accept', content: { value: 'typed value' } } as any
+  }
+  const proc = new FakePiRpcProcess()
+  new PiAcpSession({
+    sessionId: 'scoped',
+    cwd: '/tmp',
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    supportsElicitationForm: true
+  })
+  proc.emit({ type: 'extension_ui_request', id: 'in', method: 'input', title: 'Name' })
+  proc.emit({ type: 'extension_ui_request', id: 'ed', method: 'editor', prefill: 'draft' })
+  await tick()
+  assert.equal(elicitationParams.length, 2)
+  for (const params of elicitationParams) {
+    assert.equal(params.sessionId, 'scoped')
+    assert.equal('toolCallId' in params, false, 'a session-scoped form must not invent a toolCallId')
+    assert.equal(params.mode, 'form')
+  }
+  assert.deepEqual(proc.extensionUiResponses, [
+    { id: 'in', value: 'typed value' },
+    { id: 'ed', value: 'typed value' }
+  ])
+  assert.deepEqual(
+    conn.updates.map(notification => notification.update.sessionUpdate),
+    [],
+    'no synthetic tool cards'
+  )
+})
+
+test('a pending session-scoped form cancels back to pi on session cancel', async () => {
+  const conn = new FakeAgentSideConnection()
+  conn.createElicitation = () => new Promise(() => {})
+  const proc = new FakePiRpcProcess()
+  const session = new PiAcpSession({
+    sessionId: 'scoped-cancel',
+    cwd: '/tmp',
+    proc: proc as any,
+    conn: asAgentConn(conn),
+    supportsElicitationForm: true
+  })
+  proc.emit({ type: 'extension_ui_request', id: 'form', method: 'input' })
+  await tick()
+  await session.cancel()
+  assert.deepEqual(proc.extensionUiResponses, [{ id: 'form', cancelled: true }])
+  assert.deepEqual(conn.updates, [])
+})
+
 for (const scenario of [
   { method: 'select', optionId: 'choice-0', status: 'in_progress', reply: { value: 'a' } },
   { method: 'confirm', optionId: 'yes', status: 'in_progress', reply: { confirmed: true } },

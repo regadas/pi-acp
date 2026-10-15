@@ -60,7 +60,7 @@ export class FakeAgentSideConnection {
     return this.nextPermissionResponse
   }
 
-  async createElicitation(): Promise<{ action: 'cancel' }> {
+  async createElicitation(_params?: unknown): Promise<{ action: 'cancel' }> {
     return { action: 'cancel' }
   }
 }
