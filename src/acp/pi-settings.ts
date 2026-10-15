@@ -39,6 +39,18 @@ export function getMergedPiSettings(
   return deepMerge(globalSettings, project)
 }
 
+/** Mirrors pi's tilde expansion (config.js normalizePath): `~` and `~/...`
+ * (plus `~\...` on Windows) resolve against home; other paths stay literal. */
+function expandTilde(value: string): string {
+  if (value === '~') return homedir()
+  if (value.startsWith('~/') || (process.platform === 'win32' && value.startsWith('~\\'))) {
+    return join(homedir(), value.slice(2))
+  }
+  return value
+}
+
 export function getAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ? resolve(process.env.PI_CODING_AGENT_DIR) : join(homedir(), '.pi', 'agent')
+  const configured = process.env.PI_CODING_AGENT_DIR
+  if (!configured) return join(homedir(), '.pi', 'agent')
+  return resolve(expandTilde(configured))
 }
