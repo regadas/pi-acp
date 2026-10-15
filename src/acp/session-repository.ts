@@ -1,4 +1,4 @@
-import { createReadStream } from 'node:fs'
+import { createReadStream, existsSync } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { dirname, join, isAbsolute, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
@@ -428,6 +428,12 @@ export class SessionRepository {
         mapped = stored
         selected = (await project(stored.sessionFile, sessionId)) ?? selected
         stored = this.store.get(sessionId)
+      }
+      if (!existsSync(selected.sessionFile)) {
+        // A concurrent delete unlinked the file and tombstoned the id after
+        // discovery; the stale record must be neither returned nor re-mapped.
+        byId.delete(sessionId)
+        continue
       }
       byId.set(sessionId, selected)
       if (inScope(selected.cwd) && (stored?.sessionFile !== selected.sessionFile || stored?.cwd !== selected.cwd)) {

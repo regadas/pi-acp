@@ -104,6 +104,33 @@ test('SessionStore: upsert and delete refuse to overwrite a corrupt direct recor
   assert.equal(readFileSync(recordPath, 'utf8'), corruptRaw)
 })
 
+test('SessionStore: a tombstone keeps masking a session whose file no longer exists', () => {
+  const { dir, mapPath, store } = makeStore()
+  store.upsert({ sessionId: 's1', cwd: dir, sessionFile: join(dir, 's1.jsonl') })
+  store.delete('s1')
+  // A stale discovery tries to re-map the deleted id; its target file is gone.
+  store.upsert({ sessionId: 's1', cwd: dir, sessionFile: join(dir, 's1.jsonl') })
+  assert.equal(store.get('s1'), null, 'the tombstone must keep masking the deleted id')
+  const stateDir = `${mapPath}.d`
+  const record = JSON.parse(readFileSync(join(stateDir, readdirSync(stateDir)[0]!), 'utf8')) as any
+  assert.equal(record.deleted, true, 'the tombstone record itself must survive the stale upsert')
+})
+
+test('SessionStore: an explicit restore replaces the tombstone once the file exists again', () => {
+  const { dir, mapPath, store } = makeStore()
+  const sessionFile = join(dir, 's1.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 's1', cwd: dir })}\n`, 'utf-8')
+  store.delete('s1')
+  store.upsert({ sessionId: 's1', cwd: dir, sessionFile })
+  const got = store.get('s1')
+  assert.equal(got?.sessionFile, sessionFile, 'a restored file must replace the tombstone')
+  assert.equal(got?.cwd, dir)
+  const stateDir = `${mapPath}.d`
+  const record = JSON.parse(readFileSync(join(stateDir, readdirSync(stateDir)[0]!), 'utf8')) as any
+  assert.equal(record.deleted, undefined, 'the live record must replace the tombstone')
+  assert.equal(record.session.sessionFile, sessionFile)
+})
+
 test('SessionStore: legacy map is a read-only fallback and corruption there also throws', () => {
   const { mapPath, store } = makeStore()
 

@@ -426,6 +426,52 @@ test('repository.list falls back when a mapped file disappears after header vali
   assert.deepEqual(scanned, [mapped, fallback], 'mapped failure must not suppress usable competitors')
 })
 
+test('repository.list preserves a concurrent delete that lands between discovery and the mapping refresh', async t => {
+  const { root, sessions, store, repository } = fixture(t)
+  const victim = writeSession(join(sessions, 'victim.jsonl'), 'victim', root)
+  writeSession(join(sessions, 'survivor.jsonl'), 'survivor', root)
+  store.upsert({ sessionId: 'victim', cwd: root, sessionFile: victim })
+  const realGet = store.get.bind(store)
+  let deleted = false
+  // list() consults store.get once per session only after discovery finished;
+  // run the concurrent delete (unlink + tombstone) exactly there, deterministically.
+  t.mock.method(store, 'get', (sessionId: string) => {
+    if (!deleted && sessionId === 'victim') {
+      deleted = true
+      fs.unlinkSync(victim)
+      store.delete('victim')
+    }
+    return realGet(sessionId)
+  })
+
+  assert.deepEqual(
+    (await repository.list(root)).map(record => record.sessionId),
+    ['survivor'],
+    'a session deleted mid-list must not be returned from stale discovery'
+  )
+  assert.equal(fs.existsSync(victim), false)
+  assert.equal(store.get('victim'), null)
+  assert.equal(
+    (await store.list()).some(entry => entry.sessionId === 'victim'),
+    false,
+    'the stale mapping must not overwrite the tombstone'
+  )
+  const stateDir = join(root, 'map.json.d')
+  const records = fs
+    .readdirSync(stateDir)
+    .filter(name => name.endsWith('.json'))
+    .map(name => JSON.parse(fs.readFileSync(join(stateDir, name), 'utf8')))
+  assert.equal(
+    records.some(record => record.deleted === true && record.sessionId === 'victim'),
+    true,
+    'the deletion marker must survive on disk'
+  )
+  assert.deepEqual(
+    (await repository.list(root)).map(record => record.sessionId),
+    ['survivor']
+  )
+})
+
 test('repository metadata uses stable in-chunk slices without Buffer copies or concat', async t => {
   const { root, sessions, repository } = fixture(t)
   writeSession(join(sessions, 'single-chunk.jsonl'), 'single-chunk', root)

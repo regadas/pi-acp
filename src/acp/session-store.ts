@@ -1,4 +1,14 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync
+} from 'node:fs'
 import { createHash } from 'node:crypto'
 import { readFile, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -286,7 +296,11 @@ export class SessionStore {
   upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
     // Refuse to replace malformed state. This validation is intentionally per
     // record and does not introduce a shared read-modify-write file.
-    this.readDirect(entry.sessionId)
+    const current = this.readDirect(entry.sessionId)
+    // A concurrent delete tombstones the id after unlinking its file; a stale
+    // discovery upsert must not resurrect that mapping. A session file that
+    // exists again is an explicit restore and does replace the tombstone.
+    if (current?.deleted === true && !existsSync(entry.sessionFile)) return
     const record: SessionRecordFile = {
       version: 1,
       session: {
