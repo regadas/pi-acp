@@ -113,6 +113,8 @@ npm run dev          # run from source
 npm run validate     # formatting, types, lint, tests, and build
 npm run smoke        # isolated stdio lifecycle check; no provider traffic
 npm run eval:acp     # real pi with a deterministic local provider
+npm run eval:subagents:completion  # manual probe; pinned pi-subagents checkout (see reference)
+npm run eval:subagents:cancel     # manual probe; pinned pi-subagents checkout (see reference)
 ```
 
 ACP handling lives in `src/acp/`; pi subprocess communication lives in `src/pi-rpc/`. Each ACP session gets its own `pi --mode rpc` subprocess.

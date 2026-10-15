@@ -47,6 +47,8 @@
     "test": "node scripts/test.mjs",
     "smoke": "node scripts/smoke-acp.mjs",
     "eval:acp": "npm run build && node scripts/eval-acp-client.mjs",
+    "eval:subagents:completion": "npm run build && node scripts/eval-subagents-completion.mjs",
+    "eval:subagents:cancel": "npm run build && node scripts/eval-subagents-cancel.mjs",
     "validate": "npm run format:check && npm run typecheck && npm run lint && npm test && npm run build",
     "prepack": "npm run validate",
     "prepublishOnly": "npm run validate"

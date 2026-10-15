@@ -18,3 +18,4 @@ jobs:
       - run: npm run validate
       - run: npm install --global @earendil-works/pi-coding-agent@1.1.0
       - run: npm run smoke
+      - run: npm run eval:acp
