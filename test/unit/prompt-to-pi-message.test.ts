@@ -27,6 +27,16 @@ test('promptToPiMessage rejects malformed and unsupported binary content before 
   assert.throws(() => promptToPiMessage([{ type: 'audio', mimeType: 'audio/wav', data: 'AA==' }] as any), /Audio/)
 })
 
+test('promptToPiMessage separates an embedded text resource from the following text block', () => {
+  assert.equal(
+    promptToPiMessage([
+      { type: 'resource', resource: { uri: 'file:///snippet.ts', mimeType: 'text/plain', text: 'const a = 1' } },
+      { type: 'text', text: 'Explain' }
+    ]).message,
+    '\n[Embedded Context] file:///snippet.ts (text/plain)\nconst a = 1\nExplain'
+  )
+})
+
 test('promptToPiMessage delimits resource links without separating ordinary text chunks', () => {
   assert.equal(
     promptToPiMessage([

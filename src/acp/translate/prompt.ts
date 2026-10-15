@@ -43,7 +43,7 @@ export function promptToPiMessage(blocks: ContentBlock[]): {
         const resource = block.resource
         if ('text' in resource) {
           const mime = resource.mimeType ?? 'text/plain'
-          text.push(`\n[Embedded Context] ${resource.uri} (${mime})\n${resource.text}`)
+          text.push(`\n[Embedded Context] ${resource.uri} (${mime})\n${resource.text}\n`)
           break
         }
         const mime = resource.mimeType ?? 'application/octet-stream'
