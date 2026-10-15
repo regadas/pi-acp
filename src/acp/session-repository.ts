@@ -192,8 +192,12 @@ async function scanMetadata(
     for await (const line of boundedRecords(path, state)) {
       try {
         const value = JSON.parse(line) as Record<string, unknown>
-        if (value.type === 'session_info' && typeof value.name === 'string' && value.name.trim()) {
-          explicitTitle = value.name.trim().slice(0, TITLE_LIMIT)
+        if (value.type === 'session_info') {
+          // Pi's latest session_info name wins, and an empty name explicitly
+          // clears the title (getSessionName: name?.trim() || undefined), so
+          // the scan falls back to the first user message.
+          const name = typeof value.name === 'string' ? value.name.trim() : ''
+          explicitTitle = name ? name.slice(0, TITLE_LIMIT) : null
         }
         firstUserTitle ??= userMessageTitle(value)
         if (typeof value.timestamp === 'string') {

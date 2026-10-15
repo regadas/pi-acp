@@ -608,6 +608,23 @@ test('repository metadata distinguishes exact-limit EOF from truncation and keep
   assert.equal(streams[2]?.bytesRead, 8 * MIB + 1)
 })
 
+test('repository metadata clears an explicit title when pi records an empty session_info name', async t => {
+  const { root, sessions, repository } = fixture(t)
+  const path = join(sessions, 'cleared.jsonl')
+  const lines = [
+    JSON.stringify({ type: 'session', id: 'cleared', cwd: root }),
+    JSON.stringify({ type: 'message', timestamp: TIMESTAMP, message: { role: 'user', content: 'first user title' } }),
+    JSON.stringify({ type: 'session_info', timestamp: TIMESTAMP, name: 'Explicit title' }),
+    JSON.stringify({ type: 'session_info', timestamp: TIMESTAMP, name: '' })
+  ]
+  fs.writeFileSync(path, lines.join('\n') + '\n')
+
+  assert.equal((await repository.list(root))[0]?.title, 'first user title')
+
+  fs.appendFileSync(path, JSON.stringify({ type: 'session_info', timestamp: TIMESTAMP, name: 'Renamed' }) + '\n')
+  assert.equal((await repository.list(root))[0]?.title, 'Renamed')
+})
+
 test('repository.list propagates metadata stream and fallback stat resource errors', async t => {
   const { root, sessions, repository } = fixture(t)
   const path = writeSession(join(sessions, 'errors.jsonl'), 'errors', root)
