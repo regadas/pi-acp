@@ -728,12 +728,19 @@ export class PiAcpAgent implements ACPAgent {
     const cancellationEpoch = this.cancellationEpochs.get(params.sessionId) ?? 0
 
     return this.trackPrompt(params.sessionId, async () => {
+      // The exact session instance this prompt ran on. A late RPC timeout
+      // must dispose that session only: while the timed-out command drains its
+      // final client updates the old child can exit and a replacement can
+      // register under the same session id, and that replacement is healthy.
+      let ranSession: PiAcpSession | undefined
       try {
         if (this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)) {
           return { stopReason: 'cancelled' }
         }
 
-        const response = await this.runPrompt(params, cancellationEpoch, signal)
+        const response = await this.runPrompt(params, cancellationEpoch, signal, session => {
+          ranSession = session
+        })
         return this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)
           ? { ...response, stopReason: 'cancelled' }
           : response
@@ -745,11 +752,11 @@ export class PiAcpAgent implements ACPAgent {
           // An adapter-handled command (compact, stats, export, ...) timed
           // out; the RPC layer already quarantined the channel. Evict this
           // session so the next request restores a fresh subprocess instead
-          // of reusing the dead one.
-          const session = this.sessions.maybeGet(params.sessionId)
-          if (session) {
-            session.dispose({ expected: false })
-            this.sessions.evictIfCurrent(params.sessionId, session)
+          // of reusing the dead one. Only the exact original session is
+          // disposed: `evictIfCurrent` keeps a registered replacement intact.
+          if (ranSession) {
+            ranSession.dispose({ expected: false })
+            this.sessions.evictIfCurrent(params.sessionId, ranSession)
           }
         }
         throw error
@@ -764,9 +771,11 @@ export class PiAcpAgent implements ACPAgent {
   private async runPrompt(
     params: PromptRequest,
     cancellationEpoch: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onRestored?: (session: PiAcpSession) => void
   ): Promise<PromptResponse> {
     const session = await this.restoreSession(params.sessionId)
+    onRestored?.(session)
 
     // Cancellation may arrive while restoreSession is spawning and registering
     // the pi subprocess. Do not let work started before that cancellation pass
