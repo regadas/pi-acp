@@ -26,12 +26,13 @@ import {
   bashExitCode,
   bashOrderedContent,
   bashOutputDelta,
-  bashResultText,
+  bashOutputSnapshot,
   bashTerminalContent,
   bashTerminalExitMeta,
   bashTerminalInfoMeta,
   bashTerminalOutputMeta,
-  isBashTool
+  isBashTool,
+  type BashOutputSnapshot
 } from './translate/bash.js'
 import { translateCustomMessageContent, type TranslatedUserBlock } from './translate/pi-messages.js'
 import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
@@ -313,7 +314,7 @@ export class PiAcpSession {
   private fileMutationToolCallIds = new Set<string>()
   private bashToolCallIds = new Set<string>()
   private subagentToolCallIds = new Set<string>()
-  private bashOutputSnapshots = new Map<string, string>()
+  private bashOutputSnapshots = new Map<string, BashOutputSnapshot>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -1364,17 +1365,17 @@ export class PiAcpSession {
       return
     }
 
-    const text = bashResultText(params.result)
+    const previous = this.bashOutputSnapshots.get(params.toolCallId)
+    const snapshot = bashOutputSnapshot(params.result)
+    const delta = bashOutputDelta(previous, snapshot)
+    this.bashOutputSnapshots.set(params.toolCallId, snapshot)
+
     // Binary image blocks cannot travel through text-only terminal output;
     // they are preserved as standard image content beside the terminal ref.
     const imageContent: ToolCallContent[] = toolResultImageBlocks(params.result).map(image => ({
       type: 'content',
       content: { type: 'image', data: image.data, mimeType: image.mimeType }
     }))
-
-    const previous = this.bashOutputSnapshots.get(params.toolCallId) ?? ''
-    const delta = bashOutputDelta(previous, text)
-    this.bashOutputSnapshots.set(params.toolCallId, text)
 
     this.emit({
       sessionUpdate: 'tool_call_update',
