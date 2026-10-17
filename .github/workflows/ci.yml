@@ -19,3 +19,41 @@ jobs:
       - run: npm install --global @earendil-works/pi-coding-agent@1.2.0
       - run: npm run smoke
       - run: npm run eval:acp
+
+  # Bun gate: with Bun on PATH the adapter re-execs to Bun, and its default
+  # `pi` discovery reroutes direct-JS installs to Bun. The direct-launch eval
+  # variant is required here (PI_ACP_EVAL_REQUIRE_DIRECT=1), so a silently
+  # skipped default-launch proof fails the job.
+  bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+      - uses: oven-sh/setup-bun@v2
+      - run: npm ci
+      # dist/ is gitignored and npm test does not build it; smoke runs the
+      # built adapter, so a fresh checkout needs the build first.
+      - run: npm run build
+      - run: npm test
+      - run: npm install --global @earendil-works/pi-coding-agent@1.2.0
+      - run: npm run smoke
+      - run: PI_ACP_EVAL_REQUIRE_DIRECT=1 npm run eval:acp
+
+  # Windows process-tree termination: the real cmd.exe wrapper + taskkill
+  # integration from test/unit/pi-rpc-process.test.ts and the hanging
+  # --version probe tree kill from test/unit/pi-version.test.ts. No
+  # shell-wrapper eval runs on Windows.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+      - run: npm ci
+      - run: node --import tsx --test --test-name-pattern "Windows \.cmd wrapper" test/unit/pi-rpc-process.test.ts test/unit/pi-version.test.ts
+        shell: bash

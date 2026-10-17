@@ -140,7 +140,10 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       {
         id: 'local',
         name: 'Local evaluation',
-        reasoning: false,
+        // Reasoning-capable so the thought_level lifecycle assertions can
+        // select a level other than the current one (non-reasoning models
+        // clamp to a single `off` level and make those checks vacuous).
+        reasoning: true,
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 10000,
@@ -302,6 +305,18 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       )
       const value = await ctx.ui.confirm('Harness confirm', 'Proceed?')
       ctx.ui.notify(`CONFIRMED:${value}`, 'info')
+    }
+  })
+  pi.registerCommand('eval-runtime', {
+    description: 'Report the JS runtime hosting this Pi process',
+    handler: async (_args, ctx) => {
+      // Runtime receipt for the default-launch eval variant: the JS runtime is
+      // proven from inside this Pi process, never inferred from PATH.
+      const versions = process.versions as NodeJS.ProcessVersions & { bun?: string }
+      ctx.ui.notify(
+        `RUNTIME_RECEIPT ${JSON.stringify({ bun: versions.bun ?? null, node: versions.node ?? null, pid: process.pid })}`,
+        'info'
+      )
     }
   })
   pi.registerCommand('eval-timeout', {

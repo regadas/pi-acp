@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
+const isWindows = process.platform === 'win32'
 
 test('npm scripts expose the real-pi eval bridge and the manual stock-subagents probes', () => {
   const scripts = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')).scripts as Record<string, string>
@@ -69,3 +70,88 @@ test('stock-subagents probes refuse to run without the pinned checkout', () => {
     assert.match(result.stderr, /PI_ACP_EVAL_SUBAGENTS/)
   }
 })
+
+test(
+  'eval direct-launch classifier selfcheck passes against synthetic pi installs',
+  { skip: isWindows ? 'POSIX-only: /usr/bin/env shebangs, symlinks and colon-delimited PATH' : false },
+  () => {
+    const result = spawnSync(
+      process.execPath,
+      [join(repoRoot, 'scripts', 'eval-acp-client.mjs'), '--selfcheck-direct'],
+      {
+        encoding: 'utf8',
+        timeout: 60_000
+      }
+    )
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    assert.match(result.stdout, /selfcheck-direct ok/)
+  }
+)
+
+test('CI runs a Bun default-launch gate and the Windows wrapper tree-kill job', () => {
+  const ci = readFileSync(join(repoRoot, '.github/workflows/ci.yml'), 'utf8')
+  const job = (name: string, follow: string) => {
+    const start = ci.indexOf(`  ${name}:`)
+    const end = follow ? ci.indexOf(`  ${follow}:`) : ci.length
+    assert.ok(start >= 0 && end > start, `ci.yml must define the ${name} job`)
+    return ci.slice(start, end)
+  }
+  const bun = job('bun', 'windows')
+  assert.ok(bun.includes('oven-sh/setup-bun'), 'the bun job must set up Bun explicitly')
+  // An anchored run step, not a substring: the bun job's comments also mention
+  // `npm test`, so a substring check could pass with the step removed.
+  assert.match(bun, /^\s*- run: npm test$/m, 'the bun job must run the test suite with Bun on PATH')
+  // dist/ is gitignored and nothing in npm test builds it: the bun job must
+  // build before its smoke step or it fails deterministically on a fresh
+  // checkout.
+  const build = bun.indexOf('npm run build')
+  assert.ok(build >= 0, 'the bun job must build dist before smoke')
+  const install = bun.indexOf('npm install --global @earendil-works/pi-coding-agent@1.2.0')
+  assert.ok(install >= 0, 'the bun job must install the pinned pi')
+  assert.ok(bun.indexOf('npm run smoke') > install, 'the bun job must smoke after installing pi')
+  assert.ok(bun.indexOf('npm run smoke') > build, 'the bun job must smoke after building dist')
+  assert.ok(
+    bun.includes('PI_ACP_EVAL_REQUIRE_DIRECT=1 npm run eval:acp'),
+    'the bun job must require the default-launch eval variant'
+  )
+  const windows = job('windows', '')
+  assert.ok(
+    windows.includes(
+      'node --import tsx --test --test-name-pattern "Windows \\.cmd wrapper" test/unit/pi-rpc-process.test.ts test/unit/pi-version.test.ts'
+    ),
+    'the windows job must run the targeted .cmd wrapper tree-kill and version-probe tests'
+  )
+})
+
+test(
+  'windows targeted job runs the exact tree-kill and version-probe selection',
+  {
+    // On Windows the targeted tests run for real (that is the job's purpose),
+    // so the self-skip counts asserted here are POSIX-only.
+    skip: isWindows ? 'Windows targeted CI runs the selected tests for real; counts differ there' : false
+  },
+  () => {
+    // The parent test runner's NODE_TEST_CONTEXT would switch the spawned
+    // `node --test` child to its IPC reporter, hiding the summary being asserted.
+    const env = { ...process.env }
+    delete env.NODE_TEST_CONTEXT
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        '--test',
+        '--test-name-pattern',
+        'Windows \\.cmd wrapper',
+        'test/unit/pi-rpc-process.test.ts',
+        'test/unit/pi-version.test.ts'
+      ],
+      { cwd: repoRoot, encoding: 'utf8', timeout: 120_000, env }
+    )
+    assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`)
+    // On POSIX both targeted tests self-skip; the anchored counts prove the
+    // selection can never silently drop to zero (or drift past two).
+    assert.match(result.stdout, /\btests 2\b/)
+    assert.match(result.stdout, /\bskipped 2\b/)
+  }
+)

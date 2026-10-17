@@ -117,7 +117,21 @@ temporary roots; `npm run smoke` passes placeholder provider keys only, so no re
 traffic are involved.
 `npm run eval:acp` runs in CI after the built-in-only smoke: the built adapter drives real Pi with a
 deterministic local provider extension, disposable roots and no provider network; Pi >= 1.2.0 must be on
-`PATH`.
+`PATH`. It asserts the persisted session lifecycle end to end on a separate session: `session/list`
+(id, cwd), close, `session/load` replaying the persisted user/assistant turns through Pi's `get_entries`,
+`session/set_config_option` switching `thought_level` to a level other than the current one (verified
+applied, and preserved across close and `session/resume` without replay), and `session/delete` removing
+the session file and its listing. A bounded default-launch variant then runs the adapter without
+`PI_ACP_PI_COMMAND`: its default `pi` discovery reroutes direct-JS installs to Bun, the runtime is
+proven by an extension receipt from inside Pi (never inferred from `PATH`), one ordinary provider
+prompt settles end to end in that same Bun-hosted process, and a second receipt proves the identical
+pid and Bun runtime. An explicit `PI_ACP_EVAL_PI` direct-JS entry is pinned as `pi` on a disposable
+bin prepended to `PATH` so default discovery really resolves the accepted entry. The
+variant skips when no direct-JS Pi/Bun combination is resolvable, unless `PI_ACP_EVAL_REQUIRE_DIRECT=1`
+makes the skip a failure. CI covers it in a dedicated Bun job (Bun setup, build, tests, smoke and the
+required default-launch eval) alongside the Node-only validate job, plus a Windows job running the real
+cmd.exe wrapper process-tree termination and hanging `--version` probe tree-kill tests; Windows has no
+shell-wrapper eval.
 `npm run eval:subagents:completion` and `npm run eval:subagents:cancel` are explicit manual probes, not CI
 coverage: they additionally require `PI_ACP_EVAL_SUBAGENTS` pointing at a clean `nicobailon/pi-subagents`
 git-main checkout at revision `29284cd943c0c7ee852593c6e02d2a60febf6ba4` (declared entry `./index.ts`).

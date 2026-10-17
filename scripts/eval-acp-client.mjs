@@ -1,9 +1,206 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises'
+import { accessSync, closeSync, constants as fsConstants, openSync, readSync, realpathSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { withSmokeAgent } from './smoke-client.mjs'
+
+/** POSIX PATH lookup mirroring the adapter's `findExecutableOnPath` (src/pi-rpc/command.ts). */
+function findExecutableOnPath(name, { cwd = process.cwd(), pathValue = process.env.PATH ?? '/usr/bin:/bin' } = {}) {
+  const resolvedCwd = cwd.replace(/\/+$/, '')
+  for (const dir of pathValue.split(':')) {
+    const base = dir === '' ? resolvedCwd : dir.startsWith('/') ? dir : `${resolvedCwd}/${dir}`
+    const candidate = `${base}/${name}`
+    try {
+      if (!statSync(candidate).isFile()) continue
+      accessSync(candidate, fsConstants.X_OK)
+      return candidate
+    } catch {
+      /* Not an executable file in this PATH entry. */
+    }
+  }
+  return null
+}
+
+/** Reads the `#!` interpreter line; null for non-shebang files (same probe bound as the adapter). */
+function readShebangLine(path) {
+  let fd
+  try {
+    fd = openSync(path, 'r')
+    const head = Buffer.alloc(512)
+    const length = readSync(fd, head, 0, head.length, 0)
+    const text = head.subarray(0, length).toString('latin1')
+    if (!text.startsWith('#!')) return null
+    const newline = text.indexOf('\n')
+    if (newline === -1 && length === head.length) return null
+    return text.slice(2, newline === -1 ? undefined : newline).trim()
+  } catch {
+    return null
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
+/**
+ * Mirrors the adapter's POSIX default-discovery Bun reroute
+ * (`bunRuntimeInvocation` in src/pi-rpc/command.ts): only direct-JS installs
+ * with a bare Node/Bun shebang and no `..` in the PATH candidate launch via
+ * Bun. Drift is caught end-to-end by the direct variant's runtime receipt: if
+ * the adapter stops rerouting, the Bun receipt assertion fails in CI.
+ */
+function classifyDefaultLaunchPi({ explicit, pathValue = process.env.PATH, cwd = process.cwd() } = {}) {
+  const bun = findExecutableOnPath('bun', { cwd, pathValue })
+  if (!bun) return { bunLaunch: false, reason: 'bun not found on PATH' }
+  const candidate = explicit ?? findExecutableOnPath('pi', { cwd, pathValue })
+  if (!candidate) return { bunLaunch: false, reason: 'pi not found on PATH' }
+  if (candidate.split('/').includes('..'))
+    return { bunLaunch: false, reason: `PATH candidate contains ..: ${candidate}` }
+  let entry
+  try {
+    entry = realpathSync.native(candidate)
+  } catch {
+    return { bunLaunch: false, reason: `cannot resolve ${candidate}` }
+  }
+  if (!/\.(?:js|mjs|cjs)$/i.test(entry)) return { bunLaunch: false, reason: `not a direct-JS entry: ${entry}` }
+  const interpreter = readShebangLine(entry)
+  if (
+    !interpreter ||
+    !(/^\/\S*\/env[ \t]+(?:node|bun)$/.test(interpreter) || /^\/\S*\/(?:node|bun)$/.test(interpreter))
+  )
+    return { bunLaunch: false, reason: `shebang keeps its configured runtime: ${interpreter ?? 'none'}` }
+  return {
+    bunLaunch: true,
+    reason: `direct-JS entry ${entry} launches via bun`,
+    piPath: candidate,
+    piDir: dirname(candidate),
+    entry,
+    bun
+  }
+}
+
+/** Selfcheck for the classifier above: synthetic installs, no process spawning. */
+
+/**
+ * The direct variant's default discovery resolves `pi` from PATH, so an
+ * accepted explicit entry must actually be reachable under that name:
+ * pinning its directory does not help when it contains no `pi` (e.g. a
+ * dist/cli.js entry). Create a disposable bin whose `pi` symlink points at
+ * the exact accepted entry; the caller prepends it to PATH.
+ */
+async function pinExplicitPiBin(entry, binDir) {
+  await mkdir(binDir, { recursive: true })
+  await symlink(entry, join(binDir, 'pi'))
+  return binDir
+}
+
+async function directLaunchSelfcheck() {
+  const dir = await mkdtemp(join(tmpdir(), 'pi-acp-direct-selfcheck-'))
+  const binDir = async name => {
+    const created = join(dir, name)
+    await mkdir(created, { recursive: true })
+    await writeFile(join(created, 'bun'), '#!/bin/sh\n', { mode: 0o755 })
+    return created
+  }
+  try {
+    const cwd = join(dir, 'work')
+    await mkdir(cwd)
+    // Deterministic lookup space: every scenario pins its own PATH; the tail
+    // entry never exists, so ambient system binaries cannot leak in.
+    const elsewhere = join(dir, 'not-a-real-dir')
+    const scoped = bin => `${bin}:${elsewhere}`
+    // npm-style direct-JS install: a bin symlink to a `#!/usr/bin/env node` JS entry.
+    const direct = await binDir('direct')
+    await mkdir(join(dir, 'pkg'))
+    await writeFile(join(dir, 'pkg', 'cli.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
+    await symlink(join(dir, 'pkg', 'cli.js'), join(direct, 'pi'))
+    const viaBun = classifyDefaultLaunchPi({ pathValue: scoped(direct), cwd })
+    assert.equal(viaBun.bunLaunch, true)
+    assert.equal(viaBun.entry, join(realpathSync.native(dir), 'pkg', 'cli.js'))
+    assert.equal(viaBun.piDir, direct)
+    assert.equal(viaBun.bun, join(direct, 'bun'))
+    // Every later scenario is also a bin symlink, so only the intended
+    // discriminator (shebang, entry extension, missing dependency) differs.
+    const piSymlink = async (bin, entryName, content) => {
+      await writeFile(join(bin, entryName), content, { mode: 0o755 })
+      await symlink(join(bin, entryName), join(bin, 'pi'))
+    }
+    // Bare `bun` shebang entries reroute too.
+    const bunShebang = await binDir('bun-shebang')
+    await piSymlink(bunShebang, 'entry.js', '#!/usr/bin/env bun\n')
+    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(bunShebang), cwd }).bunLaunch, true)
+    // A shell launcher keeps its configured runtime.
+    const shell = await binDir('shell')
+    await piSymlink(shell, 'entry.js', '#!/bin/sh\nexec pi "$@"\n')
+    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(shell), cwd }).bunLaunch, false)
+    // Interpreter flags and non-JS entries never reroute.
+    const flags = await binDir('flags')
+    await piSymlink(flags, 'entry.js', '#!/usr/bin/env -S node --flag\n')
+    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(flags), cwd }).bunLaunch, false)
+    const script = await binDir('script')
+    await piSymlink(script, 'entry.sh', '#!/usr/bin/env node\n')
+    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(script), cwd }).bunLaunch, false)
+    // No bun on PATH: the default launch stays on the configured runtime.
+    const noBun = join(dir, 'no-bun')
+    await mkdir(noBun)
+    await writeFile(join(noBun, 'entry.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
+    await symlink(join(noBun, 'entry.js'), join(noBun, 'pi'))
+    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(noBun), cwd }).bunLaunch, false)
+    // No pi on PATH at all (bun is available).
+    const bunOnly = await binDir('bun-only')
+    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(bunOnly), cwd }).bunLaunch, false)
+    // A PATH candidate containing `..` is never Bun-launched: Bun's realpath
+    // collapses it lexically, so the resolved entry identity cannot be trusted.
+    const dotdot = await binDir('dotdot')
+    await mkdir(join(dotdot, 'x'))
+    await piSymlink(dotdot, 'entry.js', '#!/usr/bin/env node\n')
+    const dotdotResult = classifyDefaultLaunchPi({ pathValue: `${dotdot}/x/..:${elsewhere}`, cwd })
+    assert.equal(dotdotResult.bunLaunch, false)
+    assert.match(dotdotResult.reason, /\.\./)
+    // Explicit PI_ACP_EVAL_PI handling: a direct-JS entry is used as given
+    // (its directory is pinned ahead of PATH for default discovery); an
+    // explicit shell launcher never guesses at Bun.
+    const explicitDirect = classifyDefaultLaunchPi({
+      explicit: join(direct, 'pi'),
+      pathValue: scoped(shell),
+      cwd
+    })
+    assert.equal(explicitDirect.bunLaunch, true)
+    assert.equal(explicitDirect.piDir, direct)
+    assert.equal(
+      classifyDefaultLaunchPi({ explicit: join(shell, 'pi'), pathValue: scoped(direct), cwd }).bunLaunch,
+      false
+    )
+    // An explicit entry that cannot be resolved skips instead of guessing.
+    assert.equal(
+      classifyDefaultLaunchPi({ explicit: join(dir, 'missing'), pathValue: scoped(direct), cwd }).bunLaunch,
+      false
+    )
+    // Explicit PI_ACP_EVAL_PI entries are pinned as `pi` on a disposable bin:
+    // the classifier accepts a direct-JS entry, but default discovery
+    // resolves `pi` from PATH, so the entry must actually be reachable under
+    // that name for the direct variant to prove the accepted entry.
+    const pinned = await mkdtemp(join(dir, 'pinned-bin-'))
+    await pinExplicitPiBin(viaBun.entry, pinned)
+    const pinnedResult = classifyDefaultLaunchPi({ pathValue: `${pinned}:${scoped(direct)}`, cwd })
+    assert.equal(pinnedResult.bunLaunch, true)
+    assert.equal(pinnedResult.piPath, join(pinned, 'pi'))
+    assert.equal(pinnedResult.piDir, pinned)
+    assert.equal(pinnedResult.entry, viaBun.entry)
+    // Empty PATH entries resolve against the cwd, like the adapter.
+    await writeFile(join(cwd, 'entry.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
+    await symlink(join(cwd, 'entry.js'), join(cwd, 'pi'))
+    assert.equal(classifyDefaultLaunchPi({ pathValue: `:${direct}`, cwd }).bunLaunch, true)
+    console.log('selfcheck-direct ok')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+if (process.argv.includes('--selfcheck-direct')) {
+  await directLaunchSelfcheck()
+  process.exit(0)
+}
 
 // Actual built ACP stdio + installed Pi; only the provider and extension work are deterministic.
 const root = await mkdtemp(join(tmpdir(), 'pi-acp-client-eval-'))
@@ -532,6 +729,128 @@ try {
       assert.equal((await rejectedPrompt('/eval-confirm')).stopReason, 'end_turn')
       check('real Pi admits idle foreground with restored live child without adoption or stop', true)
       await client.request('session/close', { sessionId: rejectedSession.sessionId })
+      // Audit finding 6: the persisted session lifecycle runs on its own
+      // session and phase, so the trace slices asserted above stay unperturbed.
+      const lifecycleSession = await client.request('session/new', {
+        cwd: root,
+        mcpServers: [],
+        additionalDirectories: [wsRoot]
+      })
+      const lifecyclePrompt = text =>
+        client.request('session/prompt', {
+          sessionId: lifecycleSession.sessionId,
+          prompt: [{ type: 'text', text }]
+        })
+      assert.equal((await lifecyclePrompt('/eval-runtime')).stopReason, 'end_turn')
+      const runtimeReceipts = () =>
+        client.updates.filter(
+          u => u.sessionUpdate === 'agent_message_chunk' && u.content.text?.startsWith('RUNTIME_RECEIPT ')
+        )
+      assert.equal(runtimeReceipts().length, 1)
+      const wrapperRuntime = JSON.parse(runtimeReceipts()[0].content.text.slice('RUNTIME_RECEIPT '.length))
+      assert.equal(wrapperRuntime.bun, null, 'the wrapper variant must run real Pi under Node')
+      assert.ok(typeof wrapperRuntime.node === 'string' && wrapperRuntime.node)
+      console.log(`Wrapper variant Pi runtime: node ${wrapperRuntime.node}, pid ${wrapperRuntime.pid}`)
+      check('wrapper variant runs real Pi under Node (extension runtime receipt)', true)
+      assert.equal((await lifecyclePrompt('persisted lifecycle turn')).stopReason, 'end_turn')
+      const lifecycleFileStart = (await trace()).length
+      assert.equal((await lifecyclePrompt('/eval-confirm')).stopReason, 'end_turn')
+      const lifecycleIdentity = JSON.parse(
+        (await trace()).slice(lifecycleFileStart).find(e => e.statusKey === 'eval-session').statusText
+      )
+      assert.equal(lifecycleIdentity.id, lifecycleSession.sessionId)
+      const listed = await client.request('session/list', { cwd: root })
+      const listedLifecycle = listed.sessions.find(s => s.sessionId === lifecycleSession.sessionId)
+      assert.ok(listedLifecycle, 'the persisted lifecycle session must be listed')
+      // Pi records the session cwd in its canonical (realpath) form, which on
+      // macOS resolves the tmpdir symlink; assert directory identity instead.
+      assert.equal(realpathSync.native(listedLifecycle.cwd), realpathSync.native(root))
+      await client.request('session/close', { sessionId: lifecycleSession.sessionId })
+      const lifecycleLoadBefore = client.messages.length
+      const lifecycleLoadStart = (await trace()).length
+      const loaded = await client.request('session/load', {
+        sessionId: lifecycleSession.sessionId,
+        cwd: root,
+        mcpServers: [],
+        additionalDirectories: [wsRoot]
+      })
+      const replayedChunks = update =>
+        client.messages
+          .slice(lifecycleLoadBefore)
+          .filter(
+            m =>
+              m.method === 'session/update' &&
+              m.params.sessionId === lifecycleSession.sessionId &&
+              m.params.update.sessionUpdate === update
+          )
+          .map(m => m.params.update)
+      assert.ok(
+        replayedChunks('user_message_chunk').some(u => u.content.text.includes('persisted lifecycle turn')),
+        'load must replay the persisted user turn'
+      )
+      assert.ok(
+        replayedChunks('agent_message_chunk').some(u => u.content.text.includes('HARNESS_RESPONSE')),
+        'load must replay the persisted assistant turn'
+      )
+      const loadRecords = (await trace()).slice(lifecycleLoadStart)
+      assert.ok(
+        loadRecords.some(e => e.direction === 'in' && e.type === 'get_entries'),
+        'load must request real Pi get_entries'
+      )
+      assert.ok(loadRecords.some(e => e.type === 'response' && e.command === 'get_entries' && e.success))
+      const thoughtLevel = loaded.configOptions.find(o => o.id === 'thought_level')
+      assert.ok(thoughtLevel, 'load must advertise the thought_level config option')
+      // A discriminating change: the requested level must differ from the
+      // current one, so a dropped write or a value lost across close/resume
+      // fails the assertions below instead of comparing a level to itself.
+      const currentLevel = thoughtLevel.currentValue
+      assert.ok(thoughtLevel.options.length > 1, 'thought_level must advertise more than the current level')
+      const requestedLevel = thoughtLevel.options.find(o => o.value !== currentLevel)?.value
+      assert.ok(requestedLevel, 'an advertised level other than the current one must exist')
+      const configured = await client.request('session/set_config_option', {
+        sessionId: lifecycleSession.sessionId,
+        configId: 'thought_level',
+        value: requestedLevel
+      })
+      assert.ok(
+        configured.configOptions.some(o => o.id === 'thought_level' && o.currentValue === requestedLevel),
+        'set_config_option must apply a different advertised thought level'
+      )
+      await client.request('session/close', { sessionId: lifecycleSession.sessionId })
+      const resumeBefore = client.messages.length
+      const resumed = await client.request('session/resume', {
+        sessionId: lifecycleSession.sessionId,
+        cwd: root,
+        mcpServers: [],
+        additionalDirectories: [wsRoot]
+      })
+      assert.ok(
+        resumed.configOptions.some(o => o.id === 'thought_level' && o.currentValue === requestedLevel),
+        'resume must preserve the changed thought level'
+      )
+      assert.equal(
+        client.messages
+          .slice(resumeBefore)
+          .filter(
+            m =>
+              m.method === 'session/update' &&
+              m.params.sessionId === lifecycleSession.sessionId &&
+              ['user_message_chunk', 'agent_message_chunk'].includes(m.params.update.sessionUpdate)
+          ).length,
+        0,
+        'resume must not replay conversation history'
+      )
+      await client.request('session/delete', { sessionId: lifecycleSession.sessionId })
+      await assert.rejects(readFile(lifecycleIdentity.file), error => error.code === 'ENOENT')
+      const listedAfterDelete = await client.request('session/list', { cwd: root })
+      assert.ok(
+        !listedAfterDelete.sessions.some(s => s.sessionId === lifecycleSession.sessionId),
+        'the deleted session must not be listed'
+      )
+      check(
+        'persisted lifecycle: list(id,cwd), close, get_entries replay, thought_level config, resume without replay, delete removes file and listing',
+        true
+      )
       const disconnectSession = await client.request('session/new', {
         cwd: root,
         mcpServers: [],
@@ -607,6 +926,119 @@ try {
     'workspace-root instructions reach every distinct provider request at full evaluation end, including extension-triggered runs and post-tool-call continuations',
     [...uniqueRequests.values()].every(Boolean)
   )
+
+  // Default-launch variant (audit finding 6): run the adapter WITHOUT
+  // PI_ACP_PI_COMMAND so its own default discovery resolves `pi` from PATH
+  // and reroutes direct-JS installs to Bun. The runtime is proven by the
+  // extension receipt inside Pi, never inferred from PATH. Bounded and
+  // minimal by design: one command-only turn; the wrapper variant above
+  // remains the full-tracing lifecycle evaluation.
+  const direct =
+    process.platform === 'win32'
+      ? { bunLaunch: false, reason: 'Windows default launch has its own CI job; the Bun reroute is POSIX-only' }
+      : classifyDefaultLaunchPi({ explicit: process.env.PI_ACP_EVAL_PI })
+  if (!direct.bunLaunch) {
+    if (process.env.PI_ACP_EVAL_REQUIRE_DIRECT === '1')
+      throw new Error(`direct-launch variant required but unavailable: ${direct.reason}`)
+    console.log(`SKIP direct-launch variant: ${direct.reason}`)
+  } else {
+    const directRoot = await mkdtemp(join(tmpdir(), 'pi-acp-direct-'))
+    // Default discovery resolves `pi` from PATH, and the accepted entry's own
+    // directory need not contain one (e.g. an explicit dist/cli.js), so pin a
+    // disposable bin whose `pi` symlink points at the exact accepted entry.
+    const pinnedBin = await pinExplicitPiBin(direct.entry, join(directRoot, 'bin'))
+    console.log(
+      `Direct-launch variant: ${direct.reason} (bun ${direct.bun}, pi pinned to ${join(pinnedBin, 'pi')} ahead of PATH)`
+    )
+    try {
+      // The agent-dir extension auto-loads (no wrapper --extension), so the
+      // isolated agent directory carries the provider settings and receipt.
+      await mkdir(join(directRoot, 'agent', 'extensions'), { recursive: true })
+      await writeFile(
+        join(directRoot, 'agent', 'settings.json'),
+        JSON.stringify({ defaultProvider: 'acp-eval', defaultModel: 'local' })
+      )
+      await writeFile(
+        join(directRoot, 'agent', 'extensions', 'eval.ts'),
+        await readFile(new URL('./fixtures/acp-harness-extension.ts', import.meta.url))
+      )
+      await withSmokeAgent(
+        async client => {
+          await client.request('initialize', {
+            protocolVersion: 1,
+            clientInfo: { name: 'acp-client-eval', version: '1' },
+            clientCapabilities: {}
+          })
+          const { sessionId } = await client.request('session/new', { cwd: directRoot, mcpServers: [] })
+          const result = await client.request('session/prompt', {
+            sessionId,
+            prompt: [{ type: 'text', text: '/eval-runtime' }]
+          })
+          assert.equal(result.stopReason, 'end_turn')
+          const runtimeReceipts = () =>
+            client.updates.filter(
+              u => u.sessionUpdate === 'agent_message_chunk' && u.content.text?.startsWith('RUNTIME_RECEIPT ')
+            )
+          assert.equal(runtimeReceipts().length, 1)
+          const receipt = JSON.parse(runtimeReceipts()[0].content.text.slice('RUNTIME_RECEIPT '.length))
+          assert.equal(typeof receipt.pid, 'number')
+          assert.ok(typeof receipt.node === 'string' && receipt.node)
+          assert.ok(
+            typeof receipt.bun === 'string' && receipt.bun.length > 0,
+            'the default launch must run direct-JS Pi under Bun'
+          )
+          console.log(
+            `Direct default launch: Pi pid ${receipt.pid} under bun ${receipt.bun} (node compat ${receipt.node})`
+          )
+          // One ordinary provider prompt through the same Bun-hosted Pi
+          // process: the receipt proves the runtime, this proves the adapter's
+          // turn lifecycle and the deterministic provider path actually run
+          // under it.
+          const ordinary = await client.request('session/prompt', {
+            sessionId,
+            prompt: [{ type: 'text', text: 'direct-launch ordinary provider prompt' }]
+          })
+          assert.equal(ordinary.stopReason, 'end_turn')
+          const chunks = client.updates
+            .filter(u => u.sessionUpdate === 'agent_message_chunk')
+            .map(u => u.content.text)
+            .join('\n')
+          assert.ok(
+            chunks.includes('HARNESS_RESPONSE'),
+            'the ordinary prompt must settle a provider turn (HARNESS_RESPONSE)'
+          )
+          check('default launch without PI_ACP_PI_COMMAND runs direct-JS Pi under Bun (runtime receipt)', true)
+          // Same-process proof: a second runtime receipt after the ordinary
+          // provider prompt must report the identical pid and Bun runtime, so
+          // the ordinary turn genuinely ran in the receipted Bun-hosted Pi.
+          const secondRuntime = await client.request('session/prompt', {
+            sessionId,
+            prompt: [{ type: 'text', text: '/eval-runtime' }]
+          })
+          assert.equal(secondRuntime.stopReason, 'end_turn')
+          assert.equal(runtimeReceipts().length, 2, 'the second runtime receipt must arrive on the same session')
+          const [firstReceipt, secondReceipt] = runtimeReceipts().map(u =>
+            JSON.parse(u.content.text.slice('RUNTIME_RECEIPT '.length))
+          )
+          assert.equal(secondReceipt.pid, firstReceipt.pid, 'the ordinary prompt must run in the same Pi process')
+          assert.equal(secondReceipt.bun, firstReceipt.bun, 'the same Pi process must still be hosted by Bun')
+          assert.ok(secondReceipt.bun)
+          check('default-launch ordinary provider prompt settles end to end under Bun (same-process pid receipt)', true)
+        },
+        {
+          timeoutMs: 60_000,
+          env: {
+            PATH: `${pinnedBin}${delimiter}${process.env.PATH}`,
+            HOME: directRoot,
+            XDG_CONFIG_HOME: directRoot,
+            PI_CODING_AGENT_DIR: join(directRoot, 'agent')
+          }
+        }
+      )
+    } finally {
+      await rm(directRoot, { recursive: true, force: true })
+    }
+  }
 } finally {
   if (process.env.PI_ACP_EVAL_LOG_DIR) {
     const destination = resolve(process.env.PI_ACP_EVAL_LOG_DIR)
