@@ -102,6 +102,24 @@ export class FakePiRpcProcess {
     }
   }
 
+  private channelUnusableHandlers: Array<() => void> = []
+
+  // Mirrors PiRpcProcess.onChannelUnusable; see emitChannelUnusable for the
+  // delivery model.
+  onChannelUnusable(handler: () => void): () => void {
+    this.channelUnusableHandlers.push(handler)
+    return () => {
+      this.channelUnusableHandlers = this.channelUnusableHandlers.filter(h => h !== handler)
+    }
+  }
+
+  // Unlike the real PiRpcProcess (one-shot by construction), this does not
+  // dedupe deliveries so tests can assert session-side idempotency, matching
+  // the emitTermination model above.
+  emitChannelUnusable() {
+    for (const handler of [...this.channelUnusableHandlers]) handler()
+  }
+
   // Unlike the real PiRpcProcess (which notifies at most once), this does not
   // dedupe deliveries so tests can assert session-side idempotency.
   emitTermination(info: Partial<PiRpcTermination> = {}) {

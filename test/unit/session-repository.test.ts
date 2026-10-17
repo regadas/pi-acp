@@ -1,6 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, utimesSync, writeFileSync, writeSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  realpathSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+  writeSync
+} from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { syncBuiltinESMExports } from 'node:module'
 import { join, resolve } from 'node:path'
@@ -658,4 +669,67 @@ test('repository carries additional directories through find and list refreshes'
   store.upsert({ sessionId: 'with-roots', cwd: root, sessionFile: join(sessions, 'displaced.jsonl') })
   assert.deepEqual(store.get('with-roots')?.additionalDirectories, ['/ws/one', '/ws/two'])
   assert.deepEqual((await repository.find('with-roots', root))?.additionalDirectories, ['/ws/one', '/ws/two'])
+})
+
+test('repository.list scopes sessions by cwd filesystem identity, not realpath', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-cwd-identity-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const parent = join(root, 'paths')
+  const workspaceProject = join(parent, 'project')
+  const otherProject = join(parent, 'other', 'project')
+  mkdirSync(join(parent, 'other', 'nested'), { recursive: true })
+  mkdirSync(workspaceProject)
+  mkdirSync(otherProject)
+  symlinkSync(join(parent, 'other', 'nested'), join(parent, 'link'))
+  // `parent/link/..` is physically `parent/other`, so the raw path records a
+  // session in otherProject even though it lexically collapses to workspaceProject.
+  const raw = `${parent}/link/../project`
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  const writeSession = (name: string, cwd: string) =>
+    writeFileSync(join(sessions, `${name}.jsonl`), `${JSON.stringify({ type: 'session', id: name, cwd })}\n`)
+  writeSession('raw-cwd', raw)
+  writeSession('direct-cwd', workspaceProject)
+  const repository = new SessionRepository(
+    new SessionStore(join(root, 'map.json')),
+    { PI_CODING_AGENT_SESSION_DIR: sessions },
+    join(root, 'agent')
+  )
+
+  assert.deepEqual(
+    (await repository.list(workspaceProject)).map(record => record.sessionId),
+    ['direct-cwd'],
+    'a physically different directory reached through symlink/.. stays out of scope'
+  )
+  assert.deepEqual(
+    (await repository.list(raw)).map(record => record.sessionId),
+    ['raw-cwd'],
+    'the raw path scopes to its physical target only'
+  )
+
+  // Bun 1.4.2's realpathSync.native lexically collapses `symlink/..` and
+  // resolves the raw path to workspaceProject; emulate that runtime to
+  // prove list filtering discriminates by identity, not the lying realpath.
+  const originalNative = realpathSync.native
+  const collapsed = originalNative(workspaceProject)
+  realpathSync.native = ((path: string, ...rest: unknown[]) =>
+    path === raw
+      ? collapsed
+      : (originalNative as unknown as (...args: unknown[]) => string)(path, ...rest)) as typeof realpathSync.native
+  try {
+    assert.equal(realpathSync.native(raw), collapsed, 'precondition: the emulated runtime lies about the raw path')
+    assert.deepEqual(
+      (await repository.list(workspaceProject)).map(record => record.sessionId),
+      ['direct-cwd'],
+      'identity, not the collapsed realpath, decides list scope'
+    )
+    assert.deepEqual(
+      (await repository.list(raw)).map(record => record.sessionId),
+      ['raw-cwd'],
+      'the physically aliased session stays reachable through the raw path'
+    )
+  } finally {
+    realpathSync.native = originalNative
+  }
 })

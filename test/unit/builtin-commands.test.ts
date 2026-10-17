@@ -202,3 +202,47 @@ test('PiAcpAgent: /name sets session display name adapter-side', async () => {
 
   assert.match(lastAgentMessageText(conn), /Session name set: My Session/)
 })
+
+test('PiAcpAgent: /name and /compact preserve the raw free-text remainder', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+
+  const named: string[] = []
+  proc.setSessionName = async (name: string) => {
+    named.push(name)
+  }
+  const compacted: Array<string | undefined> = []
+  proc.compact = async (instructions?: string) => {
+    compacted.push(instructions)
+    return { tokensBefore: 42 }
+  }
+  const steering: string[] = []
+  proc.getState = async () => ({ steeringMode: 'all' })
+  proc.setSteeringMode = async (mode: string) => {
+    steering.push(mode)
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(makeSession(conn, proc)) as any
+
+  const prompt = (text: string) => agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text }] } as any)
+
+  assert.equal((await prompt(`/name Bob's "quick" refactor`)).stopReason, 'end_turn')
+  assert.deepEqual(named, [`Bob's "quick" refactor`], 'apostrophes and quotes survive the raw remainder')
+  const info = conn.updates.find(u => (u as any).update?.sessionUpdate === 'session_info_update')
+  assert.equal((info as any)?.update?.title, `Bob's "quick" refactor`)
+  assert.match(lastAgentMessageText(conn), /Session name set: Bob's "quick" refactor/)
+
+  assert.equal((await prompt(`/name double  spaced`)).stopReason, 'end_turn')
+  assert.deepEqual(named, [`Bob's "quick" refactor`, 'double  spaced'], 'inner spacing survives the raw remainder')
+
+  assert.equal((await prompt(`/compact don't drop "API v2" notes`)).stopReason, 'end_turn')
+  assert.deepEqual(compacted, [`don't drop "API v2" notes`], 'compaction instructions reach pi verbatim')
+  assert.match(lastAgentMessageText(conn), /Compaction completed\. \(custom instructions applied\)/)
+  assert.match(lastAgentMessageText(conn), /Tokens before: 42/)
+
+  // Token-consuming commands keep the parsed-argument behavior.
+  assert.equal((await prompt('/steering one-at-a-time')).stopReason, 'end_turn')
+  assert.deepEqual(steering, ['one-at-a-time'])
+  assert.equal(proc.prompts.length, 0, 'adapter commands never reach pi as prompts')
+})

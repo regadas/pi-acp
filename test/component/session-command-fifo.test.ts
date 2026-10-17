@@ -732,7 +732,7 @@ for (const ending of ['cancel', 'failure']) {
         proc.emit({ type: 'session_info_changed', name })
       }
     })
-    const command = session.runCommand(ctx => runBuiltinCommand(session, 'name', ['Later'], ctx))
+    const command = session.runCommand(ctx => runBuiltinCommand(session, 'name', ['Later'], ctx, 'Later'))
     const failure = ending === 'failure' ? assert.rejects(command, /pi process exited unexpectedly/) : undefined
     await tick()
     assert.equal(proc.hasPendingRequests(), false)
@@ -768,7 +768,7 @@ test('PiAcpSession: successful builtin /name echo deduplicates and leaves idle t
       proc.emit({ type: 'session_info_changed', name })
     }
   })
-  const result = await session.runCommand(ctx => runBuiltinCommand(session, 'name', ['Named'], ctx))
+  const result = await session.runCommand(ctx => runBuiltinCommand(session, 'name', ['Named'], ctx, 'Named'))
   assert.deepEqual(result, { stopReason: 'end_turn' })
   await session.cancel()
   proc.emit({ type: 'session_info_changed', name: 'Idle title' })
@@ -796,7 +796,7 @@ for (const waiting of ['queued', 'parked', 'admitting']) {
     let ran = false
     const command = session.runCommand(async ctx => {
       ran = true
-      return runBuiltinCommand(session, 'name', ['Not run'], ctx)
+      return runBuiltinCommand(session, 'name', ['Not run'], ctx, 'Not run')
     })
     if (waiting !== 'admitting') await tick()
     proc.emit({ type: 'session_info_changed', name: 'Independent title' })

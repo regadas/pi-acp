@@ -50,8 +50,49 @@ export function resolveCwdForComparison(cwd: string, flavor?: PathFlavor): strin
   return normalizeCwdForComparison(flavor ? cwd : (physicalPath(cwd) ?? cwd), flavor)
 }
 
+/**
+ * Filesystem identity of an existing directory: the stat dev/ino pair, which
+ * follows symlinks and `..` physically on every supported runtime. Bun's
+ * `realpathSync.native` lexically collapses `symlink/..`, so resolved paths
+ * are not a reliable directory identity there. Null when stat cannot supply
+ * one, in which case callers fall back to path comparison.
+ */
+export function directoryIdentity(path: string): string | null {
+  try {
+    const stats = statSync(path)
+    if (!stats.isDirectory()) return null
+    return identityFromStats(stats)
+  } catch {
+    return null
+  }
+}
+
+export function identityFromStats(stats: Stats): string | null {
+  return stats.dev !== 0 || stats.ino !== 0 ? `${stats.dev}:${stats.ino}` : null
+}
+
+export type DirectoryKey = { identity: string | null; comparison: string }
+
+export function directoryKey(path: string, identity?: string | null): DirectoryKey {
+  return { identity: identity ?? directoryIdentity(path), comparison: resolveCwdForComparison(path) }
+}
+
+/** Two directories alias each other: exact filesystem identity when both sides have one, resolved paths otherwise. */
+export function directoriesAlias(left: DirectoryKey, right: DirectoryKey): boolean {
+  if (left.identity !== null && right.identity !== null) return left.identity === right.identity
+  return left.comparison === right.comparison
+}
+
+/**
+ * Primary cwd matching: existing directories compare by filesystem identity
+ * (realpath equivalence is preserved on runtimes with a truthful realpath,
+ * and Bun's lexically collapsing realpath cannot equate different real
+ * directories), while deleted directories fall back to resolved-path
+ * comparison. Explicit flavors stay purely lexical.
+ */
 export function sessionCwdsEquivalent(left: string, right: string, flavor?: PathFlavor): boolean {
-  return resolveCwdForComparison(left, flavor) === resolveCwdForComparison(right, flavor)
+  if (flavor) return resolveCwdForComparison(left, flavor) === resolveCwdForComparison(right, flavor)
+  return directoriesAlias(directoryKey(left), directoryKey(right))
 }
 
 export function assertValidSessionCwd(cwd: string): void {

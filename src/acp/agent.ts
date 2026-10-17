@@ -117,14 +117,19 @@ type SessionRestoreOpts = {
    */
   loadOwned?: boolean
   /**
-   * Internal: load-admission fence value observed when a root-changing
-   * request was admitted, before its first yield. A newer session/load bumps
-   * it, so from that point on this request's roots are stale: every
-   * re-entry into restoreSession must fail closed instead of re-applying
-   * them (the wrapper's post-return check alone is too late after a
-   * mutation).
+   * Internal: arrival-ordinal baseline captured when a root-changing request
+   * was admitted. Only a *valid* load that arrived after that ordinal (and
+   * was admitted) supersedes the request's roots; older, still-pending or
+   * invalid loads never do.
    */
-  rootMutationGeneration?: number
+  loadArrivalBaseline?: number
+  /**
+   * Internal: close-admission fence captured when a config mutation was
+   * admitted. A close/delete admitted after it invalidates the mutation, so
+   * every (re-)entry into the restore loop fails closed instead of spawning
+   * or registering a child behind the close's back.
+   */
+  closeAdmission?: number
 }
 
 export class PiAcpAgent implements ACPAgent {
@@ -137,10 +142,43 @@ export class PiAcpAgent implements ACPAgent {
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
   private readonly cancellationEpochs = new Map<string, number>()
   private readonly loadGenerations = new Map<string, number>()
-  /** Load admissions only; unlike loadGenerations, close/delete do not bump it. */
-  private readonly loadAdmissionGenerations = new Map<string, number>()
+  /**
+   * Monotonic arrival ordinals for session/load requests, issued
+   * synchronously at arrival (before any await) so later-vs-earlier stays
+   * stable even when validations settle out of order.
+   */
+  private readonly loadArrivals = new Map<string, number>()
+  /**
+   * The arrival ordinal of the most recently admitted *valid* load. Only a
+   * valid load's admission updates it, so an invalid or still-pending load
+   * never supersedes earlier work.
+   */
+  private readonly validLoadArrivals = new Map<string, number>()
+  /**
+   * Whole admitted resume operations, registered synchronously at
+   * admission. A resume parks on load-validation gates before it is
+   * registered anywhere else, so a close or delete drains these before its
+   * final sweep: no child or request may survive the acknowledged
+   * close/delete.
+   */
+  private readonly activeResumes = new Map<string, Set<Promise<void>>>()
+  /**
+   * Close admissions only (session/close and the close inside session/delete);
+   * loads and prompts do not bump it, and it is never cleaned up. Config
+   * mutations capture it at admission so a close admitted after them
+   * invalidates their queued or in-flight work instead of letting it restore
+   * a session behind the close's back.
+   */
+  private readonly closeAdmissionGenerations = new Map<string, number>()
   private readonly activePrompts = new Map<string, Set<Promise<void>>>()
   private readonly activeLoads = new Map<string, Set<Promise<void>>>()
+  /**
+   * In-flight load-admission validations keyed by session. The resolved
+   * signal (never rejected) lets waiters observe a validating load's
+   * admission fences before they commit; the entry is cleared in its own
+   * settlement chain so a waiter can never loop on a settled gate.
+   */
+  private readonly sessionValidations = new Map<string, Promise<void>>()
   private readonly closingSessions = new Map<string, Promise<void>>()
   // Delete transactions in flight. A delete owns its session from the close
   // through the retirement wait, the unlink, and the store tombstone; restoring
@@ -288,15 +326,41 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   /**
-   * Fence counter for root-changing resumes: only a session/load bumps it.
-   * A close/delete coalesces instead — its teardown waits for an in-flight
-   * resume and leaves nothing behind to overwrite, so the pinned close
-   * semantics stay untouched.
+   * Arrival ordinal for a session/load, issued synchronously at arrival
+   * (before any await) so later-vs-earlier stays stable even when
+   * validations settle out of order.
    */
-  private bumpLoadAdmission(sessionId: string): number {
-    const admission = (this.loadAdmissionGenerations.get(sessionId) ?? 0) + 1
-    this.loadAdmissionGenerations.set(sessionId, admission)
-    return admission
+  private nextLoadArrival(sessionId: string): number {
+    const arrival = (this.loadArrivals.get(sessionId) ?? 0) + 1
+    this.loadArrivals.set(sessionId, arrival)
+    return arrival
+  }
+
+  /**
+   * Whether a *valid* load that arrived after `baseline` has been admitted:
+   * the only event that makes a root-changing request's committed roots
+   * stale. Strictly greater, so an older load's late admission never calls
+   * itself newer.
+   */
+  private supersededByValidLoad(sessionId: string, baseline: number): boolean {
+    return (this.validLoadArrivals.get(sessionId) ?? 0) > baseline
+  }
+
+  private bumpCloseAdmission(sessionId: string): void {
+    this.closeAdmissionGenerations.set(sessionId, (this.closeAdmissionGenerations.get(sessionId) ?? 0) + 1)
+  }
+
+  /**
+   * Close fence for config mutations, captured at admission. `undefined`
+   * (every other restore caller) skips it: a close or delete admitted after
+   * the mutation invalidates it, so it fails closed before it can restore,
+   * re-register, or publish behind the close's back.
+   */
+  private assertCloseAdmissionCurrent(sessionId: string, closeAdmission: number | undefined): void {
+    if (closeAdmission === undefined) return
+    if ((this.closeAdmissionGenerations.get(sessionId) ?? 0) !== closeAdmission) {
+      throw RequestError.requestCancelled({}, `session closed while configuring: ${sessionId}`)
+    }
   }
 
   private assertLoadActive(sessionId: string, generation: number): void {
@@ -355,6 +419,33 @@ export class PiAcpAgent implements ACPAgent {
     })
   }
 
+  /**
+   * Track a whole admitted resume operation, registered synchronously at
+   * admission (before its first await) so a close or delete admitted later
+   * drains it before its final sweep instead of acknowledging around it.
+   */
+  private trackResume<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const result = Promise.resolve().then(operation)
+    const tracked = result.then(
+      () => undefined,
+      () => undefined
+    )
+
+    let active = this.activeResumes.get(sessionId)
+    if (!active) {
+      active = new Set()
+      this.activeResumes.set(sessionId, active)
+    }
+    active.add(tracked)
+
+    return result.finally(() => {
+      active.delete(tracked)
+      if (active.size === 0 && this.activeResumes.get(sessionId) === active) {
+        this.activeResumes.delete(sessionId)
+      }
+    })
+  }
+
   private async waitForActivePrompts(sessionId: string): Promise<void> {
     while (true) {
       const active = this.activePrompts.get(sessionId)
@@ -371,19 +462,89 @@ export class PiAcpAgent implements ACPAgent {
     }
   }
 
+  private async waitForActiveResumes(sessionId: string): Promise<void> {
+    while (true) {
+      const active = this.activeResumes.get(sessionId)
+      if (!active?.size) return
+      await Promise.all([...active])
+    }
+  }
+
+  /** Await a load's in-flight admission validation so a request about to commit observes its fences. */
+  private async waitForSessionValidation(sessionId: string): Promise<void> {
+    while (true) {
+      const pending = this.sessionValidations.get(sessionId)
+      if (!pending) return
+      await pending
+    }
+  }
+
+  /**
+   * Register this load's validation/admission span on the session's gate
+   * chain, synchronously at arrival: the new tail is chained on the previous
+   * one, so it can never overwrite a pending gate, and the caller's lookup
+   * does not start until the previous span's admission decision landed
+   * (serialization). `settle` must be called once that decision — admission
+   * or rejection — has landed, so gate waiters observe the load's admission
+   * fences before they commit.
+   */
+  private beginLoadValidationSpan(
+    sessionId: string,
+    cwd: string
+  ): {
+    validation: Promise<{ cwd: string; sessionFile: string; additionalDirectories: readonly string[] } | null>
+    settle: () => void
+  } {
+    const previous = this.sessionValidations.get(sessionId) ?? Promise.resolve()
+    let settle!: () => void
+    const spanSettled = new Promise<void>(resolve => {
+      settle = resolve
+    })
+    const tail = previous.then(() => spanSettled)
+    this.sessionValidations.set(sessionId, tail)
+    void tail.then(() => {
+      if (this.sessionValidations.get(sessionId) === tail) this.sessionValidations.delete(sessionId)
+    })
+    const validation = previous.then(() => this.findStoredSession(sessionId, cwd))
+    return { validation, settle }
+  }
+
+  private async waitForConfigMutations(sessionId: string): Promise<void> {
+    while (true) {
+      const tail = this.configMutationQueues.get(sessionId)
+      if (!tail) return
+      await tail
+    }
+  }
+
   private beginSessionClose(sessionId: string): Promise<void> {
     const inProgress = this.closingSessions.get(sessionId)
     if (inProgress) return inProgress
 
     this.bumpCancellationEpoch(sessionId)
     this.bumpLoadGeneration(sessionId)
+    this.bumpCloseAdmission(sessionId)
 
     const closing = Promise.resolve()
       .then(async () => {
         // Dispose anything already registered so in-flight load RPCs reject,
-        // then wait for every earlier load before a final cleanup sweep.
+        // and a live resume parked on an RPC to its child unblocks through
+        // that disposal instead of holding the close behind its own wait.
         await this.closeSessionResources(sessionId)
+        // Whole admitted resume operations are drained after that first
+        // teardown and before the final sweep: a resume parks on
+        // load-validation gates before it registers anywhere else, so
+        // without this drain a close could acknowledge while the resume
+        // still spawns its child behind the close's back. Draining them
+        // before the teardown instead would deadlock the close behind a
+        // resume that only disposal can settle.
+        await this.waitForActiveResumes(sessionId)
         await this.waitForActiveLoads(sessionId)
+        // Config mutations are not tracked as prompts or loads; the queue tail
+        // is the only record of writes still to settle. Waiting for it here
+        // keeps a pre-close write from publishing or restoring after the
+        // final sweep (the write itself fails at its close fence).
+        await this.waitForConfigMutations(sessionId)
         await this.closeSessionResources(sessionId)
       })
       .finally(() => {
@@ -443,14 +604,16 @@ export class PiAcpAgent implements ACPAgent {
   }
 
   /**
-   * A root-changing request fences load admissions at its first yield. A
-   * newer load bumps the counter; the request's roots are stale from that
-   * point on, so every (re-)entry into the restore loop fails closed before
-   * it can wait on, join, or replace children with those stale roots.
+   * A root-changing request fences load admissions at its first yield. Its
+   * roots are stale once a *valid* load that arrived after the request's
+   * admission ordinal has been admitted, so every (re-)entry into the
+   * restore loop fails closed before it can wait on, join, or replace
+   * children with those stale roots. Older, still-pending or invalid loads
+   * never supersede it.
    */
   private assertRootMutationCurrent(sessionId: string, opts?: SessionRestoreOpts): void {
-    if (opts?.rootMutationGeneration === undefined) return
-    if ((this.loadAdmissionGenerations.get(sessionId) ?? 0) !== opts.rootMutationGeneration) {
+    if (opts?.loadArrivalBaseline === undefined) return
+    if (this.supersededByValidLoad(sessionId, opts.loadArrivalBaseline)) {
       throw RequestError.requestCancelled({}, `session superseded by a newer load while restoring: ${sessionId}`)
     }
   }
@@ -462,9 +625,17 @@ export class PiAcpAgent implements ACPAgent {
     // supplies a replacement root list (load/resume) must not reuse a live
     // child configured with different roots; same roots reuse it.
     while (true) {
+      // A load may still be validating the authoritative cwd; a request that
+      // supplies roots must not commit them past its admission fences, which
+      // land when the validation settles.
+      if (opts?.additionalDirectories !== undefined) await this.waitForSessionValidation(sessionId)
       // Re-entry follows an await (active-load wait or joining an in-flight
       // restore); a newer load may have taken over during it.
       this.assertRootMutationCurrent(sessionId, opts)
+      // The validation wait above can straddle a whole delete transaction
+      // (close done, unlink parked), with the file still on disk: re-check
+      // here instead of spawning a writer across the delete's unlink.
+      this.assertNotDeleting(sessionId)
       const existing = this.sessions.maybeGet(sessionId)
       if (existing) {
         this.assertRequestedSessionCwd(existing.cwd, opts?.cwd)
@@ -545,6 +716,11 @@ export class PiAcpAgent implements ACPAgent {
         this.sessions.close(sessionId)
         await shutdown
       }
+
+      // A load admitted while the old child was settling may still be
+      // validating; its admission fences must land before this replacement
+      // commits its (possibly stale) roots.
+      if (opts.additionalDirectories !== undefined) await this.waitForSessionValidation(sessionId)
 
       // A close or delete admitted while the old child was settling owns the
       // session now; the replacement fails closed instead of overriding it
@@ -688,32 +864,48 @@ export class PiAcpAgent implements ACPAgent {
    * session/load is replaying this session, its freshly restored process is
    * provisional — a failing load evicts and disposes it — so other consumers
    * must not share it mid-flight. They wait for every active load to settle
-   * and then use (or restore) the surviving state, except root-changing
-   * resumes: superseded by a newer load/close, they fail closed rather than
-   * re-applying stale roots. The load itself calls restoreSession directly
-   * and therefore never waits on itself.
+   * and then use (or restore) the surviving state. A root-changing resume
+   * fails closed only when superseded by a *valid* newer load (its fixed
+   * roots go stale); while an older load is still settling it waits and
+   * retries so its newer roots replace that load's surviving child. The
+   * load itself calls restoreSession directly and never waits on itself.
    */
   private async restoreSessionAwaitingLoads(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
     while (true) {
+      this.assertCloseAdmissionCurrent(sessionId, opts?.closeAdmission)
       await this.waitForActiveLoads(sessionId)
-      const observedGeneration = this.loadGenerations.get(sessionId) ?? 0
+      // A close or delete admitted while this mutation waited for the load
+      // owns the session now; the restore below must not re-open it during
+      // that close.
+      this.assertCloseAdmissionCurrent(sessionId, opts?.closeAdmission)
+      // Root-less restores re-read the surviving state on every retry, so
+      // their supersede baseline is per-iteration; a root-changing resume
+      // keeps its admission-time baseline (its roots go stale once a newer
+      // valid load admits, and never by an older or invalid one).
+      const baseline = opts?.loadArrivalBaseline ?? this.loadArrivals.get(sessionId) ?? 0
       const session = await this.restoreSession(sessionId, opts)
+
+      // A load admitted while the restore was in flight may still be
+      // validating; a root-changing request must observe its fences before
+      // committing the restored roots.
+      if (opts?.additionalDirectories !== undefined) await this.waitForSessionValidation(sessionId)
 
       // A load can begin after the wait resolves but while restoration is in
       // flight. Never hand its provisional process to resume/config callers.
-      if (!this.activeLoads.has(sessionId) && (this.loadGenerations.get(sessionId) ?? 0) === observedGeneration) {
+      if (!this.activeLoads.has(sessionId) && !this.supersededByValidLoad(sessionId, baseline)) {
         return session
       }
-      // A root-changing request is stale the moment a newer load or close
-      // takes over: its opts name roots the newer owner already replaced, so
-      // retrying would silently re-apply them behind its back. It fails
-      // closed instead; root-less restores (prompts, config mutations) keep
-      // the wait-and-retry path because they re-read the surviving state.
       if (opts?.additionalDirectories !== undefined) {
-        throw RequestError.requestCancelled(
-          {},
-          `session superseded by a newer load or close while restoring: ${sessionId}`
-        )
+        // A root-changing request is stale once a valid newer load admitted:
+        // its opts name roots the newer owner already replaced, so retrying
+        // would silently re-apply them behind its back. It fails closed.
+        if (this.supersededByValidLoad(sessionId, baseline)) {
+          throw RequestError.requestCancelled({}, `session superseded by a newer load while restoring: ${sessionId}`)
+        }
+        // An older load is still settling: wait for it and retry so this
+        // newer request's roots replace its surviving child.
+        await this.waitForActiveLoads(sessionId)
+        continue
       }
       await this.waitForActiveLoads(sessionId)
     }
@@ -970,7 +1162,7 @@ export class PiAcpAgent implements ACPAgent {
           // the next request restores the session on a fresh pi subprocess.
           const completed = await session.runCommand(
             async ctx => ({
-              response: await runBuiltinCommand(session, cmd, args, ctx),
+              response: await runBuiltinCommand(session, cmd, args, ctx, argsString),
               usage: await this.usageFor(session)
             }),
             requestOwner
@@ -1121,10 +1313,76 @@ export class PiAcpAgent implements ACPAgent {
     const additionalDirectories = normalizeAdditionalDirectories(params.cwd, params.additionalDirectories)
 
     const cwd = params.cwd
+    // Admission fence, synchronous before arrival publication or any
+    // lookup: a close or delete already in flight owns the session's
+    // teardown, so a NEW load must fail closed at admission instead of
+    // validating behind its back. A close that acknowledged while this load
+    // sat in validation would leave the captured close fence unchanged (the
+    // bump happened before this arrival), so the load could otherwise admit
+    // and restore a child after the acknowledged close. Loads admitted
+    // before the marker keep their existing ordering fences.
+    this.assertNotDeleting(params.sessionId)
+    if (this.closingSessions.has(params.sessionId)) {
+      throw RequestError.requestCancelled({}, `session is being closed: ${params.sessionId}`)
+    }
+    // Arrival ordinal, issued synchronously: it orders this request against
+    // every other load arrival even when validations settle out of order.
+    const arrival = this.nextLoadArrival(params.sessionId)
+
+    // A wrong-but-valid cwd must reject before the destructive fencing below
+    // (cancellation/load bumps and the teardown of the live session and its
+    // in-flight prompts). A live session's cwd is authoritative (the child is
+    // actually running it) and stays a synchronous check; without one, the
+    // raw store mapping is stale metadata — the JSONL header is authoritative
+    // and repository.find repairs it — so the load validates through the
+    // repository before any bump. The post-fencing validation in
+    // restoreFromStore remains the final authority for races.
+    const existing = this.sessions.maybeGet(params.sessionId)
+    if (existing) {
+      this.assertRequestedSessionCwd(existing.cwd, cwd)
+    } else {
+      const closeAdmission = this.closeAdmissionGenerations.get(params.sessionId) ?? 0
+      // Publish this validation/admission span on the gate chain synchronously
+      // (before the first await): gate waiters and later validations observe
+      // this load's admission fences before they commit, and a same-turn
+      // arrival can never overwrite the pending tail.
+      const span = this.beginLoadValidationSpan(params.sessionId, cwd)
+      try {
+        const record = await span.validation
+        if (!record) throw RequestError.resourceNotFound(params.sessionId)
+        this.assertRequestedSessionCwd(record.cwd, cwd)
+        // A delete transaction in progress (or a close/delete admitted while
+        // this load was validating) owns the session now; this load fails
+        // closed instead of tearing its work down or re-opening behind an
+        // acknowledged close.
+        if (this.deletingSessions.has(params.sessionId)) {
+          throw RequestError.requestCancelled({}, `session is being deleted: ${params.sessionId}`)
+        }
+        if ((this.closeAdmissionGenerations.get(params.sessionId) ?? 0) !== closeAdmission) {
+          throw RequestError.requestCancelled(
+            {},
+            `session superseded by a concurrent load or close while loading: ${params.sessionId}`
+          )
+        }
+        // A valid load that arrived later has already admitted: this older
+        // arrival is stale. An older or still-pending load never rejects it.
+        if (this.supersededByValidLoad(params.sessionId, arrival)) {
+          throw RequestError.requestCancelled(
+            {},
+            `session superseded by a newer load while loading: ${params.sessionId}`
+          )
+        }
+      } finally {
+        // Settles only after the admission decision landed (same synchronous
+        // block as the bumps below), so gate waiters never observe a settled
+        // tail whose fences have not landed yet.
+        span.settle()
+      }
+    }
 
     this.bumpCancellationEpoch(params.sessionId)
     const generation = this.bumpLoadGeneration(params.sessionId)
-    this.bumpLoadAdmission(params.sessionId)
+    this.validLoadArrivals.set(params.sessionId, arrival)
 
     return this.trackLoad(params.sessionId, async () => {
       this.assertLoadActive(params.sessionId, generation)
@@ -1179,8 +1437,14 @@ export class PiAcpAgent implements ACPAgent {
         // Only the exact instance this load produced is evicted/disposed — a
         // replacement registered by a newer load is never touched — and the
         // durable session file/store entry is retained so the session remains
-        // loadable.
-        if (!this.sessions.evictIfCurrent(params.sessionId, session)) {
+        // loadable. A load superseded by a valid newer load also cleans up
+        // nothing here: the newer load's own teardown owns the session and
+        // whatever this one joined, and evicting it would kill the winner's
+        // fresh child.
+        if (
+          !this.supersededByValidLoad(params.sessionId, arrival) &&
+          !this.sessions.evictIfCurrent(params.sessionId, session)
+        ) {
           // A newer load already registered its own session under this id; this
           // one still has to be retired through the replacement barrier.
           this.sessions.retire(session)
@@ -1196,34 +1460,50 @@ export class PiAcpAgent implements ACPAgent {
     const additionalDirectories = normalizeAdditionalDirectories(params.cwd, params.additionalDirectories)
 
     const cwd = params.cwd
+    // Admission fence, synchronous before any tracking or await: a close or
+    // delete already in flight owns the session's teardown, so a NEW resume
+    // must fail closed at admission instead of racing the close's sweeps and
+    // spawning a child behind the acknowledged completion. Resumes admitted
+    // before the marker keep the intentional coalescing (the close drains
+    // them); once the marker clears, legitimate requests restore normally.
+    this.assertNotDeleting(params.sessionId)
+    if (this.closingSessions.has(params.sessionId)) {
+      throw RequestError.requestCancelled({}, `session is being closed: ${params.sessionId}`)
+    }
+    // Arrival baseline captured synchronously at admission, before this
+    // request's first yield: only a valid load that arrives after this
+    // ordinal supersedes these roots — an older load (even one whose
+    // admission lands while this resume waits on the validation gate) or an
+    // invalid later load never does.
+    const loadArrivalBaseline = this.loadArrivals.get(params.sessionId) ?? 0
 
-    // Fence captured before this request's first yield: a newer load bumping
-    // the admission counter makes its roots stale for the whole request
-    // lifetime, not just after the restore returns.
-    const rootMutationGeneration = this.loadAdmissionGenerations.get(params.sessionId) ?? 0
+    // The whole admitted resume operation is tracked synchronously so a
+    // close or delete admitted after it drains it before its final sweep:
+    // no child or request survives the acknowledged close/delete. This
+    // keeps the intentional coalescing (a same-tick resume+close both
+    // resolve and the close reaps the resumed child).
+    return this.trackResume(params.sessionId, async () => {
+      const session = await this.restoreSessionAwaitingLoads(params.sessionId, {
+        cwd,
+        additionalDirectories,
+        loadArrivalBaseline
+      })
 
-    const session = await this.restoreSessionAwaitingLoads(params.sessionId, {
-      cwd,
-      additionalDirectories,
-      rootMutationGeneration
-    })
+      // Unlike session/load, resume MUST NOT replay conversation history.
+      const configOptions = await getSessionConfiguration(session.proc)
+      session.seedSessionConfiguration(configOptions)
 
-    // Unlike session/load, resume MUST NOT replay conversation history.
-    const configOptions = await getSessionConfiguration(session.proc)
-    session.seedSessionConfiguration(configOptions)
+      this.advertiseCommandsSoon(session)
 
-    this.advertiseCommandsSoon(session)
-
-    const response = {
-      configOptions,
-      _meta: {
-        piAcp: {
-          startupInfo: null
+      return {
+        configOptions,
+        _meta: {
+          piAcp: {
+            startupInfo: null
+          }
         }
       }
-    }
-
-    return response
+    })
   }
 
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
@@ -1379,9 +1659,19 @@ export class PiAcpAgent implements ACPAgent {
 
     // Restore + check + write + verify + publish run as one exclusive mutation.
     // Restoring first preserves resource-not-found precedence and prevents
-    // concurrent configuration mutations from interleaving.
+    // concurrent configuration mutations from interleaving. Config writes are
+    // also fenced against close/delete: one already admitted owns the session,
+    // and one admitted later invalidates this write's queued or in-flight
+    // work so it can never restore or publish behind the close's back.
+    if (this.closingSessions.has(params.sessionId) || this.deletingSessions.has(params.sessionId)) {
+      throw RequestError.requestCancelled({}, `session closed while configuring: ${params.sessionId}`)
+    }
+    const closeAdmission = this.closeAdmissionGenerations.get(params.sessionId) ?? 0
     const configOptions = await this.runExclusiveConfigMutation(params.sessionId, async () => {
-      const session = await this.restoreSessionAwaitingLoads(params.sessionId)
+      const session = await this.restoreSessionAwaitingLoads(params.sessionId, { closeAdmission })
+      // A close admitted while the restore was in flight must not have its
+      // freshly restored child written to or published on.
+      this.assertCloseAdmissionCurrent(params.sessionId, closeAdmission)
       if (configId === THOUGHT_LEVEL_CONFIG_ID && !isThinkingLevel(value)) {
         throw RequestError.invalidParams({}, `Unknown thinking level: ${value}`)
       }

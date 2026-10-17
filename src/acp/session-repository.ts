@@ -3,7 +3,7 @@ import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { dirname, join, isAbsolute, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { getAgentDir, getGlobalPiSettings, getMergedPiSettings } from './pi-settings.js'
-import { resolveCwdForComparison } from './session-cwd.js'
+import { directoriesAlias, directoryKey, type DirectoryKey } from './session-cwd.js'
 import { SessionStore, type StoredSession } from './session-store.js'
 
 export type SessionRecord = {
@@ -390,16 +390,19 @@ export class SessionRepository {
       cwdRoots.set(rawCwd, root)
       return root
     }
-    const comparedCwds = new Map<string, string>()
-    const comparisonCwd = (rawCwd: string): string => {
-      let normalized = comparedCwds.get(rawCwd)
-      if (normalized === undefined) {
-        normalized = resolveCwdForComparison(rawCwd)
-        comparedCwds.set(rawCwd, normalized)
+    const comparedCwds = new Map<string, DirectoryKey>()
+    const comparisonKey = (rawCwd: string): DirectoryKey => {
+      let key = comparedCwds.get(rawCwd)
+      if (key === undefined) {
+        key = directoryKey(rawCwd)
+        comparedCwds.set(rawCwd, key)
       }
-      return normalized
+      return key
     }
-    const inScope = (rawCwd: string): boolean => !cwd || comparisonCwd(rawCwd) === comparisonCwd(cwd)
+    // Existing cwds are identified by stat dev/ino (Bun's realpathSync.native
+    // lexically collapses symlink/.. and would widen the listing scope);
+    // deleted cwds fall back to resolved-path comparison.
+    const inScope = (rawCwd: string): boolean => !cwd || directoriesAlias(comparisonKey(rawCwd), comparisonKey(cwd))
     const paths = new Set<string>()
     const mappedSessions = new Map<string, StoredSession>()
     const roots = new Set([discoveryRoot(cwd ?? process.cwd())])

@@ -360,6 +360,12 @@ export class PiAcpSession {
     // is the only path that settles an accepted turn when the child dies
     // mid-run (including a teardown that races an in-flight prompt).
     this.proc.onTermination(termination => this.handleProcessTermination(termination))
+    // Intentionally never unsubscribed either: the channel-unusable
+    // notification fires at most once and is the only path that settles an
+    // accepted turn when an unexpected quarantine holds the process-tree
+    // termination barrier (a wrapper root that already exited, or an
+    // unconfirmed tree kill) so `onTermination` can never arrive.
+    this.proc.onChannelUnusable(() => this.handleChannelUnusable())
   }
 
   private handleProcessTermination(termination: PiRpcTermination): void {
@@ -400,6 +406,39 @@ export class PiAcpSession {
     if (!turn || turn.completionStarted) return
 
     this.failTurn(turn, terminationError(termination))
+  }
+
+  /**
+   * The channel is irrecoverably unusable while the process-tree termination
+   * barrier is intentionally held (a wrapper root already exited, or its tree
+   * kill could not be confirmed), so `onTermination` can never arrive for the
+   * accepted turn or queued work. `dispose({ expected: false })` flags and
+   * disconnects this session but does not settle an accepted turn by itself,
+   * so settle it — and any queued work — through the ordinary failure
+   * machinery instead of leaving it pending on a barrier that cannot
+   * release. Cancellation precedence is preserved (failTurn and the terminal
+   * queue keep their cancelled classification), and ownership/retirement
+   * fences are untouched: no termination record is synthesized and the
+   * replacement barrier stays held.
+   */
+  private handleChannelUnusable(): void {
+    const turn = this.pendingTurn
+    this.dispose({ expected: false })
+    if (turn && !turn.completionStarted) {
+      this.failTurn(
+        turn,
+        new Error('pi process channel is unusable: its process tree could not be confirmed terminated')
+      )
+      return
+    }
+
+    // No live turn to fail (or it already settled): queued work can never run
+    // against the unusable channel, so settle it through the same terminal
+    // queue machinery the termination path uses.
+    const queued = this.turnQueue.splice(0, this.turnQueue.length)
+    if (queued.length) {
+      void this.flushEmits().finally(() => this.settleTerminalQueue(queued, null))
+    }
   }
 
   /**

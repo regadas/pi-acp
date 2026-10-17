@@ -55,6 +55,7 @@ test('PiAcpAgent: resumeSession restores a session without replaying history', a
     return {
       onEvent: () => () => {},
       onTermination: () => () => {},
+      onChannelUnusable: () => () => {},
       whenTerminated: async () => {},
       getEntries: async () => {
         historyReplayCalls += 1
@@ -238,6 +239,7 @@ test('PiAcpAgent: an equivalent alias cwd resumes under the recorded cwd', async
     return {
       onEvent: () => () => {},
       onTermination: () => () => {},
+      onChannelUnusable: () => () => {},
       whenTerminated: async () => {},
       getAvailableModels: async () => ({ models: [{ provider: 'test', id: 'alpha', name: 'Alpha' }] }),
       getState: async () => ({

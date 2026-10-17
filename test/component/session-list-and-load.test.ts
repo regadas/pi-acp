@@ -183,6 +183,7 @@ test('PiAcpAgent: loadSession replays visible custom history once across the res
           }
         },
         onTermination: () => () => {},
+        onChannelUnusable: () => () => {},
         whenTerminated: async () => {},
         getEntries: async (beforeResponseResolve?: () => void) => {
           eventHandler?.({ type: 'message_end', message: { ...preBoundarySnapshotMessage } })

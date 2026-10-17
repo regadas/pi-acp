@@ -24,6 +24,7 @@ function mockSpawn(snapshot: unknown) {
     ({
       onEvent: () => () => {},
       onTermination: () => () => {},
+      onChannelUnusable: () => () => {},
       whenTerminated: async () => {},
       getEntries: async (beforeResponseResolve?: () => void) => {
         beforeResponseResolve?.()

@@ -1,40 +1,7 @@
 import { RequestError } from '@agentclientprotocol/sdk'
-import { statSync, type Stats } from 'node:fs'
+import { statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
-import { displayPath, resolveCwdForComparison } from './session-cwd.js'
-
-/**
- * Filesystem identity of an existing directory: the stat dev/ino pair, which
- * follows symlinks and `..` physically on every supported runtime. Bun's
- * `realpathSync.native` lexically collapses `symlink/..`, so resolved paths
- * are not a reliable directory identity there. Null when stat cannot supply
- * one, in which case callers fall back to path comparison.
- */
-function directoryIdentity(path: string): string | null {
-  try {
-    const stats = statSync(path)
-    if (!stats.isDirectory()) return null
-    return identityFromStats(stats)
-  } catch {
-    return null
-  }
-}
-
-function identityFromStats(stats: Stats): string | null {
-  return stats.dev !== 0 || stats.ino !== 0 ? `${stats.dev}:${stats.ino}` : null
-}
-
-type DirectoryKey = { identity: string | null; comparison: string }
-
-function directoryKey(path: string, identity?: string | null): DirectoryKey {
-  return { identity: identity ?? directoryIdentity(path), comparison: resolveCwdForComparison(path) }
-}
-
-/** Two directories alias each other: exact filesystem identity when both sides have one, resolved paths otherwise. */
-function directoriesAlias(left: DirectoryKey, right: DirectoryKey): boolean {
-  if (left.identity !== null && right.identity !== null) return left.identity === right.identity
-  return left.comparison === right.comparison
-}
+import { directoriesAlias, directoryKey, displayPath, identityFromStats, type DirectoryKey } from './session-cwd.js'
 
 /**
  * Validate the ACP `additionalDirectories` request field against the session

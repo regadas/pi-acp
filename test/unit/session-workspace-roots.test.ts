@@ -470,7 +470,7 @@ test(
       additionalDirectories: [second]
     })
     // Attach before releasing so the rejection is never unhandled.
-    const resumeOutcome = assert.rejects(resume, /superseded by a newer load or close while restoring/)
+    const resumeOutcome = assert.rejects(resume, /superseded by a newer load while restoring/)
     await replacementParkedSignal
 
     const load = harness.agent.loadSession({

@@ -441,6 +441,7 @@ test('PiAcpAgent: load replay keeps interleaved generic bash content in source o
     ({
       onEvent: () => () => {},
       onTermination: () => () => {},
+      onChannelUnusable: () => () => {},
       whenTerminated: async () => {},
       getEntries: async (beforeResponseResolve?: () => void) => {
         beforeResponseResolve?.()

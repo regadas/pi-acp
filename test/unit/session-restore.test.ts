@@ -60,6 +60,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
     return {
       onEvent: () => () => {},
       onTermination: () => () => {},
+      onChannelUnusable: () => () => {},
       dispose: () => {},
       // Restore validation requires pi to report the requested session.
       getState: async () => ({
@@ -161,6 +162,7 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
     return {
       onEvent: () => () => {},
       onTermination: () => () => {},
+      onChannelUnusable: () => () => {},
       dispose: () => {},
       getAvailableModels: async () => ({
         models: [

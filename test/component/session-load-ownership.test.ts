@@ -67,6 +67,10 @@ class MockProc {
   onTermination() {
     return () => {}
   }
+  // Never emits; mirrors PiRpcProcess's one-shot channel-unusable surface.
+  onChannelUnusable() {
+    return () => {}
+  }
   async whenTerminated() {}
   async abort() {}
   // Idempotent, like PiRpcProcess.dispose().

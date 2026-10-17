@@ -67,11 +67,17 @@ async function hasExportableSessionFile(path: string): Promise<boolean> {
   }
 }
 
+/**
+ * `rawArgs` is the unparsed remainder after the command name, preserved
+ * verbatim for free-text commands (/name, /compact) so apostrophes, quotes
+ * and spacing survive; `args` stays tokenized for option-style commands.
+ */
 export async function runBuiltinCommand(
   session: PiAcpSession,
   cmd: string,
   args: string[],
-  ctx: CommandContext
+  ctx: CommandContext,
+  rawArgs: string
 ): Promise<PromptResponse> {
   const guidance = GUIDANCE_ONLY_COMMANDS[cmd]
   if (guidance) {
@@ -87,7 +93,7 @@ export async function runBuiltinCommand(
   }
 
   if (cmd === 'compact') {
-    const customInstructions = args.join(' ').trim() || undefined
+    const customInstructions = rawArgs.trim() || undefined
     const res = await session.proc.compact(customInstructions)
 
     const r = res && typeof res === 'object' ? (res as { tokensBefore?: unknown; summary?: unknown }) : null
@@ -149,7 +155,7 @@ export async function runBuiltinCommand(
   }
 
   if (cmd === 'name') {
-    const name = args.join(' ').trim()
+    const name = rawArgs.trim()
     if (!name) {
       await ctx.sendSessionUpdate({
         sessionId: session.sessionId,

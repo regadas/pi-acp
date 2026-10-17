@@ -51,9 +51,9 @@ test('adapter export rejects a missing or empty session file before calling pi',
     sendSessionUpdate: async (update: unknown) => updates.push(update)
   }
 
-  await runBuiltinCommand(session as any, 'export', [], ctx as any)
+  await runBuiltinCommand(session as any, 'export', [], ctx as any, '')
   writeFileSync(sessionFile, '   \n')
-  await runBuiltinCommand(session as any, 'export', [], ctx as any)
+  await runBuiltinCommand(session as any, 'export', [], ctx as any, '')
 
   assert.equal(exportCalls, 0)
   assert.equal(updates.length, 2)
