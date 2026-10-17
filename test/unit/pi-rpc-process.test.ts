@@ -14,6 +14,7 @@ import {
   type PiRpcEvent,
   type PiRpcTermination
 } from '../../src/pi-rpc/process.js'
+import { killProcessTree, type TreeKillResult } from '../../src/pi-rpc/process-tree.js'
 import { clearPiVersionCacheForTests } from '../../src/pi-rpc/version.js'
 
 const isWindows = process.platform === 'win32'
@@ -372,6 +373,438 @@ test('PiRpcProcess: dispose rejects pending requests immediately and escalates S
   // Requests after dispose fail fast.
   await assert.rejects(proc.getState(), PiRpcClosedError)
 })
+
+// Windows process-tree termination (audit finding 2): the default `pi`
+// launcher on Windows is a .cmd script, so the child is cmd.exe and the real
+// pi is a grandchild holding the session file and stdio pipes. Disposal must
+// kill the whole tree and confirm it before termination can settle.
+
+test('killProcessTree: confirms a zero-exit taskkill and passes the pid through', async () => {
+  const mock = new MockChild()
+  const spawned: number[] = []
+  const result = killProcessTree(4242, 1_000, pid => {
+    spawned.push(pid)
+    return asChild(mock)
+  })
+  mock.emit('close', 0, null)
+  assert.deepEqual(await result, { confirmed: true })
+  assert.deepEqual(spawned, [4242])
+})
+
+test('killProcessTree: reports a failed taskkill with its stderr tail', async () => {
+  const mock = new MockChild()
+  const result = killProcessTree(1, 1_000, () => asChild(mock))
+  mock.stderr.write('ERROR: The process "1" not found.\r\n')
+  await tick()
+  mock.emit('close', 128, null)
+  const outcome = await result
+  assert.equal(outcome.confirmed, false)
+  assert.match((outcome as { reason: string }).reason, /code 128.*not found/)
+})
+
+test('killProcessTree: spawn throw and taskkill error both fail unconfirmed', async () => {
+  assert.equal(
+    (
+      await killProcessTree(1, 1_000, () => {
+        throw new Error('spawn ENOENT')
+      })
+    ).confirmed,
+    false
+  )
+  const mock = new MockChild()
+  const errored = killProcessTree(1, 1_000, () => asChild(mock))
+  mock.emit('error', Object.assign(new Error('taskkill gone'), { code: 'ENOENT' }))
+  assert.equal((await errored).confirmed, false)
+})
+
+test('killProcessTree: kills a hanging taskkill and fails unconfirmed after the timeout', async () => {
+  const mock = new MockChild()
+  const outcome = await killProcessTree(9, 30, () => asChild(mock))
+  assert.equal(outcome.confirmed, false)
+  assert.match((outcome as { reason: string }).reason, /timed out after 30ms/)
+  assert.deepEqual(mock.kills, ['SIGKILL'])
+})
+
+function deferredTreeKill() {
+  const calls: Array<{ pid: number; timeoutMs: number }> = []
+  let confirm!: (result: TreeKillResult) => void
+  const killTree = (pid: number, timeoutMs: number) => {
+    calls.push({ pid, timeoutMs })
+    return new Promise<TreeKillResult>(resolve => {
+      confirm = resolve
+    })
+  }
+  return { calls, killTree, confirm: (result: TreeKillResult) => confirm(result) }
+}
+
+test('PiRpcProcess: wrapper disposal gates root exit and close on tree termination confirmation', async () => {
+  const mock = Object.assign(new MockChild(), { pid: 4242 })
+  const { calls, killTree, confirm } = deferredTreeKill()
+  const proc = PiRpcProcess.fromChild(asChild(mock), { killGraceMs: 250, closeFallbackMs: 20, killTree })
+  const events: PiRpcEvent[] = []
+  proc.onEvent(ev => events.push(ev))
+  const pending = proc.getState()
+  await tick()
+  let settled = false
+  void proc.whenTerminated().then(() => {
+    settled = true
+  })
+
+  proc.dispose()
+  await assert.rejects(pending, PiRpcClosedError)
+  assert.deepEqual(calls, [{ pid: 4242, timeoutMs: 250 }], 'the tree kill owns the wrapper pid and kill grace budget')
+  assert.deepEqual(mock.kills, [], 'the root wrapper must not be signaled before the tree kill reaches descendants')
+
+  // The cmd.exe root can exit and close while the real pi grandchild still
+  // lives; neither event may release the barrier before confirmation.
+  mock.stdout.write('{"type":"agent_start"}\n')
+  mock.emit('exit', 0, null)
+  mock.emit('close', 0, null)
+  await sleep(60)
+  assert.equal(settled, false, 'termination must not settle on unconfirmed root exit/close')
+  assert.deepEqual(events, [], 'records after disposal stay quarantined')
+
+  confirm({ confirmed: true })
+  await tick()
+  assert.equal(settled, true, 'confirmation releases the termination barrier')
+  assert.deepEqual(mock.kills, [], 'the tree kill terminates the root; no direct signal is ever sent')
+})
+
+test('PiRpcProcess: confirmed tree kill settles a pre-confirmation exit through the close fallback', async () => {
+  const mock = Object.assign(new MockChild(), { pid: 5150 })
+  let confirm!: (result: TreeKillResult) => void
+  const proc = PiRpcProcess.fromChild(asChild(mock), {
+    closeFallbackMs: 20,
+    killTree: () =>
+      new Promise<TreeKillResult>(resolve => {
+        confirm = resolve
+      })
+  })
+  let settled = false
+  void proc.whenTerminated().then(() => {
+    settled = true
+  })
+
+  proc.dispose()
+  // The grandchild still holds stdout, so only the root's exit arrives.
+  mock.emit('exit', 1, null)
+  await sleep(60)
+  assert.equal(settled, false, 'the exit fallback must stay disarmed until the tree kill confirms')
+
+  confirm({ confirmed: true })
+  await sleep(60)
+  assert.equal(settled, true, 'confirmation arms the bounded close fallback for the already-exited root')
+})
+
+test('PiRpcProcess: disposal after a wrapper root exit never targets the reaped pid', async () => {
+  const mock = Object.assign(new MockChild(), { pid: 777 })
+  const { calls, killTree } = deferredTreeKill()
+  const proc = PiRpcProcess.fromChild(asChild(mock), { closeFallbackMs: 20, killTree })
+  let settled = false
+  void proc.whenTerminated().then(() => {
+    settled = true
+  })
+
+  // The wrapper root exits spontaneously (pi crash) and only its exit event
+  // has arrived; the fallback timer is armed for a close that never comes.
+  mock.emit('exit', 0, null)
+  await tick()
+  proc.dispose()
+
+  assert.deepEqual(calls, [], 'a reaped root pid must never be tree-killed: the OS may have reused it')
+  await sleep(80)
+  assert.equal(settled, false, 'without a confirmable tree the barrier stays held (fail closed)')
+
+  // A late close does not release the barrier either: close only proves the
+  // direct root and its inherited pipe holders are gone. A living descendant
+  // that closed or redirected its stdio can still be writing the session
+  // file, so pipe EOF is not whole-tree death evidence.
+  mock.emit('close', 0, null)
+  await sleep(80)
+  assert.equal(settled, false, 'a late close after disposal stays gated behind tree confirmation')
+})
+
+test('PiRpcProcess: an armed exit fallback is held once disposal gates the tree', async () => {
+  const mock = Object.assign(new MockChild(), { pid: 778 })
+  const { killTree } = deferredTreeKill()
+  const proc = PiRpcProcess.fromChild(asChild(mock), { closeFallbackMs: 20, killTree })
+  let settled = false
+  void proc.whenTerminated().then(() => {
+    settled = true
+  })
+
+  mock.emit('exit', 3, null)
+  proc.dispose()
+  await sleep(80)
+  assert.equal(settled, false, 'the pre-armed fallback must not settle a gated tree')
+
+  // Without disposal the same exit still settles through the fallback.
+  const plain = PiRpcProcess.fromChild(asChild(mock), { closeFallbackMs: 20, killTree })
+  let plainSettled = false
+  void plain.whenTerminated().then(() => {
+    plainSettled = true
+  })
+  mock.emit('exit', 3, null)
+  await sleep(80)
+  assert.equal(plainSettled, true, 'a spontaneous wrapper exit still settles without disposal')
+})
+
+test('PiRpcProcess: a wrapper child still settles termination normally without disposal', async () => {
+  const mock = Object.assign(new MockChild(), { pid: 606 })
+  const proc = PiRpcProcess.fromChild(asChild(mock), {
+    killTree: () => new Promise<TreeKillResult>(() => {})
+  })
+  const events: PiRpcEvent[] = []
+  proc.onEvent(ev => events.push(ev))
+  const terminations: PiRpcTermination[] = []
+  proc.onTermination(t => terminations.push(t))
+
+  mock.stdout.write('{"type":"agent_start"}\n')
+  await tick()
+  mock.emit('exit', 0, null)
+  mock.emit('close', 0, null)
+  await tick()
+
+  assert.equal(terminations.length, 1, 'a clean wrapper exit settles without needing a tree kill')
+  assert.equal(terminations[0]!.code, 0)
+  assert.deepEqual(
+    events.map(ev => ev.type),
+    ['agent_start'],
+    'buffered stdout drains before settlement'
+  )
+})
+
+for (const failure of ['taskkill exited with code 1: Access is denied', 'timed out after 2000ms']) {
+  test(`PiRpcProcess: unconfirmed tree kill fails closed and never releases termination (${failure})`, async t => {
+    const reported: unknown[][] = []
+    const consoleError = t.mock.method(console, 'error', (...args: unknown[]) => {
+      reported.push(args)
+    })
+    const mock = Object.assign(new MockChild(), { pid: 1313 })
+    const proc = PiRpcProcess.fromChild(asChild(mock), {
+      closeFallbackMs: 20,
+      killTree: () => Promise.resolve({ confirmed: false, reason: failure })
+    })
+    let settled = false
+    void proc.whenTerminated().then(() => {
+      settled = true
+    })
+    const pending = proc.getState()
+    await tick()
+
+    proc.dispose()
+    await assert.rejects(pending, PiRpcClosedError)
+    mock.emit('exit', 0, null)
+    mock.emit('close', 0, null)
+    mock.stdout.write('{"type":"agent_end"}\n')
+    await sleep(80)
+
+    assert.equal(settled, false, 'the pi grandchild may still hold the session; the barrier must stay held')
+    assert.deepEqual(mock.kills, [], 'no direct root kill may follow an unconfirmed tree kill')
+    assert.ok(reported.length >= 1, 'the failure is reported')
+    assert.match(String(reported[0]![0]), /could not be confirmed/)
+    await assert.rejects(proc.getState(), PiRpcClosedError)
+    consoleError.mock.restore()
+  })
+}
+
+// Focused coverage for the unconfirmed-kill branch of the one-shot
+// channel-unusable notification (process.ts onTreeKillSettled): an unexpected
+// disposal whose tree kill cannot be confirmed must notify exactly once,
+// never synthesize termination, and never release the barrier; an expected
+// disposal keeps the held barrier without notifying at all.
+test(
+  'PiRpcProcess: an unconfirmed tree kill after unexpected disposal notifies channel-unusable exactly once',
+  { timeout: 10_000 },
+  async t => {
+    const reported: unknown[][] = []
+    const consoleError = t.mock.method(console, 'error', (...args: unknown[]) => {
+      reported.push(args)
+    })
+    t.after(() => consoleError.mock.restore())
+    const mock = Object.assign(new MockChild(), { pid: 4242 })
+    const proc = PiRpcProcess.fromChild(asChild(mock), {
+      closeFallbackMs: 20,
+      killTree: () => Promise.resolve({ confirmed: false, reason: 'taskkill exited with code 1: Access is denied' })
+    })
+    let notifications = 0
+    const unsubscribe = proc.onChannelUnusable(() => {
+      notifications += 1
+    })
+    const terminations: PiRpcTermination[] = []
+    proc.onTermination(info => terminations.push(info))
+    let terminated = false
+    void proc.whenTerminated().then(() => {
+      terminated = true
+    })
+
+    proc.dispose({ expected: false })
+    await tick()
+    assert.equal(notifications, 1, 'the unexpected quarantine notifies exactly once')
+
+    // A late subscriber is delivered the one-shot notification once, without
+    // re-notifying the earlier one.
+    let lateDeliveries = 0
+    proc.onChannelUnusable(() => {
+      lateDeliveries += 1
+    })
+    await tick()
+    assert.equal(lateDeliveries, 1, 'a late subscriber receives the notification exactly once')
+
+    // Repeated disposals are no-ops and never notify twice.
+    proc.dispose({ expected: false })
+    proc.dispose({ expected: true })
+    unsubscribe()
+    await tick()
+    assert.equal(notifications, 1, 'the notification is one-shot across repeated disposals')
+    assert.equal(terminations.length, 0, 'no termination record is synthesized')
+    assert.equal(terminated, false, 'the termination barrier stays held')
+    assert.ok(reported.length >= 1, 'the unconfirmed kill is still reported as a diagnostic')
+  }
+)
+
+test(
+  'PiRpcProcess: a rejected tree kill after unexpected disposal notifies channel-unusable exactly once',
+  { timeout: 10_000 },
+  async t => {
+    const consoleError = t.mock.method(console, 'error', () => {})
+    t.after(() => consoleError.mock.restore())
+    const mock = Object.assign(new MockChild(), { pid: 4243 })
+    const proc = PiRpcProcess.fromChild(asChild(mock), {
+      closeFallbackMs: 20,
+      killTree: () => Promise.reject(new Error('taskkill spawn failed'))
+    })
+    let notifications = 0
+    proc.onChannelUnusable(() => {
+      notifications += 1
+    })
+    const terminations: PiRpcTermination[] = []
+    proc.onTermination(info => terminations.push(info))
+    let terminated = false
+    void proc.whenTerminated().then(() => {
+      terminated = true
+    })
+
+    proc.dispose({ expected: false })
+    await tick()
+    assert.equal(notifications, 1, 'the rejected tree kill notifies the unexpected quarantine once')
+    assert.equal(terminations.length, 0)
+    assert.equal(terminated, false, 'the barrier stays held behind the failed tree kill')
+  }
+)
+
+test(
+  'PiRpcProcess: an expected disposal with an unconfirmed tree kill notifies nothing and holds the barrier',
+  { timeout: 10_000 },
+  async t => {
+    const consoleError = t.mock.method(console, 'error', () => {})
+    t.after(() => consoleError.mock.restore())
+    const mock = Object.assign(new MockChild(), { pid: 4244 })
+    const proc = PiRpcProcess.fromChild(asChild(mock), {
+      closeFallbackMs: 20,
+      killTree: () => Promise.resolve({ confirmed: false, reason: 'timed out after 2000ms' })
+    })
+    let notifications = 0
+    proc.onChannelUnusable(() => {
+      notifications += 1
+    })
+    let terminated = false
+    void proc.whenTerminated().then(() => {
+      terminated = true
+    })
+
+    proc.dispose()
+    await tick()
+    assert.equal(notifications, 0, 'an expected disposal never notifies channel-unusable')
+    assert.equal(terminated, false, 'the barrier stays held behind the unconfirmed tree')
+  }
+)
+
+test(
+  'PiRpcProcess: Windows .cmd wrapper dispose terminates the wrapper and its grandchild before settling',
+  { skip: process.platform === 'win32' ? false : 'Windows-only: exercises the real cmd.exe wrapper and taskkill' },
+  async t => {
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-win-tree-'))
+    const pidFile = join(dir, 'tree-pids.txt')
+    const grandchildFixture = fileURLToPath(new URL('../fixtures/fake-pi-cmd-grandchild.mjs', import.meta.url))
+    // npm-style launcher: cmd.exe relays to a node grandchild exactly like a
+    // default `pi` install on Windows.
+    writeFileSync(join(dir, 'pi-fixture.cmd'), `@echo off\r\n"${process.execPath}" "${grandchildFixture}" %*\r\n`)
+
+    const previousPidFile = process.env.PI_ACP_TEST_TREE_PID_FILE
+    process.env.PI_ACP_TEST_TREE_PID_FILE = pidFile
+    let wrapperPid = 0
+    let grandchildPid = 0
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let proc: PiRpcProcess | undefined
+    t.after(() => {
+      // Cleanup must not leak processes even when an assertion fails first.
+      for (const pid of [wrapperPid, grandchildPid]) {
+        if (pid > 0 && alive(pid)) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {
+            /* raced natural exit */
+          }
+        }
+      }
+      proc?.dispose()
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* best-effort temp cleanup */
+      }
+    })
+
+    try {
+      proc = await PiRpcProcess.spawn({ cwd: dir, piCommand: join(dir, 'pi-fixture.cmd') })
+      // The grandchild creates the pid file before it finishes writing both
+      // pids, so existence alone can observe an empty file: poll until exactly
+      // two positive numeric PID tokens are readable (bounded).
+      const readPidPair = (): [number, number] | null => {
+        try {
+          const tokens = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
+          if (tokens.length === 2 && tokens.every(pid => Number.isInteger(pid) && pid > 0)) {
+            return [tokens[0]!, tokens[1]!]
+          }
+        } catch {
+          /* Both pids are not readable yet. */
+        }
+        return null
+      }
+      const deadline = Date.now() + 10_000
+      let pids = readPidPair()
+      while (Date.now() < deadline && !pids) {
+        await sleep(25)
+        pids = readPidPair()
+      }
+      ;[grandchildPid, wrapperPid] = pids!
+      assert.ok(grandchildPid > 0 && wrapperPid > 0, 'grandchild must report the wrapper and grandchild pids')
+      assert.ok(alive(wrapperPid) && alive(grandchildPid), 'wrapper and grandchild must be alive before dispose')
+
+      const terminated = proc.whenTerminated()
+      proc.dispose()
+      await withTimeout(terminated, 10_000, 'Windows process-tree termination')
+
+      // Both the cmd.exe wrapper and the node grandchild must be dead once
+      // termination settled: the barrier gates replacement writers.
+      const settleDeadline = Date.now() + 5_000
+      while (Date.now() < settleDeadline && (alive(wrapperPid) || alive(grandchildPid))) await sleep(25)
+      assert.equal(alive(wrapperPid), false, 'cmd.exe wrapper must be dead when termination settles')
+      assert.equal(alive(grandchildPid), false, 'node grandchild must be dead when termination settles')
+    } finally {
+      if (previousPidFile === undefined) delete process.env.PI_ACP_TEST_TREE_PID_FILE
+      else process.env.PI_ACP_TEST_TREE_PID_FILE = previousPidFile
+    }
+  }
+)
 
 test('PiRpcProcess: a failed stdin write quarantines the channel as an unexpected fault', async () => {
   for (const mode of ['callback', 'throw'] as const) {

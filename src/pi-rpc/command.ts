@@ -142,7 +142,17 @@ function bunRuntimeInvocation(
   return isBunRunnableEntry(resolved) ? { executable: bun, args: [resolved, ...args] } : null
 }
 
-export type PiInvocation = { executable: string; args: string[]; windowsVerbatimArguments?: boolean }
+/**
+ * `windowsScriptWrapper` marks a cmd.exe wrapper invocation (Windows
+ * .cmd/.bat launcher): the real pi is a grandchild, so teardown must
+ * terminate the whole process tree.
+ */
+export type PiInvocation = {
+  executable: string
+  args: string[]
+  windowsVerbatimArguments?: boolean
+  windowsScriptWrapper?: true
+}
 
 function cmdToken(value: string): string {
   // First quote for the batch launcher's argv parser, then escape cmd syntax.
@@ -185,6 +195,7 @@ export function buildPiInvocation(
   return {
     executable: commandProcessor,
     args: ['/d', '/s', '/c', `"${commandLine}"`],
-    windowsVerbatimArguments: true
+    windowsVerbatimArguments: true,
+    windowsScriptWrapper: true
   }
 }

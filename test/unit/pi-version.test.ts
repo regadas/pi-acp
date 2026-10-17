@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   MIN_PI_VERSION,
   PI_FEATURE_MIN_VERSION,
@@ -270,6 +271,94 @@ test('assertSupportedPiVersion aborts an in-flight version child', { skip: isWin
     'shutdown cancellation must settle before the 15 second preflight timeout'
   )
 })
+
+test(
+  'assertSupportedPiVersion: a hanging Windows .cmd wrapper version probe abort kills the whole tree',
+  { skip: isWindows ? false : 'Windows-only: exercises the real cmd.exe wrapper and taskkill' },
+  async t => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-win-tree-'))
+    const pidFile = join(dir, 'version-pids.txt')
+    const grandchildFixture = fileURLToPath(new URL('../fixtures/fake-pi-cmd-grandchild.mjs', import.meta.url))
+    // npm-style launcher: cmd.exe relays to a node grandchild exactly like a
+    // default `pi` install on Windows. The grandchild hangs on --version and
+    // holds the inherited stdio pipes, so only a whole-tree kill can settle
+    // the aborted probe (the probe settles on close, never on a root kill).
+    writeFileSync(join(dir, 'pi-fixture.cmd'), `@echo off\r\n"${process.execPath}" "${grandchildFixture}" %*\r\n`)
+    const previousPidFile = process.env.PI_ACP_TEST_TREE_PID_FILE
+    const previousHang = process.env.PI_ACP_TEST_HANG_VERSION
+    process.env.PI_ACP_TEST_TREE_PID_FILE = pidFile
+    process.env.PI_ACP_TEST_HANG_VERSION = '1'
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let wrapperPid = 0
+    let grandchildPid = 0
+    t.after(() => {
+      if (previousPidFile === undefined) delete process.env.PI_ACP_TEST_TREE_PID_FILE
+      else process.env.PI_ACP_TEST_TREE_PID_FILE = previousPidFile
+      if (previousHang === undefined) delete process.env.PI_ACP_TEST_HANG_VERSION
+      else process.env.PI_ACP_TEST_HANG_VERSION = previousHang
+      // Cleanup must not leak processes even when an assertion fails first.
+      for (const pid of [wrapperPid, grandchildPid]) {
+        if (pid > 0 && alive(pid)) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {
+            /* raced natural exit */
+          }
+        }
+      }
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* best-effort temp cleanup */
+      }
+    })
+
+    const controller = new AbortController()
+    const checking = assertSupportedPiVersion(join(dir, 'pi-fixture.cmd'), dir, controller.signal)
+    // The grandchild creates the pid file before it finishes writing both
+    // pids, so existence alone can observe an empty file: poll until exactly
+    // two positive numeric PID tokens are readable (bounded).
+    const readPidPair = (): [number, number] | null => {
+      try {
+        const tokens = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
+        if (tokens.length === 2 && tokens.every(pid => Number.isInteger(pid) && pid > 0)) {
+          return [tokens[0]!, tokens[1]!]
+        }
+      } catch {
+        /* Both pids are not readable yet. */
+      }
+      return null
+    }
+    const reportDeadline = Date.now() + 10_000
+    let pids = readPidPair()
+    while (Date.now() < reportDeadline && !pids) {
+      await new Promise(r => setTimeout(r, 25))
+      pids = readPidPair()
+    }
+    ;[grandchildPid, wrapperPid] = pids!
+    assert.ok(grandchildPid > 0 && wrapperPid > 0, 'the hanging grandchild must report both pids')
+    assert.ok(alive(wrapperPid) && alive(grandchildPid), 'wrapper and grandchild must be alive before abort')
+
+    controller.abort()
+    await assert.rejects(
+      checking,
+      (error: unknown) => error instanceof Error && error.name === 'AbortError',
+      'the aborted probe must settle through tree termination, not the 15s timeout'
+    )
+    // The probe rejects only on close, which the pipe-holding grandchild
+    // releases when the whole tree dies: the settled rejection proves it.
+    assert.equal(alive(grandchildPid), false, 'the hanging pi grandchild must be dead after probe abort')
+    assert.equal(alive(wrapperPid), false, 'the cmd.exe wrapper must be dead after probe abort')
+  }
+)
 
 test('one version caller abort does not kill a probe used by another caller', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()

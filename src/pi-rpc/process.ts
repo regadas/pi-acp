@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, writeFileSync, statSync, unlinkSync } from 'node
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildPiInvocation, getPiCommand } from './command.js'
+import { killProcessTree, type TreeKillResult } from './process-tree.js'
 import { WORKSPACE_ROOTS_ENV } from './workspace-instructions.js'
 import { LfLineDecoder } from './line-decoder.js'
 import { assertSupportedPiVersion, PiVersionError } from './version.js'
@@ -91,6 +92,12 @@ type PiRpcProcessOptions = {
   killGraceMs?: number
   closeFallbackMs?: number
   maxStdoutRecordBytes?: number
+  /**
+   * Test seam overriding the process-tree termination primitive (see
+   * {@link killProcessTree}). Production sets it for cmd.exe wrapper children
+   * only; its presence enables tree-termination gating in dispose.
+   */
+  killTree?: (pid: number, timeoutMs: number) => Promise<TreeKillResult>
 }
 
 type PiExtensionUiResponse =
@@ -147,12 +154,22 @@ export class PiRpcProcess {
   private killTimer: NodeJS.Timeout | undefined
   private exitFallbackTimer: NodeJS.Timeout | undefined
   private nativeUnsettled = false
+  private readonly killTree?: (pid: number, timeoutMs: number) => Promise<TreeKillResult>
+  private treeKillConfirmed = false
+  /** Observed root exit: the OS may have reused its pid, so it must never be signaled by pid. */
+  private rootExitObserved = false
+  private pendingTreeExit: { code: number | null; signal: NodeJS.Signals | null } | undefined
+  private pendingTreeClose: { code: number | null; signal: NodeJS.Signals | null } | undefined
+  /** One-shot marker that an unexpected quarantine made the channel unusable. */
+  private channelUnusable = false
+  private channelUnusableHandlers: Array<() => void> = []
 
   private constructor(child: ChildProcessWithoutNullStreams, opts?: PiRpcProcessOptions) {
     this.child = child
     this.requestTimeoutMs = opts?.requestTimeoutMs
     this.killGraceMs = opts?.killGraceMs ?? KILL_GRACE_MS
     this.closeFallbackMs = opts?.closeFallbackMs ?? CLOSE_FALLBACK_MS
+    this.killTree = opts?.killTree
 
     // Write callbacks do not consume the stream's asynchronous error event.
     child.stdin.on('error', () => this.dispose({ expected: false }))
@@ -193,13 +210,26 @@ export class PiRpcProcess {
       }
     })
     child.on('exit', (code, signal) => {
+      this.rootExitObserved = true
       // Prefer settling on 'close' so stdout data already buffered in the pipe
       // is dispatched to event handlers first; the fallback timer guards
-      // against stdio that never closes.
-      const timer = setTimeout(() => this.settleTermination({ reason: 'exit', code, signal }), this.closeFallbackMs)
+      // against stdio that never closes. A dispose armed after this exit must
+      // not settle the tree until its termination is confirmed.
+      if (this.treeSettlementGated()) {
+        this.pendingTreeExit = { code, signal }
+        return
+      }
+      const timer = setTimeout(() => {
+        if (!this.treeSettlementGated()) this.settleTermination({ reason: 'exit', code, signal })
+      }, this.closeFallbackMs)
       this.exitFallbackTimer = timer
     })
     child.on('close', (code, signal) => {
+      this.rootExitObserved = true
+      if (this.treeSettlementGated()) {
+        this.pendingTreeClose = { code, signal }
+        return
+      }
       this.settleTermination({ reason: 'exit', code, signal })
     })
   }
@@ -428,7 +458,12 @@ export class PiRpcProcess {
     // Wire stdout/stderr and lifecycle listeners immediately. A child can exit
     // directly after its `spawn` event; constructing only after awaiting that
     // event creates a window where the terminal event is lost.
-    const proc = new PiRpcProcess(child)
+    // A cmd.exe wrapper child (Windows .cmd/.bat launcher) must terminate its
+    // whole process tree on disposal, not just the wrapper root.
+    const proc = new PiRpcProcess(
+      child,
+      invocation.windowsScriptWrapper === true ? { killTree: killProcessTree } : undefined
+    )
     void proc.whenTerminated().then(cleanupEmptySession)
 
     // The OS child is alive now. Hand it to its owner before the first await
@@ -513,6 +548,51 @@ export class PiRpcProcess {
     }
   }
 
+  /**
+   * One-shot subscription to the unexpected-quarantine notification (see
+   * {@link onChannelUnusable}). Subscribing after the quarantine delivers the
+   * notification asynchronously, like a late `onTermination` subscriber.
+   */
+  onChannelUnusable(handler: () => void): () => void {
+    if (this.channelUnusable) {
+      queueMicrotask(() => {
+        try {
+          handler()
+        } catch {
+          // Isolate subscriber failures.
+        }
+      })
+      return () => {}
+    }
+
+    this.channelUnusableHandlers.push(handler)
+    return () => {
+      this.channelUnusableHandlers = this.channelUnusableHandlers.filter(h => h !== handler)
+    }
+  }
+
+  /**
+   * Notify (at most once) that an unexpected quarantine made the channel
+   * irrecoverably unusable while the process-tree termination barrier is held
+   * (the wrapper root already exited, or its tree kill could not be
+   * confirmed): no termination record can ever arrive on this path, so
+   * accepted work must settle through this notification instead of waiting
+   * for `onTermination`. Ownership and retirement fences stay untouched.
+   */
+  private notifyChannelUnusable(): void {
+    if (this.channelUnusable) return
+    this.channelUnusable = true
+    const handlers = [...this.channelUnusableHandlers]
+    this.channelUnusableHandlers = []
+    for (const handler of handlers) {
+      try {
+        handler()
+      } catch {
+        // Isolate subscriber failures from each other and the dispose path.
+      }
+    }
+  }
+
   /** Bounded tail of the child's stderr output (for diagnostics). */
   stderrTail(): string {
     return this.stderrTailBuf
@@ -544,6 +624,49 @@ export class PiRpcProcess {
 
   private backgroundDisposal = false
 
+  /**
+   * Wrapper children (cmd.exe .cmd launchers on Windows) only release
+   * termination after the whole process tree is confirmed dead: the root
+   * exiting alone leaves the real pi grandchild alive, holding the session
+   * file and stdio pipes while writing.
+   */
+  private treeSettlementGated(): boolean {
+    return this.killTree !== undefined && !this.treeKillConfirmed && this.disposeRequested
+  }
+
+  private onTreeKillSettled(result: TreeKillResult): void {
+    if (this.termination || this.treeKillConfirmed) return
+    if (!result.confirmed) {
+      // Fail closed: the tree may still be writing the session, so the
+      // termination barrier stays held and no replacement writer or session
+      // delete can be admitted. Adapter shutdown still bounds this at 13s.
+      console.error(
+        `pi-acp: pi process-tree termination could not be confirmed (${result.reason}); ` +
+          'holding the session until shutdown'
+      )
+      // Same held barrier as a reaped root: an unexpected quarantine settles
+      // accepted work through the channel-unusable notification instead of
+      // pending forever on a termination that cannot arrive.
+      if (this.disposeRequested && !this.disposeIsExpected) this.notifyChannelUnusable()
+      return
+    }
+    this.treeKillConfirmed = true
+    const close = this.pendingTreeClose
+    const exit = this.pendingTreeExit
+    this.pendingTreeClose = this.pendingTreeExit = undefined
+    if (close) {
+      this.settleTermination({ reason: 'exit', code: close.code, signal: close.signal })
+    } else if (exit) {
+      // The root already exited; keep the bounded close-drain fallback for a
+      // close that never arrives (the tree is dead, so this is purely a bound).
+      const timer = setTimeout(
+        () => this.settleTermination({ reason: 'exit', code: exit.code, signal: exit.signal }),
+        this.closeFallbackMs
+      )
+      this.exitFallbackTimer = timer
+    }
+  }
+
   dispose(options?: { expected?: boolean; backgroundOwner?: string }): void {
     if (this.disposeRequested) return
     if (this.backgroundDisposal && options?.expected !== false) return
@@ -566,6 +689,38 @@ export class PiRpcProcess {
     // instead of leaving them to time out.
     this.rejectAllPending(this.closedError())
     if (this.termination) return
+
+    const pid = this.child.pid
+    if (this.killTree !== undefined && pid !== undefined) {
+      // Windows npm launchers run cmd.exe with the real pi as a grandchild
+      // holding the session file and stdio pipes. Kill the whole tree as a
+      // unit: signaling only the root first would strand the grandchild past
+      // taskkill's /T reach while it can still write the session. A root that
+      // already exited cannot be tree-killed at all: its pid may have been
+      // reused, and /T cannot reach an orphan through a dead parent pid, so
+      // the barrier fails closed instead of risking an unrelated process.
+      if (this.rootExitObserved) {
+        if (this.exitFallbackTimer) {
+          clearTimeout(this.exitFallbackTimer)
+          this.exitFallbackTimer = undefined
+        }
+        console.error(
+          'pi-acp: pi wrapper root exited before disposal; its process tree cannot be ' +
+            'terminated safely (pid reuse); holding the session until shutdown'
+        )
+        // The barrier can never release here, so an unexpected quarantine
+        // must still settle accepted work through the channel-unusable
+        // notification. An expected disposal already settled its work as
+        // cancellations through the session's own shutdown path.
+        if (!this.disposeIsExpected) this.notifyChannelUnusable()
+        return
+      }
+      void this.killTree(pid, this.killGraceMs).then(
+        result => this.onTreeKillSettled(result),
+        (error: unknown) => this.onTreeKillSettled({ confirmed: false, reason: String(error) })
+      )
+      return
+    }
 
     try {
       this.child.kill('SIGTERM')

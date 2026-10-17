@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import { buildPiInvocation } from './command.js'
+import { killProcessTree } from './process-tree.js'
 
 /** Owned ACP completion needs awaited agent_before_settle boundaries and delivered, retained system-prompt sections on extension-triggered runs. */
 export const MIN_PI_VERSION = '1.2.0'
@@ -89,6 +90,10 @@ export function clearPiVersionCacheForTests(): void {
   versionCache.clear()
 }
 
+// Mirrors the RPC child's bounded tree-kill grace (KILL_GRACE_MS in
+// process.ts): one attempt, fail closed on an unconfirmed result.
+const PROBE_TREE_KILL_TIMEOUT_MS = 2_000
+
 function versionFailure(command: string, cwd: string, detail: string): PiVersionError {
   return new PiVersionError(
     `Could not determine the pi version: \`${command} --version\` ${detail} from ${cwd}. ` +
@@ -121,6 +126,26 @@ function startVersionProbe(piCommand: string, cwd: string, defaultCommand = fals
       shell: false,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments
     })
+    // A reaped root pid may have been reused by the OS, so it must never be
+    // targeted by a tree kill; the probe then relies on its bounded settle.
+    let exited = false
+    child.once('exit', () => {
+      exited = true
+    })
+    const killProbeTree = () => {
+      if (invocation.windowsScriptWrapper === true && child.pid !== undefined && !exited) {
+        // The .cmd wrapper's real pi is a grandchild holding the stdio
+        // pipes; killing only the cmd.exe root would strand it.
+        void killProcessTree(child.pid, PROBE_TREE_KILL_TIMEOUT_MS).then(
+          result => {
+            if (!result.confirmed) console.error(`pi-acp: version probe tree kill unconfirmed (${result.reason})`)
+          },
+          () => {}
+        )
+        return
+      }
+      child.kill('SIGKILL')
+    }
     const cleanup = () => {
       clearTimeout(timer)
       signal.removeEventListener('abort', onAbort)
@@ -135,7 +160,7 @@ function startVersionProbe(piCommand: string, cwd: string, defaultCommand = fals
     const onAbort = () => {
       if (settled || abortedReason !== undefined) return
       abortedReason = abortReason(signal)
-      child.kill('SIGKILL')
+      killProbeTree()
     }
     child.stdout.setEncoding('utf8').on('data', chunk => (stdout += chunk))
     child.stderr.setEncoding('utf8').on('data', chunk => (stderr += chunk))
@@ -182,7 +207,7 @@ function startVersionProbe(piCommand: string, cwd: string, defaultCommand = fals
       settle({ value: version })
     })
     const timer = setTimeout(() => {
-      child.kill('SIGKILL')
+      killProbeTree()
       settle({ error: versionFailure(piCommand, cwd, 'timed out') })
     }, 15_000)
     signal.addEventListener('abort', onAbort, { once: true })
