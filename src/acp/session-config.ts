@@ -1,6 +1,7 @@
 import { RequestError, type SessionConfigOption } from '@agentclientprotocol/sdk'
 import type { AcpClient } from './client.js'
 import type { PiRpcProcess } from '../pi-rpc/process.js'
+import { piRecord } from '../pi-rpc/protocol.js'
 import {
   FALLBACK_THINKING_LEVELS,
   isThinkingLevel,
@@ -18,13 +19,27 @@ export const MODEL_CONFIG_ID = 'model'
 export const THOUGHT_LEVEL_CONFIG_ID = 'thought_level'
 
 /**
- * Thinking levels the current pi model actually supports (mirrors pi's
- * getSupportedThinkingLevels; see thinking-levels.ts). When the model is
- * unknown (state probe failed or pi reports no model) only the conservative
- * `off` level is offered: no level is ever advertised blind.
+ * Values pi already handed the caller (e.g. the parallel newSession probes);
+ * a present own property — even `undefined` — suppresses the matching RPC.
+ */
+type PrefetchedConfig = {
+  readonly state?: unknown
+  readonly availableModels?: unknown
+}
+
+/** pi get_available_models payloads are untrusted; only the models array is consumed. */
+export function piModelsList(payload: unknown): readonly unknown[] {
+  const models = piRecord(payload).models
+  return Array.isArray(models) ? models : []
+}
+
+/**
+ * Thinking levels the current pi model actually supports. When the model is
+ * unknown only the conservative `off` level is offered: no level is ever
+ * advertised blind.
  */
 function thinkingLevelsFromState(state: unknown): readonly ThinkingLevel[] {
-  const model = (state as { model?: unknown } | null | undefined)?.model
+  const model = piRecord(state).model
   if (!model || typeof model !== 'object') return FALLBACK_THINKING_LEVELS
   const supported = supportedThinkingLevels(model)
   return supported.length ? supported : FALLBACK_THINKING_LEVELS
@@ -82,7 +97,7 @@ export async function applyThinkingLevel(proc: PiRpcProcess, level: ThinkingLeve
     )
   }
 
-  const applied = (state as { thinkingLevel?: unknown } | null | undefined)?.thinkingLevel
+  const applied = piRecord(state).thinkingLevel
   if (applied !== level) {
     throw RequestError.internalError(
       {},
@@ -98,18 +113,15 @@ type ThoughtLevelState = {
   current: ThinkingLevel
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-async function getThoughtLevelState(proc: PiRpcProcess, pre?: { state?: any | null }): Promise<ThoughtLevelState> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-  const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
+async function getThoughtLevelState(proc: PiRpcProcess, pre?: PrefetchedConfig): Promise<ThoughtLevelState> {
+  const state = Object.hasOwn(pre ?? {}, 'state') ? pre?.state : await proc.getState()
 
   const available = await availableThinkingLevels(proc, state)
 
-  const tl = typeof state?.thinkingLevel === 'string' ? state.thinkingLevel : null
-  let current: ThinkingLevel = tl && isThinkingLevel(tl) ? tl : 'off'
-  // The advertised current value must be one of the advertised options: when
-  // support is unknown or the reported level is outside the model's set,
-  // report the conservative effective level instead of an unselectable one.
+  const reported = piRecord(state).thinkingLevel
+  let current: ThinkingLevel = typeof reported === 'string' && isThinkingLevel(reported) ? reported : 'off'
+  // The advertised current must be one of the advertised options: report the
+  // conservative effective level when it is not.
   if (!available.includes(current)) {
     current = available.includes('off') ? 'off' : (available[0] ?? 'off')
   }
@@ -119,14 +131,13 @@ async function getThoughtLevelState(proc: PiRpcProcess, pre?: { state?: any | nu
 
 export async function getSessionConfiguration(
   proc: PiRpcProcess,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-  pre?: { state?: any | null; availableModels?: any | null }
+  pre?: PrefetchedConfig
 ): Promise<SessionConfigOption[]> {
-  // Resolve each health probe once. Missing prefetches are real RPC calls and
-  // failures propagate; only a successful response with absent/unknown data
-  // may produce conservative configuration.
-  const hasState = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state')
-  const hasAvailableModels = Object.prototype.hasOwnProperty.call(pre ?? {}, 'availableModels')
+  // Missing prefetches are real RPC calls and failures propagate; only a
+  // successful response with absent/unknown data may produce conservative
+  // configuration.
+  const hasState = Object.hasOwn(pre ?? {}, 'state')
+  const hasAvailableModels = Object.hasOwn(pre ?? {}, 'availableModels')
   const [state, availableModels] = await Promise.all([
     hasState ? Promise.resolve(pre?.state) : proc.getState(),
     hasAvailableModels ? Promise.resolve(pre?.availableModels) : proc.getAvailableModels()
@@ -184,56 +195,38 @@ function buildConfigOptions(state: {
 
 async function getModelState(
   proc: PiRpcProcess,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-  pre?: { state?: any | null; availableModels?: any | null }
+  pre?: PrefetchedConfig
 ): Promise<{
   availableModels: AdvertisedModel[]
   currentModelId: string
 } | null> {
-  // Ask pi for available models.
-  let availableModels: AdvertisedModel[] = []
+  const data = Object.hasOwn(pre ?? {}, 'availableModels') ? pre?.availableModels : await proc.getAvailableModels()
 
-  const data = Object.prototype.hasOwnProperty.call(pre ?? {}, 'availableModels')
-    ? pre?.availableModels
-    : // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-      ((await proc.getAvailableModels()) as any)
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-  const models: any[] = Array.isArray(data?.models) ? data.models : []
-  availableModels = models
-    .map(m => {
-      const provider = String(m?.provider ?? '').trim()
-      const id = String(m?.id ?? '').trim()
+  // String coercion, not schema validation: only a trimmed provider/id must be
+  // non-empty for an entry to be advertised.
+  const availableModels: AdvertisedModel[] = piModelsList(data)
+    .map(entry => {
+      const record = piRecord(entry)
+      const provider = String(record.provider ?? '').trim()
+      const id = String(record.id ?? '').trim()
       if (!provider || !id) return null
-
-      const name = String(m?.name ?? id)
+      const name = String(record.name ?? id)
       return {
         modelId: `${provider}/${id}`,
         name: `${provider}/${name}`,
         description: null
       } satisfies AdvertisedModel
     })
-    .filter(Boolean) as AdvertisedModel[]
+    .filter(model => model !== null)
 
-  // Ask pi what model is currently active.
-  let currentModelId: string | null = null
+  const state = Object.hasOwn(pre ?? {}, 'state') ? pre?.state : await proc.getState()
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-  const state = Object.prototype.hasOwnProperty.call(pre ?? {}, 'state') ? pre?.state : ((await proc.getState()) as any)
-
-  const model = state?.model
-  if (model && typeof model === 'object') {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const provider = String((model as any).provider ?? '').trim()
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const id = String((model as any).id ?? '').trim()
-    if (provider && id) currentModelId = `${provider}/${id}`
-  }
+  const model = piRecord(piRecord(state).model)
+  const provider = String(model.provider ?? '').trim()
+  const id = String(model.id ?? '').trim()
+  const currentModelId = provider && id ? `${provider}/${id}` : null
 
   if (!availableModels.length && !currentModelId) return null
-
-  // Fallback if current model is unknown: use first in list.
-  if (!currentModelId) currentModelId = availableModels[0]?.modelId ?? 'default'
 
   return {
     availableModels,
@@ -254,8 +247,7 @@ export async function emitConfigOptionsUpdate(
   sink: SessionUpdateSink,
   sessionId: string,
   proc: PiRpcProcess,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-  pre?: { state?: any | null }
+  pre?: PrefetchedConfig
 ): Promise<SessionConfigOption[]> {
   const configOptions = await getSessionConfiguration(proc, pre)
 
@@ -276,9 +268,8 @@ export async function emitConfigOptionsUpdate(
  * config-option publication.
  */
 export async function applySessionModel(proc: PiRpcProcess, requestedModelId: string): Promise<unknown> {
-  // Accept either:
-  //  - "provider/model" (preferred, matches how we advertise)
-  //  - "model" (fallback, resolve via available models)
+  // Accept "provider/model" (preferred, matching how models are advertised) or
+  // a bare "model" resolved through the available models.
   let provider: string | null = null
   let modelId: string | null = null
 
@@ -291,14 +282,11 @@ export async function applySessionModel(proc: PiRpcProcess, requestedModelId: st
   }
 
   if (!provider) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const data = (await proc.getAvailableModels()) as any
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const models: any[] = Array.isArray(data?.models) ? data.models : []
-    const found = models.find(m => String(m?.id) === modelId)
+    const found = piModelsList(await proc.getAvailableModels()).find(entry => String(piRecord(entry).id) === modelId)
     if (found) {
-      provider = String(found.provider)
-      modelId = String(found.id)
+      const record = piRecord(found)
+      provider = String(record.provider)
+      modelId = String(record.id)
     }
   }
 
@@ -318,10 +306,9 @@ export async function applySessionModel(proc: PiRpcProcess, requestedModelId: st
     )
   }
 
-  const model = (state as { model?: unknown } | null | undefined)?.model
-  const appliedProvider =
-    model && typeof model === 'object' ? String((model as { provider?: unknown }).provider ?? '').trim() : ''
-  const appliedId = model && typeof model === 'object' ? String((model as { id?: unknown }).id ?? '').trim() : ''
+  const appliedModel = piRecord(piRecord(state).model)
+  const appliedProvider = String(appliedModel.provider ?? '').trim()
+  const appliedId = String(appliedModel.id ?? '').trim()
   if (appliedProvider !== provider || appliedId !== modelId) {
     const current = appliedProvider && appliedId ? `${appliedProvider}/${appliedId}` : 'unknown'
     throw RequestError.internalError({}, `pi did not apply model ${provider}/${modelId} (current: ${current})`)

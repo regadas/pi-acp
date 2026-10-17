@@ -71,14 +71,12 @@ export type PiRpcTermination = {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 const ABORT_TIMEOUT_MS = 10_000
-// Prompt preflight may run extension hooks and overflow compaction before pi
-// sends its acceptance response, so give it the same bounded budget as an
-// explicit compaction rather than the short control-command default.
+// Prompt preflight can run extension hooks and overflow compaction before
+// acceptance, so it gets compaction's budget, not the control-command default.
 const PROMPT_TIMEOUT_MS = 10 * 60_000
 const COMPACT_TIMEOUT_MS = 10 * 60_000
-// get_entries serializes the complete flat session history and export_html
-// renders the whole session; both scale with history size, so give them a
-// larger (still finite) budget than short control commands.
+// get_entries and export_html serialize/render the whole session, so they get
+// a larger (still finite) budget than short control commands.
 const GET_ENTRIES_TIMEOUT_MS = 2 * 60_000
 const EXPORT_TIMEOUT_MS = 2 * 60_000
 const KILL_GRACE_MS = 2_000
@@ -93,9 +91,9 @@ type PiRpcProcessOptions = {
   closeFallbackMs?: number
   maxStdoutRecordBytes?: number
   /**
-   * Test seam overriding the process-tree termination primitive (see
-   * {@link killProcessTree}). Production sets it for cmd.exe wrapper children
-   * only; its presence enables tree-termination gating in dispose.
+   * Test seam overriding the tree-kill primitive ({@link killProcessTree}).
+   * Production sets it for cmd.exe wrapper children only; its presence gates
+   * termination on tree confirmation in dispose.
    */
   killTree?: (pid: number, timeoutMs: number) => Promise<TreeKillResult>
 }
@@ -117,11 +115,9 @@ type SpawnParams = {
   /** Cancels the version preflight before the RPC child is spawned. */
   signal?: AbortSignal
   /**
-   * Called synchronously with the wrapper as soon as the OS child exists,
-   * which is before this spawn resolves. Owners take responsibility for
-   * terminating the child here so a teardown racing the spawn cannot miss it.
-   * A throwing hook fails the spawn with the child disposed, never leaving it
-   * alive and unowned.
+   * Called synchronously with the wrapper before this spawn resolves, so a
+   * teardown racing the spawn cannot miss the child. A throwing hook fails
+   * the spawn with the child disposed, never leaving it alive and unowned.
    */
   onProcess?: (proc: PiRpcProcess) => void
 }
@@ -198,8 +194,9 @@ export class PiRpcProcess {
     })
 
     child.on('error', err => {
-      // A failed kill can emit error while the child still owns its session file.
-      // Even after exit, close must drain stdout before releasing ownership.
+      // error can fire on a live child (e.g. a failed kill) that still owns
+      // its session file: the replacement barrier holds until close, which
+      // also drains stdout. A pid-less child never spawned and settles now.
       if (child.pid === undefined) {
         this.settleTermination({
           reason: 'error',
@@ -211,10 +208,9 @@ export class PiRpcProcess {
     })
     child.on('exit', (code, signal) => {
       this.rootExitObserved = true
-      // Prefer settling on 'close' so stdout data already buffered in the pipe
-      // is dispatched to event handlers first; the fallback timer guards
-      // against stdio that never closes. A dispose armed after this exit must
-      // not settle the tree until its termination is confirmed.
+      // Settle on 'close' so buffered stdout drains to handlers first; the
+      // fallback timer bounds stdio that never closes. A tree-gated dispose
+      // defers settlement to the kill result.
       if (this.treeSettlementGated()) {
         this.pendingTreeExit = { code, signal }
         return
@@ -244,8 +240,7 @@ export class PiRpcProcess {
 
   private handleStdoutLine(line: string): void {
     // Once the channel is quarantined or terminal, no record can safely be
-    // attributed to an ACP turn. An orphaned descendant may still hold and
-    // write to stdout after the pi child exits.
+    // attributed to an ACP turn (an orphaned descendant may still write).
     if (this.disposeRequested || this.termination || !line.trim()) return
     let msg: unknown
     try {
@@ -259,9 +254,8 @@ export class PiRpcProcess {
     const decoded = decodePiRecord(msg)
     if (!decoded) return
     if (decoded.type === 'response' && 'command' in decoded && 'success' in decoded) {
-      // Responses are correlation records, never pi events. A response whose
-      // request already timed out is stale and must not reach session event
-      // handlers or a later turn.
+      // Responses are correlation records, never pi events; a stale one whose
+      // request timed out must not reach session handlers or a later turn.
       if (typeof decoded.id !== 'string') return
       const entry = this.takePending(decoded.id)
       if (!entry) return
@@ -388,10 +382,9 @@ export class PiRpcProcess {
     // installs run under Bun; overrides always launch exactly as configured.
     const defaultCommand = params.piCommand === undefined
 
-    // Fail closed on unsupported/unknown pi versions before spawning the RPC
-    // subprocess (see MIN_PI_VERSION): the ACP prompt lifecycle depends on
-    // pi's settlement boundaries. Launch failures return null here and are
-    // surfaced by the detailed spawn error handling below instead.
+    // Fail closed on unsupported pi versions (see MIN_PI_VERSION) before
+    // spawning: ACP prompt lifecycle depends on pi's settlement boundaries.
+    // Launch failures resolve null here; the RPC spawn surfaces the error.
     try {
       await assertSupportedPiVersion(cmd, params.cwd, params.signal, defaultCommand)
     } catch (e) {
@@ -401,10 +394,8 @@ export class PiRpcProcess {
       throw e
     }
 
-    // Speed/robustness for ACP:
-    // - themes are irrelevant in rpc mode and can be noisy/slow to load.
-    // Keep extensions + prompt templates enabled because ACP users may rely on them
-    // (e.g. MCP extensions, prompt templates for workflows).
+    // Themes are noise in rpc mode; extensions and prompt templates stay on
+    // because ACP users rely on them (e.g. MCP extensions).
     const extension = new URL('./acp-extension.js', import.meta.url)
     const extensionPath = fileURLToPath(
       existsSync(extension) ? extension : new URL('./acp-extension.ts', import.meta.url)
@@ -412,9 +403,8 @@ export class PiRpcProcess {
     const args = ['--mode', 'rpc', '--no-themes', '--extension', extensionPath]
     let emptySessionPath: string | undefined
     if (!params.sessionPath && params.sessionDirectory) {
-      // Pi opens an explicit empty session file eagerly. Its default new-session
-      // path is not persisted until an assistant message, making preflight cancel
-      // followed by restore otherwise lose the session identity.
+      // Pi only persists its default new-session path after an assistant
+      // message; an explicit empty file keeps identity across preflight cancel.
       mkdirSync(params.sessionDirectory, { recursive: true, mode: 0o700 })
       emptySessionPath = join(
         params.sessionDirectory,
@@ -455,11 +445,9 @@ export class PiRpcProcess {
       shell: false,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments
     })
-    // Wire stdout/stderr and lifecycle listeners immediately. A child can exit
-    // directly after its `spawn` event; constructing only after awaiting that
-    // event creates a window where the terminal event is lost.
-    // A cmd.exe wrapper child (Windows .cmd/.bat launcher) must terminate its
-    // whole process tree on disposal, not just the wrapper root.
+    // Listeners attach immediately because a child can exit directly after its
+    // `spawn` event. A cmd.exe wrapper child must terminate its whole process
+    // tree on disposal, not just the wrapper root.
     const proc = new PiRpcProcess(
       child,
       invocation.windowsScriptWrapper === true ? { killTree: killProcessTree } : undefined
@@ -475,8 +463,8 @@ export class PiRpcProcess {
       throw error
     }
 
-    // Ensure spawn failures (e.g. ENOENT when pi isn't installed) are surfaced as a
-    // deterministic error instead of later EPIPE/internal-error noise.
+    // Spawn failures (e.g. ENOENT when pi isn't installed) surface as
+    // deterministic errors, not later EPIPE/internal-error noise.
     try {
       await new Promise<void>((resolve, reject) => {
         const onSpawn = () => {
@@ -510,10 +498,9 @@ export class PiRpcProcess {
       throw new PiRpcSpawnError(`Could not start pi (command: ${cmd}).`, { code, cause: e })
     }
 
-    // No hidden handshake: spawn returns as soon as the OS process exists so
-    // the caller owns the child immediately. Authoritative get_state
-    // validation (and session-dir setup) happens in SessionManager.create /
-    // PiAcpAgent.restoreSession, which also own failure disposal.
+    // No hidden handshake: callers own the child immediately; authoritative
+    // get_state validation (and session-dir setup) happens in
+    // SessionManager.create / PiAcpAgent.restoreSession, which own failure disposal.
     return proc
   }
 
@@ -573,11 +560,9 @@ export class PiRpcProcess {
 
   /**
    * Notify (at most once) that an unexpected quarantine made the channel
-   * irrecoverably unusable while the process-tree termination barrier is held
-   * (the wrapper root already exited, or its tree kill could not be
-   * confirmed): no termination record can ever arrive on this path, so
-   * accepted work must settle through this notification instead of waiting
-   * for `onTermination`. Ownership and retirement fences stay untouched.
+   * unusable while the tree barrier is held (root already exited, or its kill
+   * unconfirmed): no termination record can ever arrive, so accepted work
+   * settles here instead of awaiting `onTermination`.
    */
   private notifyChannelUnusable(): void {
     if (this.channelUnusable) return
@@ -625,10 +610,9 @@ export class PiRpcProcess {
   private backgroundDisposal = false
 
   /**
-   * Wrapper children (cmd.exe .cmd launchers on Windows) only release
-   * termination after the whole process tree is confirmed dead: the root
-   * exiting alone leaves the real pi grandchild alive, holding the session
-   * file and stdio pipes while writing.
+   * Wrapper children release termination only after the whole tree is
+   * confirmed dead: the root exiting alone leaves the real pi grandchild
+   * alive and writing the session through its pipes.
    */
   private treeSettlementGated(): boolean {
     return this.killTree !== undefined && !this.treeKillConfirmed && this.disposeRequested
@@ -638,15 +622,12 @@ export class PiRpcProcess {
     if (this.termination || this.treeKillConfirmed) return
     if (!result.confirmed) {
       // Fail closed: the tree may still be writing the session, so the
-      // termination barrier stays held and no replacement writer or session
-      // delete can be admitted. Adapter shutdown still bounds this at 13s.
+      // barrier stays held and only an unexpected quarantine settles accepted
+      // work, through channel-unusable — a termination can never arrive.
       console.error(
         `pi-acp: pi process-tree termination could not be confirmed (${result.reason}); ` +
           'holding the session until shutdown'
       )
-      // Same held barrier as a reaped root: an unexpected quarantine settles
-      // accepted work through the channel-unusable notification instead of
-      // pending forever on a termination that cannot arrive.
       if (this.disposeRequested && !this.disposeIsExpected) this.notifyChannelUnusable()
       return
     }
@@ -692,13 +673,11 @@ export class PiRpcProcess {
 
     const pid = this.child.pid
     if (this.killTree !== undefined && pid !== undefined) {
-      // Windows npm launchers run cmd.exe with the real pi as a grandchild
-      // holding the session file and stdio pipes. Kill the whole tree as a
-      // unit: signaling only the root first would strand the grandchild past
-      // taskkill's /T reach while it can still write the session. A root that
-      // already exited cannot be tree-killed at all: its pid may have been
-      // reused, and /T cannot reach an orphan through a dead parent pid, so
-      // the barrier fails closed instead of risking an unrelated process.
+      // Kill the whole tree as a unit: the real pi grandchild holds the session
+      // and pipes, and signaling only the root would strand it past taskkill's
+      // /T reach. A root that already exited can never be tree-killed — its pid
+      // may have been reused — so the barrier fails closed instead of risking
+      // an unrelated process.
       if (this.rootExitObserved) {
         if (this.exitFallbackTimer) {
           clearTimeout(this.exitFallbackTimer)
@@ -708,10 +687,9 @@ export class PiRpcProcess {
           'pi-acp: pi wrapper root exited before disposal; its process tree cannot be ' +
             'terminated safely (pid reuse); holding the session until shutdown'
         )
-        // The barrier can never release here, so an unexpected quarantine
-        // must still settle accepted work through the channel-unusable
-        // notification. An expected disposal already settled its work as
-        // cancellations through the session's own shutdown path.
+        // The barrier can never release: an unexpected quarantine settles
+        // through channel-unusable; an expected disposal already settled its
+        // work through the session's own shutdown path.
         if (!this.disposeIsExpected) this.notifyChannelUnusable()
         return
       }
@@ -1091,13 +1069,10 @@ export class PiRpcProcess {
         entry.onTimeout = () => {
           if (!this.takePending(id)) return
           const error = new PiRpcRequestTimeoutError(cmd.type, timeoutMs)
-          // Any timed-out command leaves both the command outcome and channel
-          // health unknown: pi may still execute it later and stream output
-          // (a prompt after slow preflight, a compact mutating state, a
-          // wedged event loop recovering). Quarantine the channel as an
-          // unexpected fault before rejecting so no late response or event
-          // can escape into a closed or replacement ACP turn, and every
-          // future request fails fast instead of hanging.
+          // A timed-out command leaves outcome and channel health unknown (pi
+          // may still execute it later and stream output), so quarantine before
+          // rejecting: no late response escapes into a closed or replacement
+          // ACP turn, and later requests fail fast instead of hanging.
           this.dispose({ expected: false })
           reject(error)
         }
@@ -1117,10 +1092,9 @@ export class PiRpcProcess {
   private writeLine(line: string): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       const fail = (error: unknown) => {
-        // A failed stdin write leaves it unknown how much of the record pi
-        // received, so the channel can no longer be framed reliably.
-        // Quarantine it as an unexpected fault before rejecting: later
-        // requests must fail fast instead of running on a broken channel.
+        // A failed write leaves the record framing unknown, so quarantine
+        // before rejecting: later requests must fail fast, not run on a
+        // broken channel.
         this.dispose({ expected: false })
         reject(error)
       }

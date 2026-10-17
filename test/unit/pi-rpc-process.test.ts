@@ -608,15 +608,39 @@ for (const failure of ['taskkill exited with code 1: Access is denied', 'timed o
   })
 }
 
-// Focused coverage for the unconfirmed-kill branch of the one-shot
-// channel-unusable notification (process.ts onTreeKillSettled): an unexpected
-// disposal whose tree kill cannot be confirmed must notify exactly once,
-// never synthesize termination, and never release the barrier; an expected
-// disposal keeps the held barrier without notifying at all.
-test(
-  'PiRpcProcess: an unconfirmed tree kill after unexpected disposal notifies channel-unusable exactly once',
-  { timeout: 10_000 },
-  async t => {
+// One-shot channel-unusable coverage across kill outcomes: an unexpected
+// disposal notifies exactly once and never releases the termination barrier;
+// an expected disposal stays silent behind the same held barrier.
+type ChannelUnusableCase = {
+  readonly name: string
+  readonly killTree: () => Promise<TreeKillResult>
+  readonly disposeOptions: { expected: false } | undefined
+  readonly expectedNotifications: number
+}
+
+const channelUnusableCases = [
+  {
+    name: 'an unconfirmed tree kill after unexpected disposal notifies channel-unusable exactly once',
+    killTree: () => Promise.resolve({ confirmed: false, reason: 'taskkill exited with code 1: Access is denied' }),
+    disposeOptions: { expected: false },
+    expectedNotifications: 1
+  },
+  {
+    name: 'a rejected tree kill after unexpected disposal notifies channel-unusable exactly once',
+    killTree: () => Promise.reject(new Error('taskkill spawn failed')),
+    disposeOptions: { expected: false },
+    expectedNotifications: 1
+  },
+  {
+    name: 'an expected disposal with an unconfirmed tree kill notifies nothing and holds the barrier',
+    killTree: () => Promise.resolve({ confirmed: false, reason: 'timed out after 2000ms' }),
+    disposeOptions: undefined,
+    expectedNotifications: 0
+  }
+] as const satisfies readonly ChannelUnusableCase[]
+
+for (const { name, killTree, disposeOptions, expectedNotifications } of channelUnusableCases) {
+  test(`PiRpcProcess: ${name}`, { timeout: 10_000 }, async t => {
     const reported: unknown[][] = []
     const consoleError = t.mock.method(console, 'error', (...args: unknown[]) => {
       reported.push(args)
@@ -625,10 +649,10 @@ test(
     const mock = Object.assign(new MockChild(), { pid: 4242 })
     const proc = PiRpcProcess.fromChild(asChild(mock), {
       closeFallbackMs: 20,
-      killTree: () => Promise.resolve({ confirmed: false, reason: 'taskkill exited with code 1: Access is denied' })
+      killTree
     })
     let notifications = 0
-    const unsubscribe = proc.onChannelUnusable(() => {
+    proc.onChannelUnusable(() => {
       notifications += 1
     })
     const terminations: PiRpcTermination[] = []
@@ -638,87 +662,30 @@ test(
       terminated = true
     })
 
-    proc.dispose({ expected: false })
+    proc.dispose(disposeOptions)
     await tick()
-    assert.equal(notifications, 1, 'the unexpected quarantine notifies exactly once')
+    assert.equal(notifications, expectedNotifications, 'channel-unusable fires only for unexpected disposals')
 
-    // A late subscriber is delivered the one-shot notification once, without
-    // re-notifying the earlier one.
     let lateDeliveries = 0
     proc.onChannelUnusable(() => {
       lateDeliveries += 1
     })
     await tick()
-    assert.equal(lateDeliveries, 1, 'a late subscriber receives the notification exactly once')
+    assert.equal(
+      lateDeliveries,
+      expectedNotifications,
+      'a late subscriber receives the one-shot notification at most once'
+    )
 
-    // Repeated disposals are no-ops and never notify twice.
     proc.dispose({ expected: false })
     proc.dispose({ expected: true })
-    unsubscribe()
     await tick()
-    assert.equal(notifications, 1, 'the notification is one-shot across repeated disposals')
+    assert.equal(notifications, expectedNotifications, 'the notification is one-shot across repeated disposals')
     assert.equal(terminations.length, 0, 'no termination record is synthesized')
     assert.equal(terminated, false, 'the termination barrier stays held')
-    assert.ok(reported.length >= 1, 'the unconfirmed kill is still reported as a diagnostic')
-  }
-)
-
-test(
-  'PiRpcProcess: a rejected tree kill after unexpected disposal notifies channel-unusable exactly once',
-  { timeout: 10_000 },
-  async t => {
-    const consoleError = t.mock.method(console, 'error', () => {})
-    t.after(() => consoleError.mock.restore())
-    const mock = Object.assign(new MockChild(), { pid: 4243 })
-    const proc = PiRpcProcess.fromChild(asChild(mock), {
-      closeFallbackMs: 20,
-      killTree: () => Promise.reject(new Error('taskkill spawn failed'))
-    })
-    let notifications = 0
-    proc.onChannelUnusable(() => {
-      notifications += 1
-    })
-    const terminations: PiRpcTermination[] = []
-    proc.onTermination(info => terminations.push(info))
-    let terminated = false
-    void proc.whenTerminated().then(() => {
-      terminated = true
-    })
-
-    proc.dispose({ expected: false })
-    await tick()
-    assert.equal(notifications, 1, 'the rejected tree kill notifies the unexpected quarantine once')
-    assert.equal(terminations.length, 0)
-    assert.equal(terminated, false, 'the barrier stays held behind the failed tree kill')
-  }
-)
-
-test(
-  'PiRpcProcess: an expected disposal with an unconfirmed tree kill notifies nothing and holds the barrier',
-  { timeout: 10_000 },
-  async t => {
-    const consoleError = t.mock.method(console, 'error', () => {})
-    t.after(() => consoleError.mock.restore())
-    const mock = Object.assign(new MockChild(), { pid: 4244 })
-    const proc = PiRpcProcess.fromChild(asChild(mock), {
-      closeFallbackMs: 20,
-      killTree: () => Promise.resolve({ confirmed: false, reason: 'timed out after 2000ms' })
-    })
-    let notifications = 0
-    proc.onChannelUnusable(() => {
-      notifications += 1
-    })
-    let terminated = false
-    void proc.whenTerminated().then(() => {
-      terminated = true
-    })
-
-    proc.dispose()
-    await tick()
-    assert.equal(notifications, 0, 'an expected disposal never notifies channel-unusable')
-    assert.equal(terminated, false, 'the barrier stays held behind the unconfirmed tree')
-  }
-)
+    assert.ok(reported.length >= 1, 'the failed tree kill is still reported as a diagnostic')
+  })
+}
 
 test(
   'PiRpcProcess: Windows .cmd wrapper dispose terminates the wrapper and its grandchild before settling',

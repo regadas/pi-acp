@@ -62,16 +62,19 @@ test('SessionManager.create: a get_state failure disposes the spawned process an
   })
 })
 
-test('SessionManager.create: never fabricates a session ID when pi reports none', async () => {
+test('SessionManager.create: never fabricates a session ID from an incomplete or malformed identity', async () => {
   await withEnv({ PI_ACP_DIR: mkdtempSync(join(tmpdir(), 'pi-acp-own-')) }, async () => {
-    for (const state of [
+    for (const payload of [
       { isStreaming: false },
       { sessionId: 'sess-1', isStreaming: false },
       { sessionFile: '/tmp/sess-1.jsonl', isStreaming: false },
-      { sessionId: '  ', sessionFile: '/tmp/sess-1.jsonl' }
-    ]) {
+      { sessionId: '  ', sessionFile: '/tmp/sess-1.jsonl' },
+      null,
+      'garbage',
+      42
+    ] as unknown[]) {
       const proc = new FakePiRpcProcess()
-      proc.state = state
+      proc.getState = async () => payload
 
       await withMockSpawn(
         async () => proc,
@@ -79,9 +82,10 @@ test('SessionManager.create: never fabricates a session ID when pi reports none'
           const manager = new SessionManager()
           await assert.rejects(
             () => manager.create(baseParams() as any),
-            /did not report an authoritative sessionId\/sessionFile/
+            /did not report an authoritative sessionId\/sessionFile/,
+            `payload: ${JSON.stringify(payload)}`
           )
-          assert.equal(proc.disposeCount, 1)
+          assert.equal(proc.disposeCount, 1, `payload: ${JSON.stringify(payload)}`)
         }
       )
     }
@@ -294,27 +298,34 @@ function makeRestoreAgent(root: string, sessionFile: string) {
   return { agent, manager, restore }
 }
 
-test('PiAcpAgent: restore rejects and disposes when pi reports a different session identity', async () => {
+test('PiAcpAgent: restore rejects and disposes on a mismatched or malformed identity', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-own-agent-'))
   const sessionFile = join(root, 'sess-restore.jsonl')
 
-  for (const state of [
+  for (const payload of [
     // Different session id entirely.
     { sessionId: 'someone-else', sessionFile, isStreaming: false },
     // Right id, no session file.
     { sessionId: 'sess-restore', isStreaming: false },
     // Right id, different file than the stored mapping.
-    { sessionId: 'sess-restore', sessionFile: join(root, 'other.jsonl'), isStreaming: false }
-  ]) {
+    { sessionId: 'sess-restore', sessionFile: join(root, 'other.jsonl'), isStreaming: false },
+    // Not a record at all: no identity fields exist.
+    null,
+    'garbage'
+  ] as unknown[]) {
     const proc = new FakePiRpcProcess()
-    proc.state = state
+    proc.getState = async () => payload
 
     await withMockSpawn(
       async () => proc,
       async () => {
         const { manager, restore } = makeRestoreAgent(root, sessionFile)
-        await assert.rejects(restore(), /did not restore the requested session/)
-        assert.equal(proc.disposeCount, 1, 'mismatched child must be disposed before installation')
+        await assert.rejects(restore(), /did not restore the requested session/, `payload: ${JSON.stringify(payload)}`)
+        assert.equal(
+          proc.disposeCount,
+          1,
+          `a child with a mismatched or unusable identity must be disposed: ${JSON.stringify(payload)}`
+        )
         assert.equal(manager.maybeGet('sess-restore'), undefined)
       }
     )

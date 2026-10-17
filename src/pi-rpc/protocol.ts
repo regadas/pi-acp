@@ -79,6 +79,11 @@ const KNOWN_EVENTS = new Set([
   'compaction_end'
 ])
 
+/** pi RPC payloads are untrusted; project non-objects to {} and consume only known fields (arrays pass through). */
+export function piRecord(value: unknown): Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {}
+}
+
 /** Decode untrusted NDJSON once; malformed records are ignored explicitly. */
 export function decodePiRecord(value: unknown): DecodedPiRecord | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null

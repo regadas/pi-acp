@@ -9,13 +9,10 @@ function spawnTaskkill(pid: number): ChildProcess {
 }
 
 /**
- * Terminate a process and every descendant it started via `taskkill /T /F`.
- * The tree must be killed as a unit: on Windows the default `pi` launcher is
- * a .cmd script, so the child is cmd.exe and the real pi is a grandchild that
- * still holds the session file and the stdio pipes. Killing only the root
- * strands that grandchild beyond `/T`'s reach. Resolves `confirmed` only when
- * taskkill reports the whole tree terminated; any failure, or a run longer
- * than `timeoutMs`, resolves unconfirmed so callers can fail closed.
+ * Terminate a process and all its descendants via `taskkill /T /F`: a
+ * Windows .cmd launcher's real pi is a grandchild holding the session file
+ * and pipes, so killing only the root would strand it. Any failure or run
+ * beyond `timeoutMs` resolves unconfirmed so callers fail closed.
  */
 export function killProcessTree(
   pid: number,

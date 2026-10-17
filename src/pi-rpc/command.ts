@@ -105,7 +105,7 @@ function readShebangLine(path: string): string | null {
  * (`env -S node --flag`) and unrecognized shebangs keep their configured
  * runtime instead of guessing at Bun compatibility.
  */
-function isBunRunnableEntry(path: string): boolean {
+export function isBunRunnableEntry(path: string): boolean {
   if (!isJavaScriptEntry(path)) return false
   const interpreter = readShebangLine(path)
   if (interpreter === null) return false

@@ -122,8 +122,10 @@ test(
     const results = await Promise.allSettled(writes)
     assert.equal(results[0]!.status, 'fulfilled', 'the in-flight write settles within the close')
     for (const result of results.slice(1)) {
-      assert.equal(result!.status, 'rejected', 'a write queued before the close must not run after it')
-      assert.match(String((result as PromiseRejectedResult).reason?.message ?? ''), /session closed while configuring/)
+      assert.equal(result?.status, 'rejected', 'a write queued before the close must not run after it')
+      if (result?.status === 'rejected') {
+        assert.match(String(result.reason?.message ?? ''), /session closed while configuring/)
+      }
     }
 
     assert.equal(spawned.length, 1, 'no child is spawned for queued writes after the close')
@@ -660,11 +662,11 @@ test(
 
     const outcomes = await Promise.allSettled([first, second])
     assert.equal(outcomes[1]!.status, 'fulfilled', 'the later valid load wins')
-    assert.equal(outcomes[0]!.status, 'rejected', 'the earlier load is superseded by the later admission')
-    assert.match(
-      String((outcomes[0] as PromiseRejectedResult).reason?.message ?? ''),
-      /closed while loading|superseded/
-    )
+    const superseded = outcomes[0]
+    assert.equal(superseded?.status, 'rejected', 'the earlier load is superseded by the later admission')
+    if (superseded?.status === 'rejected') {
+      assert.match(String(superseded.reason?.message ?? ''), /closed while loading|superseded/)
+    }
 
     const live = sessions.maybeGet(sessionId)
     assert.ok(live, 'the winning load keeps the session registered')
@@ -692,7 +694,7 @@ test(
 
     assert.equal(spawned.length, 2, "the later load replaces the resume's child")
     assert.equal(spawned[0]!.disposed, true)
-    assert.equal(sessions.maybeGet(sessionId)?.proc, spawned[1] as any, 'the later load wins the session')
+    assert.equal(sessions.maybeGet(sessionId)?.proc, spawned[1], 'the later load wins the session')
     sessions.close(sessionId)
   }
 )
@@ -848,7 +850,7 @@ test(
     const reopened = await agent.loadSession({ sessionId, cwd, mcpServers: [] })
     assert.ok(Array.isArray(reopened.configOptions), 'a load after the completed close still restores')
     assert.equal(spawned.length, 2, 'the legitimate post-close load spawns its fresh child')
-    assert.equal(sessions.maybeGet(sessionId)?.proc, spawned[1] as any, 'the post-close load owns the session')
+    assert.equal(sessions.maybeGet(sessionId)?.proc, spawned[1], 'the post-close load owns the session')
     sessions.close(sessionId)
   }
 )

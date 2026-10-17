@@ -201,6 +201,17 @@ test('buildPiInvocation reroutes Bun-shebang entries and stays conservative othe
     executable: 'pi',
     args: []
   })
+
+  // A bare node shebang alone would reroute to Bun; only the non-JS extension
+  // keeps the configured runtime, so this case isolates the extension gate.
+  const nonJsEntry = join(binDir, 'entry.sh')
+  writeExecutable(nonJsEntry, '#!/usr/bin/env node\n')
+  rmSync(join(binDir, 'pi'))
+  symlinkSync(nonJsEntry, join(binDir, 'pi'))
+  assert.deepEqual(buildPiInvocation('pi', [], { platform: 'linux', env: { PATH: binDir }, defaultCommand: true }), {
+    executable: 'pi',
+    args: []
+  })
 })
 
 test('buildPiInvocation falls back to the bare default command when pi is not on PATH', { skip: isWindows }, t => {

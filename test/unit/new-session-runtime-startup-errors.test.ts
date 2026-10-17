@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { RequestError } from '@agentclientprotocol/sdk'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { SessionStore } from '../../src/acp/session-store.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
@@ -81,6 +82,72 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
   )
   assert.equal(existsSync(sessionFile), false)
   assert.equal(store.get('s-auth'), null)
+})
+
+test('PiAcpAgent: newSession maps post-spawn state probe failures behind models precedence', async () => {
+  const cases = [
+    {
+      name: 'state auth error with models available',
+      models: async () => ({ models: [{ provider: 'test', id: 'model', name: 'model' }] }),
+      state: async () => {
+        throw new Error('Authentication required: missing key')
+      },
+      code: -32000,
+      message: /Configure an API key or log in with an OAuth provider/i
+    },
+    {
+      name: 'state non-auth error with models available',
+      models: async () => ({ models: [{ provider: 'test', id: 'model', name: 'model' }] }),
+      state: async () => {
+        throw new Error('state socket hang up')
+      },
+      code: -32603,
+      message: /state socket hang up/
+    },
+    {
+      name: 'empty models takes precedence over a state failure',
+      models: async () => ({ models: [] }),
+      state: async () => {
+        throw new Error('state socket hang up')
+      },
+      code: -32000,
+      message: /Configure an API key or log in with an OAuth provider/i
+    },
+    {
+      name: 'a models failure takes precedence over a state auth error',
+      models: async () => {
+        throw new Error('models socket hang up')
+      },
+      state: async () => {
+        throw new Error('Authentication required: missing key')
+      },
+      code: -32603,
+      message: /models socket hang up/
+    }
+  ] as const
+
+  for (const { name, models, state, code, message } of cases) {
+    const session = {
+      sessionId: 's-state',
+      cwd: process.cwd(),
+      proc: { getAvailableModels: models, getState: state }
+    }
+    const sessions = new FakeSessions(session)
+    const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+    ;(agent as any).sessions = sessions as any
+
+    await assert.rejects(
+      () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),
+      (error: unknown) => {
+        assert.ok(error instanceof RequestError, `${name}: ${String(error)}`)
+        assert.equal(error.code, code, `${name}: error code`)
+        assert.match(error.message, message, `${name}: error message`)
+        return true
+      },
+      name
+    )
+    assert.deepEqual(sessions.closeCalls, ['s-state'], name)
+  }
 })
 
 test('PiAcpAgent: newSession waits for writer exit before deleting a failed session', async () => {

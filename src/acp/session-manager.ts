@@ -4,6 +4,7 @@ import type { AcpClient } from './client.js'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { PiRpcProcess, PiRpcSpawnError } from '../pi-rpc/process.js'
+import { piRecord } from '../pi-rpc/protocol.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { SessionStore } from './session-store.js'
 import { resolveSessionDirectory } from './session-repository.js'
@@ -350,19 +351,22 @@ export class SessionManager {
     // retried by sessionId, no store mapping exists, and `findPiSession` has no
     // id to match. A bare disposal is therefore correct -- the replacement
     // barrier is keyed by sessionId and would have nothing to key on.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    let state: any = null
+    let state: unknown
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-      state = (await proc.getState()) as any
+      state = await proc.getState()
     } catch (e) {
       proc.dispose()
       throw maybeAuthRequiredError(e, params.authMethods) ?? toRequestError(e)
     }
     this.assertNotDisposed(proc)
 
-    const sessionId = typeof state?.sessionId === 'string' && state.sessionId.trim() ? state.sessionId : null
-    const sessionFile = typeof state?.sessionFile === 'string' && state.sessionFile.trim() ? state.sessionFile : null
+    const reportedState = piRecord(state)
+    const sessionId =
+      typeof reportedState.sessionId === 'string' && reportedState.sessionId.trim() ? reportedState.sessionId : null
+    const sessionFile =
+      typeof reportedState.sessionFile === 'string' && reportedState.sessionFile.trim()
+        ? reportedState.sessionFile
+        : null
     if (!sessionId || !sessionFile) {
       proc.dispose()
       throw RequestError.internalError(

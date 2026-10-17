@@ -71,7 +71,7 @@ export function identityFromStats(stats: Stats): string | null {
   return stats.dev !== 0 || stats.ino !== 0 ? `${stats.dev}:${stats.ino}` : null
 }
 
-export type DirectoryKey = { identity: string | null; comparison: string }
+export type DirectoryKey = { readonly identity: string | null; readonly comparison: string }
 
 export function directoryKey(path: string, identity?: string | null): DirectoryKey {
   return { identity: identity ?? directoryIdentity(path), comparison: resolveCwdForComparison(path) }

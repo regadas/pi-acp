@@ -1,58 +1,22 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises'
-import { accessSync, closeSync, constants as fsConstants, openSync, readSync, realpathSync, statSync } from 'node:fs'
+import { realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { execFileSync } from 'node:child_process'
+import { findExecutableOnPath, isBunRunnableEntry } from '../src/pi-rpc/command.ts'
 import { withSmokeAgent } from './smoke-client.mjs'
 
-/** POSIX PATH lookup mirroring the adapter's `findExecutableOnPath` (src/pi-rpc/command.ts). */
-function findExecutableOnPath(name, { cwd = process.cwd(), pathValue = process.env.PATH ?? '/usr/bin:/bin' } = {}) {
-  const resolvedCwd = cwd.replace(/\/+$/, '')
-  for (const dir of pathValue.split(':')) {
-    const base = dir === '' ? resolvedCwd : dir.startsWith('/') ? dir : `${resolvedCwd}/${dir}`
-    const candidate = `${base}/${name}`
-    try {
-      if (!statSync(candidate).isFile()) continue
-      accessSync(candidate, fsConstants.X_OK)
-      return candidate
-    } catch {
-      /* Not an executable file in this PATH entry. */
-    }
-  }
-  return null
-}
-
-/** Reads the `#!` interpreter line; null for non-shebang files (same probe bound as the adapter). */
-function readShebangLine(path) {
-  let fd
-  try {
-    fd = openSync(path, 'r')
-    const head = Buffer.alloc(512)
-    const length = readSync(fd, head, 0, head.length, 0)
-    const text = head.subarray(0, length).toString('latin1')
-    if (!text.startsWith('#!')) return null
-    const newline = text.indexOf('\n')
-    if (newline === -1 && length === head.length) return null
-    return text.slice(2, newline === -1 ? undefined : newline).trim()
-  } catch {
-    return null
-  } finally {
-    if (fd !== undefined) closeSync(fd)
-  }
-}
-
 /**
- * Mirrors the adapter's POSIX default-discovery Bun reroute
- * (`bunRuntimeInvocation` in src/pi-rpc/command.ts): only direct-JS installs
- * with a bare Node/Bun shebang and no `..` in the PATH candidate launch via
- * Bun. Drift is caught end-to-end by the direct variant's runtime receipt: if
- * the adapter stops rerouting, the Bun receipt assertion fails in CI.
+ * Classifies the default launch with the adapter's production helpers
+ * (src/pi-rpc/command.ts) instead of a mirrored copy. The direct variant's
+ * runtime receipt fails in CI if the adapter stops rerouting to Bun.
  */
 function classifyDefaultLaunchPi({ explicit, pathValue = process.env.PATH, cwd = process.cwd() } = {}) {
-  const bun = findExecutableOnPath('bun', { cwd, pathValue })
+  const env = { PATH: pathValue }
+  const bun = findExecutableOnPath('bun', { cwd, env })
   if (!bun) return { bunLaunch: false, reason: 'bun not found on PATH' }
-  const candidate = explicit ?? findExecutableOnPath('pi', { cwd, pathValue })
+  const candidate = explicit ?? findExecutableOnPath('pi', { cwd, env })
   if (!candidate) return { bunLaunch: false, reason: 'pi not found on PATH' }
   if (candidate.split('/').includes('..'))
     return { bunLaunch: false, reason: `PATH candidate contains ..: ${candidate}` }
@@ -62,13 +26,7 @@ function classifyDefaultLaunchPi({ explicit, pathValue = process.env.PATH, cwd =
   } catch {
     return { bunLaunch: false, reason: `cannot resolve ${candidate}` }
   }
-  if (!/\.(?:js|mjs|cjs)$/i.test(entry)) return { bunLaunch: false, reason: `not a direct-JS entry: ${entry}` }
-  const interpreter = readShebangLine(entry)
-  if (
-    !interpreter ||
-    !(/^\/\S*\/env[ \t]+(?:node|bun)$/.test(interpreter) || /^\/\S*\/(?:node|bun)$/.test(interpreter))
-  )
-    return { bunLaunch: false, reason: `shebang keeps its configured runtime: ${interpreter ?? 'none'}` }
+  if (!isBunRunnableEntry(entry)) return { bunLaunch: false, reason: `entry keeps its configured runtime: ${entry}` }
   return {
     bunLaunch: true,
     reason: `direct-JS entry ${entry} launches via bun`,
@@ -79,14 +37,10 @@ function classifyDefaultLaunchPi({ explicit, pathValue = process.env.PATH, cwd =
   }
 }
 
-/** Selfcheck for the classifier above: synthetic installs, no process spawning. */
-
 /**
- * The direct variant's default discovery resolves `pi` from PATH, so an
- * accepted explicit entry must actually be reachable under that name:
- * pinning its directory does not help when it contains no `pi` (e.g. a
- * dist/cli.js entry). Create a disposable bin whose `pi` symlink points at
- * the exact accepted entry; the caller prepends it to PATH.
+ * Default discovery resolves `pi` from PATH, so an accepted explicit entry must
+ * be reachable under that name (its own directory may contain no `pi`, e.g. a
+ * dist/cli.js): pin a disposable bin whose `pi` symlink points at it.
  */
 async function pinExplicitPiBin(entry, binDir) {
   await mkdir(binDir, { recursive: true })
@@ -119,32 +73,18 @@ async function directLaunchSelfcheck() {
     assert.equal(viaBun.entry, join(realpathSync.native(dir), 'pkg', 'cli.js'))
     assert.equal(viaBun.piDir, direct)
     assert.equal(viaBun.bun, join(direct, 'bun'))
-    // Every later scenario is also a bin symlink, so only the intended
-    // discriminator (shebang, entry extension, missing dependency) differs.
+    // Entry classification itself (bare bun/node shebangs, shell launchers,
+    // interpreter flags, non-JS extensions) is production behavior, tested
+    // with the real helper in test/unit/pi-command.test.ts; the selfcheck
+    // below keeps only the script-specific flow and gates.
     const piSymlink = async (bin, entryName, content) => {
       await writeFile(join(bin, entryName), content, { mode: 0o755 })
       await symlink(join(bin, entryName), join(bin, 'pi'))
     }
-    // Bare `bun` shebang entries reroute too.
-    const bunShebang = await binDir('bun-shebang')
-    await piSymlink(bunShebang, 'entry.js', '#!/usr/bin/env bun\n')
-    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(bunShebang), cwd }).bunLaunch, true)
-    // A shell launcher keeps its configured runtime.
-    const shell = await binDir('shell')
-    await piSymlink(shell, 'entry.js', '#!/bin/sh\nexec pi "$@"\n')
-    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(shell), cwd }).bunLaunch, false)
-    // Interpreter flags and non-JS entries never reroute.
-    const flags = await binDir('flags')
-    await piSymlink(flags, 'entry.js', '#!/usr/bin/env -S node --flag\n')
-    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(flags), cwd }).bunLaunch, false)
-    const script = await binDir('script')
-    await piSymlink(script, 'entry.sh', '#!/usr/bin/env node\n')
-    assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(script), cwd }).bunLaunch, false)
     // No bun on PATH: the default launch stays on the configured runtime.
     const noBun = join(dir, 'no-bun')
     await mkdir(noBun)
-    await writeFile(join(noBun, 'entry.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
-    await symlink(join(noBun, 'entry.js'), join(noBun, 'pi'))
+    await piSymlink(noBun, 'entry.js', '#!/usr/bin/env node\n')
     assert.equal(classifyDefaultLaunchPi({ pathValue: scoped(noBun), cwd }).bunLaunch, false)
     // No pi on PATH at all (bun is available).
     const bunOnly = await binDir('bun-only')
@@ -160,6 +100,8 @@ async function directLaunchSelfcheck() {
     // Explicit PI_ACP_EVAL_PI handling: a direct-JS entry is used as given
     // (its directory is pinned ahead of PATH for default discovery); an
     // explicit shell launcher never guesses at Bun.
+    const shell = await binDir('shell')
+    await piSymlink(shell, 'entry.js', '#!/bin/sh\nexec pi "$@"\n')
     const explicitDirect = classifyDefaultLaunchPi({
       explicit: join(direct, 'pi'),
       pathValue: scoped(shell),
@@ -176,10 +118,8 @@ async function directLaunchSelfcheck() {
       classifyDefaultLaunchPi({ explicit: join(dir, 'missing'), pathValue: scoped(direct), cwd }).bunLaunch,
       false
     )
-    // Explicit PI_ACP_EVAL_PI entries are pinned as `pi` on a disposable bin:
-    // the classifier accepts a direct-JS entry, but default discovery
-    // resolves `pi` from PATH, so the entry must actually be reachable under
-    // that name for the direct variant to prove the accepted entry.
+    // The pinned bin proves the accepted explicit entry stays reachable as
+    // the literal `pi` for default discovery.
     const pinned = await mkdtemp(join(dir, 'pinned-bin-'))
     await pinExplicitPiBin(viaBun.entry, pinned)
     const pinnedResult = classifyDefaultLaunchPi({ pathValue: `${pinned}:${scoped(direct)}`, cwd })
@@ -187,9 +127,9 @@ async function directLaunchSelfcheck() {
     assert.equal(pinnedResult.piPath, join(pinned, 'pi'))
     assert.equal(pinnedResult.piDir, pinned)
     assert.equal(pinnedResult.entry, viaBun.entry)
-    // Empty PATH entries resolve against the cwd, like the adapter.
-    await writeFile(join(cwd, 'entry.js'), '#!/usr/bin/env node\n', { mode: 0o755 })
-    await symlink(join(cwd, 'entry.js'), join(cwd, 'pi'))
+    // Empty PATH entries resolve against the cwd: the pathValue->env bridge
+    // must preserve the production helper's execvp semantics.
+    await piSymlink(cwd, 'entry.js', '#!/usr/bin/env node\n')
     assert.equal(classifyDefaultLaunchPi({ pathValue: `:${direct}`, cwd }).bunLaunch, true)
     console.log('selfcheck-direct ok')
   } finally {
