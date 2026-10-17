@@ -20,6 +20,8 @@ type SessionCreateParams = {
   /** Auth methods the owning agent advertised at initialize (for auth-required errors). */
   authMethods?: AuthMethod[]
   supportsElicitationForm?: boolean
+  /** Additional validated workspace roots (empty when none). */
+  additionalDirectories?: readonly string[]
 }
 
 export class SessionManager {
@@ -137,6 +139,7 @@ export class SessionManager {
     sessionPath?: string
     sessionDirectory?: string
     piCommand?: string
+    additionalDirectories?: readonly string[]
   }): Promise<PiRpcProcess> {
     // Refuse before a child exists. A caller can reach this point long after
     // teardown began -- a restore parked on {@link waitForRetiredProcesses} is
@@ -328,7 +331,8 @@ export class SessionManager {
       proc = await this.spawnOwned({
         cwd: params.cwd,
         sessionDirectory: resolveSessionDirectory(params.cwd).path,
-        piCommand: params.piCommand
+        piCommand: params.piCommand,
+        ...(params.additionalDirectories?.length ? { additionalDirectories: params.additionalDirectories } : {})
       })
     } catch (e) {
       if (e instanceof PiRpcSpawnError) {
@@ -377,7 +381,12 @@ export class SessionManager {
     }
 
     try {
-      this.store.upsert({ sessionId, cwd: params.cwd, sessionFile })
+      this.store.upsert({
+        sessionId,
+        cwd: params.cwd,
+        sessionFile,
+        additionalDirectories: params.additionalDirectories ?? []
+      })
     } catch (e) {
       // pi already created this session, and `findPiSession` discovers it by
       // scanning pi's own directory, so a later session/load can target the
@@ -396,7 +405,8 @@ export class SessionManager {
         conn: params.conn,
         supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
         authMethods: params.authMethods,
-        supportsElicitationForm: params.supportsElicitationForm
+        supportsElicitationForm: params.supportsElicitationForm,
+        additionalDirectories: params.additionalDirectories
       })
     } catch (error) {
       // The store mapping already exists, so a later session/load can target
@@ -448,7 +458,8 @@ export class SessionManager {
         conn: params.conn,
         supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
         authMethods: params.authMethods,
-        supportsElicitationForm: params.supportsElicitationForm
+        supportsElicitationForm: params.supportsElicitationForm,
+        additionalDirectories: params.additionalDirectories
       })
     } catch (error) {
       this.retireProcess(sessionId, params.proc)

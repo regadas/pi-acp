@@ -28,7 +28,7 @@ test('CI and release gates run eval:acp after pi install and smoke, before publi
     '.github/workflows/github-release.yml'
   ]) {
     const text = readFileSync(join(repoRoot, workflow), 'utf8')
-    const install = text.indexOf('npm install --global @earendil-works/pi-coding-agent@1.1.0')
+    const install = text.indexOf('npm install --global @earendil-works/pi-coding-agent@1.2.0')
     const smoke = text.indexOf('npm run smoke')
     const evalStep = text.indexOf('npm run eval:acp')
     assert.ok(install >= 0, `${workflow} must install pinned pi`)

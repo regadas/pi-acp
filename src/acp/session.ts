@@ -213,6 +213,8 @@ function customMessageIdentity(message: unknown, blocks: TranslatedUserBlock[]):
 export class PiAcpSession {
   readonly sessionId: string
   readonly cwd: string
+  /** Additional workspace roots the child pi was configured with. */
+  readonly additionalDirectories: readonly string[]
 
   private activeAdapterPromptTurns = 0
   private customMessageSequence = 0
@@ -338,11 +340,14 @@ export class PiAcpSession {
     supportsElicitationForm?: boolean
     supportsTerminalOutputMeta?: boolean
     authMethods?: AuthMethod[]
+    /** Additional validated workspace roots for this session's child. */
+    additionalDirectories?: readonly string[]
     /** Test seam: maximum wait for an observed out-of-band run to settle. */
     deferredAdmissionTimeoutMs?: number
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
+    this.additionalDirectories = opts.additionalDirectories ?? []
     this.proc = opts.proc
     this.conn = opts.conn
     this.supportsElicitationForm = opts.supportsElicitationForm ?? false

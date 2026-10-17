@@ -12,6 +12,8 @@ export type SessionRecord = {
   title: string | null
   updatedAt: string | null
   sessionFile: string
+  /** Additional workspace roots known from the adapter mapping; absent means none. */
+  additionalDirectories?: readonly string[]
 }
 
 const HEADER_LIMIT = 1024 * 1024
@@ -298,7 +300,12 @@ export class SessionRepository {
     private readonly agentDir = getAgentDir()
   ) {}
 
-  upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
+  upsert(entry: {
+    sessionId: string
+    cwd: string
+    sessionFile: string
+    additionalDirectories?: readonly string[]
+  }): void {
     this.store.upsert(entry)
   }
 
@@ -345,7 +352,13 @@ export class SessionRepository {
         if (stored.cwd !== header.cwd) {
           this.store.upsert({ sessionId: header.sessionId, cwd: header.cwd, sessionFile: stored.sessionFile })
         }
-        return { ...header, title: null, updatedAt: stored.updatedAt, sessionFile: stored.sessionFile }
+        return {
+          ...header,
+          title: null,
+          updatedAt: stored.updatedAt,
+          sessionFile: stored.sessionFile,
+          additionalDirectories: stored.additionalDirectories ?? []
+        }
       }
     }
 
@@ -355,7 +368,9 @@ export class SessionRepository {
     }
     if (!newest) return null
     this.store.upsert({ sessionId: newest.sessionId, cwd: newest.cwd, sessionFile: newest.sessionFile })
-    return newest
+    // Discovery (re)established the mapping; the roots recorded for this
+    // session identity survive the refresh.
+    return { ...newest, additionalDirectories: this.store.get(newest.sessionId)?.additionalDirectories ?? [] }
   }
 
   async list(cwd?: string): Promise<SessionRecord[]> {
@@ -443,6 +458,8 @@ export class SessionRepository {
       if (inScope(selected.cwd) && (stored?.sessionFile !== selected.sessionFile || stored?.cwd !== selected.cwd)) {
         this.store.upsert(selected)
       }
+      // Roots follow the adapter mapping, not the discovered file.
+      selected.additionalDirectories = stored?.additionalDirectories ?? []
     }
     return [...byId.values()]
       .filter(record => inScope(record.cwd))

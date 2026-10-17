@@ -155,6 +155,31 @@ test('test runner: selected tests run against disposable user state and leave in
   }
 })
 
+test('isolatedEnv scrubs inherited adapter-internal bridge keys', () => {
+  const observed = join(tmpdir(), `pi-acp-isolated-env-${process.pid}.json`)
+  const probe = [
+    `import { isolatedEnv } from ${JSON.stringify(pathToFileURL(join(repoRoot, 'scripts/isolated-env.mjs')).href)}`,
+    "import { writeFileSync } from 'node:fs'",
+    `const env = isolatedEnv({ ...process.env, PI_ACP_WORKSPACE_ROOTS: '["/poisoned"]' }, ` +
+      `{ home: '/h', workspace: '/w', acpDir: '/a', agentDir: '/g', root: '/r' })`,
+    `writeFileSync(${JSON.stringify(observed)}, JSON.stringify({`,
+    '  roots: env.PI_ACP_WORKSPACE_ROOTS ?? null,',
+    '  piCommand: env.PI_ACP_PI_COMMAND ?? null',
+    '}))'
+  ].join('\n')
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', probe], {
+    env: { ...process.env, PI_ACP_WORKSPACE_ROOTS: '["/inherited/outer-root"]', PI_ACP_PI_COMMAND: '/bin/false' },
+    encoding: 'utf8'
+  })
+  try {
+    assert.equal(result.error, undefined, String(result.error))
+    assert.equal(result.status, 0, `isolated-env probe failed:\n${result.stdout}\n${result.stderr}`)
+    assert.deepEqual(JSON.parse(readFileSync(observed, 'utf8')), { roots: null, piCommand: null })
+  } finally {
+    rmSync(observed, { force: true })
+  }
+})
+
 test('ordinary smoke: disposable user state and scrubbed overrides reach the built adapter', () => {
   const state = sentinelUserState('pi-acp-isolated-probe-smoke-')
   const launchCwd = join(state.root, 'launch-cwd')

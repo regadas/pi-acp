@@ -48,6 +48,7 @@ import { parseCommandArgs } from './slash-commands.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { assertValidSessionCwd, sessionCwdsEquivalent } from './session-cwd.js'
+import { normalizeAdditionalDirectories, workspaceRootsEquivalent } from './workspace-roots.js'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
@@ -66,15 +67,6 @@ function assertNoMcpServers(mcpServers: readonly unknown[] | undefined): void {
     `pi does not support MCP servers, so pi-acp cannot connect the ${mcpServers.length} requested MCP server(s). ` +
       'Remove mcpServers from the session request. To use MCP tools with pi, configure them through a pi extension ' +
       '(e.g. https://github.com/nicobailon/pi-mcp-adapter) instead.'
-  )
-}
-
-function assertNoAdditionalDirectories(additionalDirectories: readonly string[] | undefined): void {
-  if (!additionalDirectories?.length) return
-  throw RequestError.invalidParams(
-    { reason: 'ADDITIONAL_DIRECTORIES_UNSUPPORTED' },
-    `pi-acp does not support additional workspace directories, so it cannot use the ${additionalDirectories.length} ` +
-      'requested additional directories. Remove additionalDirectories from the session request.'
   )
 }
 
@@ -113,6 +105,18 @@ const REPLACEMENT_TERMINATION_TIMEOUT_MS = 5_000
 const LIST_PAGE_SIZE = 50
 const LIST_SNAPSHOT_TTL_MS = 5 * 60_000
 const MAX_LIST_SNAPSHOTS = 16
+
+/** Restore request shape shared by load/resume/prompt/config callers. */
+type SessionRestoreOpts = {
+  cwd?: string
+  additionalDirectories?: readonly string[]
+  /**
+   * Internal: the caller is a session/load whose own activeLoads tracking must
+   * not be awaited inside the changed-root path (a load can never wait for
+   * itself).
+   */
+  loadOwned?: boolean
+}
 
 export class PiAcpAgent implements ACPAgent {
   private readonly conn: AcpClient
@@ -221,9 +225,15 @@ export class PiAcpAgent implements ACPAgent {
   private async findStoredSession(
     sessionId: string,
     cwd?: string
-  ): Promise<{ cwd: string; sessionFile: string } | null> {
+  ): Promise<{ cwd: string; sessionFile: string; additionalDirectories: readonly string[] } | null> {
     const session = await this.sessionRepository().find(sessionId, cwd)
-    return session ? { cwd: session.cwd, sessionFile: session.sessionFile } : null
+    return session
+      ? {
+          cwd: session.cwd,
+          sessionFile: session.sessionFile,
+          additionalDirectories: session.additionalDirectories ?? []
+        }
+      : null
   }
 
   private assertRequestedSessionCwd(recordedCwd: string, requestedCwd?: string): void {
@@ -409,138 +419,229 @@ export class PiAcpAgent implements ACPAgent {
     throw RequestError.requestCancelled({}, `session is being deleted: ${sessionId}`)
   }
 
-  private async restoreSession(sessionId: string, opts?: { cwd?: string }): Promise<PiAcpSession> {
+  private async restoreSession(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
     this.assertNotDeleting(sessionId)
 
-    const existing = this.sessions.maybeGet(sessionId)
-    if (existing) {
-      this.assertRequestedSessionCwd(existing.cwd, opts?.cwd)
-      return existing
-    }
-
-    const inFlight = this.restoringSessions.get(sessionId)
-    if (inFlight) {
-      const session = await inFlight
-      this.assertRequestedSessionCwd(session.cwd, opts?.cwd)
-      return session
-    }
-
-    const restorePromise = (async () => {
-      const stored = await this.findStoredSession(sessionId, opts?.cwd)
-      if (!stored) {
-        throw RequestError.resourceNotFound(sessionId)
-      }
-
-      this.assertRequestedSessionCwd(stored.cwd, opts?.cwd)
-      const cwd = stored.cwd
-
-      // pi does not coordinate concurrent writers on a session file, so a
-      // replacement must not open this session's file while the child it
-      // replaces is still being terminated. Disposal only starts that
-      // escalation, so wait (bounded, fail closed) for the real exit first.
-      // Keyed by the file as well as the id: a child retired under a *different*
-      // session id (pi reported another identity) may still append to this file.
-      await this.sessions.waitForRetiredProcesses([sessionId, stored.sessionFile], this.replacementTerminationTimeoutMs)
-
-      // Spawned through the session manager so the child is owned (and waited
-      // for at shutdown) even if this restore disposes it below.
-      let proc: PiRpcProcess
-      try {
-        proc = await this.sessions.spawnOwned({
-          cwd,
-          sessionPath: stored.sessionFile,
-          piCommand: process.env.PI_ACP_PI_COMMAND
-        })
-      } catch (e: unknown) {
-        if (e instanceof Error && e.name === 'PiRpcSpawnError') {
-          throw RequestError.internalError({ code: (e as Error & { code?: string }).code }, e.message)
+    // Additional workspace roots are child-start configuration. A caller that
+    // supplies a replacement root list (load/resume) must not reuse a live
+    // child configured with different roots; same roots reuse it.
+    while (true) {
+      const existing = this.sessions.maybeGet(sessionId)
+      if (existing) {
+        this.assertRequestedSessionCwd(existing.cwd, opts?.cwd)
+        if (
+          opts?.additionalDirectories === undefined ||
+          workspaceRootsEquivalent(existing.additionalDirectories, opts.additionalDirectories)
+        ) {
+          return existing
         }
-        throw e
-      }
-
-      // The connection may have been torn down while the spawn was in flight;
-      // a disposed agent must never register (and thereby leak) this process.
-      // Every disposal below retires through the manager: this child opened
-      // `stored.sessionFile`, so an immediate retry must wait for its exit
-      // instead of opening the same file a second time.
-      if (this.disposed) {
-        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
-        throw RequestError.internalError({}, 'pi-acp agent is disposed')
-      }
-
-      // Authoritative identity check before installation: the child must
-      // actually be running the requested session. A pi that silently started
-      // a different or fresh session (e.g. the stored file vanished) would
-      // otherwise be installed under the wrong ACP sessionId.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-      let state: any = null
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-        state = (await proc.getState()) as any
-      } catch (e) {
-        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
-        throw (
-          maybeAuthRequiredError(e, this.authMethods) ??
-          RequestError.internalError({}, `pi did not report its session state: ${String((e as Error)?.message ?? e)}`)
-        )
-      }
-      if (this.disposed) {
-        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
-        throw RequestError.internalError({}, 'pi-acp agent is disposed')
-      }
-
-      const reportedId = typeof state?.sessionId === 'string' ? state.sessionId.trim() : ''
-      const reportedFile = typeof state?.sessionFile === 'string' ? state.sessionFile.trim() : ''
-      if (
-        reportedId !== sessionId ||
-        !reportedFile ||
-        (stored.sessionFile && !sessionPathsEquivalent(reportedFile, stored.sessionFile))
-      ) {
-        // The child reported a different identity, so it may append to either
-        // file. Gate every identity a later restore could reach it through:
-        // otherwise a `session/load` for the *reported* id discovers that file
-        // (findPiSession scans pi's own directory) and spawns a second writer
-        // while this one is still escalating SIGTERM -> SIGKILL.
-        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile, reportedId, reportedFile])
-        throw RequestError.internalError(
-          {},
-          `pi did not restore the requested session (requested ${sessionId} at ${stored.sessionFile}, ` +
-            `got ${reportedId || 'unknown'} at ${reportedFile || 'unknown'})`
-        )
-      }
-
-      // getOrCreate refuses registration after teardown and disposes `proc`
-      // itself when a concurrently registered session wins the race.
-      const session = this.sessions.getOrCreate(sessionId, {
-        cwd,
-        conn: this.conn,
-        proc,
-        supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
-        authMethods: this.authMethods,
-        supportsElicitationForm: this.supportsElicitationForm
-      })
-
-      try {
-        this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile })
-      } catch (error) {
-        if (this.sessions.maybeGet(sessionId) === session && session.proc === proc) {
-          this.sessions.close(sessionId)
-        } else {
-          this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
+        // A live load's freshly restored child is provisional until that load
+        // settles; wait instead of destroying it mid-flight. Loads themselves
+        // never wait here (they would wait on their own tracking): they own
+        // generation-guarded teardown of whatever survives their fencing.
+        if (!opts?.loadOwned && this.activeLoads.has(sessionId)) {
+          await this.waitForActiveLoads(sessionId)
+          continue
         }
-        throw error
+        // Retire the differently configured child through the normal teardown
+        // (including its replacement barrier below) and restore a fresh one.
+        return await this.restoreSessionReplacingChild(sessionId, opts)
       }
 
-      return session
-    })()
+      const inFlight = this.restoringSessions.get(sessionId)
+      if (inFlight) {
+        const session = await inFlight
+        this.assertRequestedSessionCwd(session.cwd, opts?.cwd)
+        if (
+          opts?.additionalDirectories === undefined ||
+          workspaceRootsEquivalent(session.additionalDirectories, opts.additionalDirectories)
+        ) {
+          return session
+        }
+        continue
+      }
 
+      return await this.registeredRestore(sessionId, opts)
+    }
+  }
+
+  /**
+   * The registered restore spawn path shared by every restore: the store
+   * read, retirement barrier, child spawn, identity check and registration
+   * run as the session's in-flight restore, so concurrent consumers join it
+   * and close/delete/load fence it.
+   */
+  private async registeredRestore(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
+    const restorePromise = this.restoreFromStore(sessionId, opts)
     this.restoringSessions.set(sessionId, restorePromise)
-
     try {
       return await restorePromise
     } finally {
-      this.restoringSessions.delete(sessionId)
+      if (this.restoringSessions.get(sessionId) === restorePromise) this.restoringSessions.delete(sessionId)
     }
+  }
+
+  /**
+   * Fenced replacement of a live child whose additional roots differ from the
+   * request. The teardown AND the fresh restore run as one registered
+   * in-flight restore, so a close, delete or load admitted while the old child
+   * is still settling fences this window instead of racing an invisible gap:
+   * a close or delete fails it closed before the replacement spawns, and a
+   * load awaits it, supersedes the fresh child and is never overridden -- this
+   * window can never destroy a load's provisional child. New prompts join the
+   * registration and continue on the fresh child.
+   */
+  private async restoreSessionReplacingChild(sessionId: string, opts: SessionRestoreOpts): Promise<PiAcpSession> {
+    const observedEpoch = this.cancellationEpochs.get(sessionId) ?? 0
+    const replacement = (async () => {
+      // Retire the differently configured child. This mirrors the teardown in
+      // closeSessionResources but never awaits in-flight restores (this window
+      // is itself the registered restore; awaiting would self-join) and never
+      // waits for active prompts: prompts arriving now join this registration
+      // and continue on the fresh child, so waiting for them here would
+      // deadlock on this very promise.
+      const session = this.sessions.maybeGet(sessionId)
+      if (session) {
+        const shutdown = session.shutdown()
+        this.sessions.close(sessionId)
+        await shutdown
+      }
+
+      // A close or delete admitted while the old child was settling owns the
+      // session now; the replacement fails closed instead of overriding it
+      // (respawning behind an acknowledged close, or recreating a deleted
+      // session's file and store entry). The epoch bump also catches
+      // admissions that already completed -- closing markers are cleared as
+      // soon as their close finishes -- and a completed delete surfaces below
+      // as resource-not-found because the fresh restore re-reads the store.
+      this.assertNotDeleting(sessionId)
+      if (this.closingSessions.has(sessionId) || (this.cancellationEpochs.get(sessionId) ?? 0) !== observedEpoch) {
+        throw RequestError.requestCancelled(
+          {},
+          `session closed, cancelled, or superseded by a load while restoring: ${sessionId}`
+        )
+      }
+
+      return this.restoreFromStore(sessionId, opts)
+    })()
+    this.restoringSessions.set(sessionId, replacement)
+    try {
+      return await replacement
+    } finally {
+      if (this.restoringSessions.get(sessionId) === replacement) this.restoringSessions.delete(sessionId)
+    }
+  }
+
+  private async restoreFromStore(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
+    const stored = await this.findStoredSession(sessionId, opts?.cwd)
+    if (!stored) {
+      throw RequestError.resourceNotFound(sessionId)
+    }
+
+    this.assertRequestedSessionCwd(stored.cwd, opts?.cwd)
+    const cwd = stored.cwd
+    const additionalDirectories = opts?.additionalDirectories ?? stored.additionalDirectories
+
+    // pi does not coordinate concurrent writers on a session file, so a
+    // replacement must not open this session's file while the child it
+    // replaces is still being terminated. Disposal only starts that
+    // escalation, so wait (bounded, fail closed) for the real exit first.
+    // Keyed by the file as well as the id: a child retired under a *different*
+    // session id (pi reported another identity) may still append to this file.
+    await this.sessions.waitForRetiredProcesses([sessionId, stored.sessionFile], this.replacementTerminationTimeoutMs)
+
+    // Spawned through the session manager so the child is owned (and waited
+    // for at shutdown) even if this restore disposes it below.
+    let proc: PiRpcProcess
+    try {
+      proc = await this.sessions.spawnOwned({
+        cwd,
+        sessionPath: stored.sessionFile,
+        piCommand: process.env.PI_ACP_PI_COMMAND,
+        ...(additionalDirectories.length ? { additionalDirectories } : {})
+      })
+    } catch (e: unknown) {
+      if (e instanceof Error && e.name === 'PiRpcSpawnError') {
+        throw RequestError.internalError({ code: (e as Error & { code?: string }).code }, e.message)
+      }
+      throw e
+    }
+
+    // The connection may have been torn down while the spawn was in flight;
+    // a disposed agent must never register (and thereby leak) this process.
+    // Every disposal below retires through the manager: this child opened
+    // `stored.sessionFile`, so an immediate retry must wait for its exit
+    // instead of opening the same file a second time.
+    if (this.disposed) {
+      this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
+      throw RequestError.internalError({}, 'pi-acp agent is disposed')
+    }
+
+    // Authoritative identity check before installation: the child must
+    // actually be running the requested session. A pi that silently started
+    // a different or fresh session (e.g. the stored file vanished) would
+    // otherwise be installed under the wrong ACP sessionId.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
+    let state: any = null
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
+      state = (await proc.getState()) as any
+    } catch (e) {
+      this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
+      throw (
+        maybeAuthRequiredError(e, this.authMethods) ??
+        RequestError.internalError({}, `pi did not report its session state: ${String((e as Error)?.message ?? e)}`)
+      )
+    }
+    if (this.disposed) {
+      this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
+      throw RequestError.internalError({}, 'pi-acp agent is disposed')
+    }
+
+    const reportedId = typeof state?.sessionId === 'string' ? state.sessionId.trim() : ''
+    const reportedFile = typeof state?.sessionFile === 'string' ? state.sessionFile.trim() : ''
+    if (
+      reportedId !== sessionId ||
+      !reportedFile ||
+      (stored.sessionFile && !sessionPathsEquivalent(reportedFile, stored.sessionFile))
+    ) {
+      // The child reported a different identity, so it may append to either
+      // file. Gate every identity a later restore could reach it through:
+      // otherwise a `session/load` for the *reported* id discovers that file
+      // (findPiSession scans pi's own directory) and spawns a second writer
+      // while this one is still escalating SIGTERM -> SIGKILL.
+      this.sessions.retireProcess(sessionId, proc, [stored.sessionFile, reportedId, reportedFile])
+      throw RequestError.internalError(
+        {},
+        `pi did not restore the requested session (requested ${sessionId} at ${stored.sessionFile}, ` +
+          `got ${reportedId || 'unknown'} at ${reportedFile || 'unknown'})`
+      )
+    }
+
+    // getOrCreate refuses registration after teardown and disposes `proc`
+    // itself when a concurrently registered session wins the race.
+    const session = this.sessions.getOrCreate(sessionId, {
+      cwd,
+      conn: this.conn,
+      proc,
+      supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
+      authMethods: this.authMethods,
+      supportsElicitationForm: this.supportsElicitationForm,
+      additionalDirectories
+    })
+
+    try {
+      this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile, additionalDirectories })
+    } catch (error) {
+      if (this.sessions.maybeGet(sessionId) === session && session.proc === proc) {
+        this.sessions.close(sessionId)
+      } else {
+        this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
+      }
+      throw error
+    }
+
+    return session
   }
 
   /**
@@ -551,7 +652,7 @@ export class PiAcpAgent implements ACPAgent {
    * and then use (or restore) the surviving state. The load itself calls
    * restoreSession directly and therefore never waits on itself.
    */
-  private async restoreSessionAwaitingLoads(sessionId: string, opts?: { cwd?: string }): Promise<PiAcpSession> {
+  private async restoreSessionAwaitingLoads(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
     while (true) {
       await this.waitForActiveLoads(sessionId)
       const observedGeneration = this.loadGenerations.get(sessionId) ?? 0
@@ -615,7 +716,8 @@ export class PiAcpAgent implements ACPAgent {
           list: {},
           resume: {},
           close: {},
-          delete: {}
+          delete: {},
+          additionalDirectories: {}
         }
       }
     }
@@ -624,7 +726,7 @@ export class PiAcpAgent implements ACPAgent {
   async newSession(params: NewSessionRequest) {
     assertValidSessionCwd(params.cwd)
     assertNoMcpServers(params.mcpServers)
-    assertNoAdditionalDirectories(params.additionalDirectories)
+    const additionalDirectories = normalizeAdditionalDirectories(params.cwd, params.additionalDirectories)
 
     const session = await this.sessions.create({
       cwd: params.cwd,
@@ -632,7 +734,8 @@ export class PiAcpAgent implements ACPAgent {
       piCommand: process.env.PI_ACP_PI_COMMAND,
       supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
       authMethods: this.authMethods,
-      supportsElicitationForm: this.supportsElicitationForm
+      supportsElicitationForm: this.supportsElicitationForm,
+      additionalDirectories
     })
 
     let configOptions: Awaited<ReturnType<typeof getSessionConfiguration>>
@@ -918,6 +1021,7 @@ export class PiAcpAgent implements ACPAgent {
     const sessions: SessionInfo[] = filtered.map(s => ({
       sessionId: s.sessionId,
       cwd: s.cwd,
+      additionalDirectories: [...(s.additionalDirectories ?? [])],
       title: s.title,
       updatedAt: s.updatedAt
     }))
@@ -962,7 +1066,7 @@ export class PiAcpAgent implements ACPAgent {
   async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
     assertValidSessionCwd(params.cwd)
     assertNoMcpServers(params.mcpServers)
-    assertNoAdditionalDirectories(params.additionalDirectories)
+    const additionalDirectories = normalizeAdditionalDirectories(params.cwd, params.additionalDirectories)
 
     const cwd = params.cwd
 
@@ -981,7 +1085,11 @@ export class PiAcpAgent implements ACPAgent {
         this.assertLoadActive(params.sessionId, generation)
       }
 
-      const session = await this.restoreSession(params.sessionId, { cwd })
+      const session = await this.restoreSession(params.sessionId, {
+        cwd,
+        additionalDirectories,
+        loadOwned: true
+      })
       try {
         this.assertLoadActive(params.sessionId, generation)
         const proc = session.proc
@@ -1032,11 +1140,11 @@ export class PiAcpAgent implements ACPAgent {
   async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
     assertValidSessionCwd(params.cwd)
     assertNoMcpServers(params.mcpServers)
-    assertNoAdditionalDirectories(params.additionalDirectories)
+    const additionalDirectories = normalizeAdditionalDirectories(params.cwd, params.additionalDirectories)
 
     const cwd = params.cwd
 
-    const session = await this.restoreSessionAwaitingLoads(params.sessionId, { cwd })
+    const session = await this.restoreSessionAwaitingLoads(params.sessionId, { cwd, additionalDirectories })
 
     // Unlike session/load, resume MUST NOT replay conversation history.
     const configOptions = await getSessionConfiguration(session.proc)

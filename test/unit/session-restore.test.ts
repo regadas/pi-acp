@@ -106,7 +106,8 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
       {
         sessionId: 'stored-session',
         cwd: '/tmp/store-project',
-        sessionFile: '/tmp/store-project/session.jsonl'
+        sessionFile: '/tmp/store-project/session.jsonl',
+        additionalDirectories: []
       }
     ])
   } finally {
@@ -211,7 +212,8 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
       {
         sessionId: 'fallback-session',
         cwd: '/tmp/fallback-project',
-        sessionFile
+        sessionFile,
+        additionalDirectories: []
       }
     ])
     assert.deepEqual(conn.updates, [

@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -11,7 +14,9 @@ import {
   type PiRpcEvent,
   type PiRpcTermination
 } from '../../src/pi-rpc/process.js'
+import { clearPiVersionCacheForTests } from '../../src/pi-rpc/version.js'
 
+const isWindows = process.platform === 'win32'
 const FIXTURE = fileURLToPath(new URL('../fixtures/fake-pi-rpc.mjs', import.meta.url))
 
 class MockChild extends EventEmitter {
@@ -1161,4 +1166,40 @@ test('PiRpcProcess: owner cancel control releases an awaited settlement boundary
   assert.equal(mock.killed, false, 'the bounded abort must not quarantine a healthy boundary')
   assert.deepEqual(phases.slice(0, 3), ['clear_queue', 'cancel', 'abort'])
   assert.equal(phases.at(-1), 'check')
+})
+
+test('PiRpcProcess.spawn passes additional workspace roots to the child env only', { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-ws-env-'))
+  const stub = join(dir, 'pi-ws-env')
+  const capture = join(dir, 'env.json')
+  writeFileSync(
+    stub,
+    '#!/usr/bin/env node\n' +
+      `if (process.argv[2] === '--version') console.log('1.3.0');\n` +
+      `else require('node:fs').writeFileSync(${JSON.stringify(capture)}, process.env.PI_ACP_WORKSPACE_ROOTS ?? 'null');\n`
+  )
+  chmodSync(stub, 0o755)
+
+  // A poisoned parent environment must not leak into root-less children:
+  // the adapter's own env copy is the baseline the child starts from.
+  const previousRoots = process.env.PI_ACP_WORKSPACE_ROOTS
+  process.env.PI_ACP_WORKSPACE_ROOTS = JSON.stringify(['/inherited/outer-root'])
+  try {
+    let proc = await PiRpcProcess.spawn({ cwd: dir, piCommand: stub, additionalDirectories: ['/ws/a', '/ws/b'] })
+    await proc.whenTerminated()
+    assert.deepEqual(JSON.parse(readFileSync(capture, 'utf8')), ['/ws/a', '/ws/b'])
+
+    proc = await PiRpcProcess.spawn({ cwd: dir, piCommand: stub })
+    await proc.whenTerminated()
+    assert.equal(
+      JSON.parse(readFileSync(capture, 'utf8')),
+      null,
+      'no roots must explicitly clear an inherited workspace-roots env value'
+    )
+  } finally {
+    if (previousRoots === undefined) delete process.env.PI_ACP_WORKSPACE_ROOTS
+    else process.env.PI_ACP_WORKSPACE_ROOTS = previousRoots
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

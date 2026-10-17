@@ -606,3 +606,56 @@ test('repository.list: foreign metadata scan work is skipped except for competin
   assert.equal((await repository.list()).length, 32, 'unscoped cross-project discovery remains available')
   assert.equal(scanned.length, 33)
 })
+
+test('repository carries additional directories through find and list refreshes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-roots-'))
+  const sessions = join(root, 'sessions')
+  const sessionFile = join(sessions, 'roots.jsonl')
+  mkdirSync(sessions)
+  writeFileSync(
+    sessionFile,
+    [
+      JSON.stringify({ type: 'session', id: 'with-roots', cwd: root }),
+      JSON.stringify({
+        type: 'message',
+        timestamp: '2026-01-02T00:00:00.000Z',
+        message: { role: 'user', content: 'hi' }
+      })
+    ].join('\n') + '\n'
+  )
+  const unmapped = join(sessions, 'unmapped.jsonl')
+  writeFileSync(
+    unmapped,
+    [
+      JSON.stringify({ type: 'session', id: 'no-mapping', cwd: root }),
+      JSON.stringify({
+        type: 'message',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        message: { role: 'user', content: 'hi' }
+      })
+    ].join('\n') + '\n'
+  )
+
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'with-roots', cwd: root, sessionFile, additionalDirectories: ['/ws/one', '/ws/two'] })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  // find() reports the stored ordered roots for a mapped record...
+  assert.deepEqual((await repository.find('with-roots', root))?.additionalDirectories, ['/ws/one', '/ws/two'])
+  // ...and none for a session discovered without adapter metadata.
+  assert.deepEqual((await repository.find('no-mapping', root))?.additionalDirectories, [])
+
+  const listed = await repository.list(root)
+  assert.deepEqual(
+    listed.map(record => [record.sessionId, record.additionalDirectories]),
+    [
+      ['with-roots', ['/ws/one', '/ws/two']],
+      ['no-mapping', []]
+    ]
+  )
+
+  // A discovery upsert must not clear the recorded roots.
+  store.upsert({ sessionId: 'with-roots', cwd: root, sessionFile: join(sessions, 'displaced.jsonl') })
+  assert.deepEqual(store.get('with-roots')?.additionalDirectories, ['/ws/one', '/ws/two'])
+  assert.deepEqual((await repository.find('with-roots', root))?.additionalDirectories, ['/ws/one', '/ws/two'])
+})

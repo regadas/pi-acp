@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process'
 import { buildPiInvocation } from './command.js'
 
-/** Owned ACP completion needs awaited agent_before_settle boundaries and rendered-prompt hooks. */
-export const MIN_PI_VERSION = '1.1.0'
-const MIN_PI_REASON = 'awaited `agent_before_settle` boundaries and rendered system-prompt hooks'
+/** Owned ACP completion needs awaited agent_before_settle boundaries and delivered, retained system-prompt sections on extension-triggered runs. */
+export const MIN_PI_VERSION = '1.2.0'
+const MIN_PI_REASON =
+  'awaited `agent_before_settle` boundaries and system-prompt section delivery on extension-triggered runs'
 
 export const PI_FEATURE_MIN_VERSION = {
   agentSettled: '0.80.4',

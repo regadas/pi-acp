@@ -14,7 +14,8 @@ function pathApi(flavor: PathFlavor) {
   return flavor === 'win32' ? win32 : posix
 }
 
-function displayPath(path: string): string {
+/** Bounded, JSON-quoted path display for error messages (reused across seam errors). */
+export function displayPath(path: string): string {
   const clipped = path.length <= MAX_DISPLAY_PATH_LENGTH ? path : `${path.slice(0, MAX_DISPLAY_PATH_LENGTH - 3)}...`
   return JSON.stringify(clipped)
 }

@@ -1,9 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import acpExtension from '../../src/pi-rpc/acp-extension.js'
+import { WORKSPACE_INSTRUCTIONS_SECTION, WORKSPACE_ROOTS_ENV } from '../../src/pi-rpc/workspace-instructions.js'
 
 const key = Symbol.for('@agegr/pi-web/session-liveness/v1')
+// Process-global cache of the adapter's workspace-root bridge config; mirrors
+// the production registry symbol so tests can reset harness state.
+const WORKSPACE_ROOTS_REGISTRY = Symbol.for('@regadas/pi-acp/workspace-roots/v1')
 const globals = globalThis as Record<symbol, any>
 
 function harness() {
@@ -2935,3 +2942,90 @@ for (const visible of [true, false]) {
     assert.equal(h.updates.at(-1).state, 'idle')
   })
 }
+
+test('before_agent_start assigns the root-scoped workspace section once per run', t => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-ws-hook-'))
+  writeFileSync(join(root, 'AGENTS.md'), 'multi-root guidance')
+
+  const previous = process.env[WORKSPACE_ROOTS_ENV]
+  process.env[WORKSPACE_ROOTS_ENV] = JSON.stringify([root])
+  t.after(() => {
+    if (previous === undefined) delete process.env[WORKSPACE_ROOTS_ENV]
+    else process.env[WORKSPACE_ROOTS_ENV] = previous
+  })
+
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  assert.equal(
+    process.env[WORKSPACE_ROOTS_ENV],
+    undefined,
+    'the extension consumes and scrubs the bridge env so tool descendants never inherit it'
+  )
+  const options = { sections: {} as Record<string, string> }
+  const first = h.emit('before_agent_start', { prompt: 'question', systemPromptOptions: options })
+  assert.equal(first?.systemPrompt, undefined, 'the section is added, not a whole-prompt replacement')
+  assert.ok(options.sections[WORKSPACE_INSTRUCTIONS_SECTION]!.includes('multi-root guidance'))
+  assert.ok(options.sections[WORKSPACE_INSTRUCTIONS_SECTION]!.includes(`root="${root}"`))
+  assert.ok(/apply only within their own root/.test(options.sections[WORKSPACE_INSTRUCTIONS_SECTION]!))
+
+  const section = options.sections[WORKSPACE_INSTRUCTIONS_SECTION]!
+  h.emit('before_agent_start', { prompt: 'next turn', systemPromptOptions: options })
+  assert.equal(options.sections[WORKSPACE_INSTRUCTIONS_SECTION], section, 'repeated turns never duplicate context')
+
+  writeFileSync(join(root, 'AGENTS.override.md'), 'fresh override guidance')
+  h.emit('before_agent_start', { prompt: 'third turn', systemPromptOptions: options })
+  assert.ok(options.sections[WORKSPACE_INSTRUCTIONS_SECTION]!.includes('fresh override guidance'))
+  assert.ok(!options.sections[WORKSPACE_INSTRUCTIONS_SECTION]!.includes('multi-root guidance'))
+})
+
+test('before_agent_start clears a stale workspace section when no roots are configured', () => {
+  // The extension caches process-start roots in a process-global registry;
+  // this env-absent test must not observe another test's cached roots.
+  delete (globalThis as Record<symbol, unknown>)[WORKSPACE_ROOTS_REGISTRY]
+  const h = harness()
+  const options = { sections: { [WORKSPACE_INSTRUCTIONS_SECTION]: 'stale workspace context' } }
+  const result = h.emit('before_agent_start', { prompt: 'question', systemPromptOptions: options })
+  assert.equal(result?.systemPrompt, undefined)
+  assert.equal(options.sections[WORKSPACE_INSTRUCTIONS_SECTION], undefined, 'no stale section survives')
+})
+
+test('workspace roots survive an extension factory reload with the scrubbed env', t => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-ws-reload-'))
+  writeFileSync(join(root, 'AGENTS.md'), 'reload-stable guidance')
+
+  const registryGlobals = globalThis as Record<symbol, unknown>
+  delete registryGlobals[WORKSPACE_ROOTS_REGISTRY]
+  t.after(() => {
+    delete registryGlobals[WORKSPACE_ROOTS_REGISTRY]
+  })
+
+  const previous = process.env[WORKSPACE_ROOTS_ENV]
+  process.env[WORKSPACE_ROOTS_ENV] = JSON.stringify([root])
+  t.after(() => {
+    if (previous === undefined) delete process.env[WORKSPACE_ROOTS_ENV]
+    else process.env[WORKSPACE_ROOTS_ENV] = previous
+  })
+
+  const hook = (h: ReturnType<typeof harness>) => {
+    const options = { sections: {} as Record<string, string> }
+    h.emit('before_agent_start', { prompt: 'question', systemPromptOptions: options })
+    return options.sections[WORKSPACE_INSTRUCTIONS_SECTION] ?? null
+  }
+
+  // First factory load: pi's extension loader parses the env, caches the
+  // process-start config, and scrubs the env before tool descendants.
+  const first = harness()
+  t.after(() => first.emit('session_shutdown'))
+  assert.ok(hook(first)?.includes('reload-stable guidance'))
+  assert.equal(process.env[WORKSPACE_ROOTS_ENV], undefined, 'the bridge env is scrubbed after the first load')
+
+  // Supported pi reloads extensions with moduleCache:false, re-running the
+  // factory with the already-scrubbed env: the process-start roots must
+  // survive instead of silently parsing as none.
+  const second = harness()
+  t.after(() => second.emit('session_shutdown'))
+  assert.ok(
+    hook(second)?.includes('reload-stable guidance'),
+    'a factory reload must not lose the process-start workspace roots'
+  )
+})

@@ -30,7 +30,7 @@ assert.ok(existsSync('dist/index.js'), 'Run npm run build first: this eval drive
 const pi = process.env.PI_ACP_EVAL_PI ?? execFileSync('which', ['pi'], { encoding: 'utf8' }).trim()
 identity.piVersion = execFileSync(pi, ['--version'], { encoding: 'utf8' }).trim()
 const [piMajor, piMinor] = identity.piVersion.split(/[.\s]/).map(Number)
-assert.ok(piMajor > 1 || (piMajor === 1 && piMinor >= 1), `pi >= 1.1.0 is required, found ${identity.piVersion}`)
+assert.ok(piMajor > 1 || (piMajor === 1 && piMinor >= 2), `pi >= 1.2.0 is required, found ${identity.piVersion}`)
 const fixture = resolve('scripts/fixtures/subagents-completion-provider.ts')
 const checks = []
 const check = (scenario, assertion, passed, evidence) => {

@@ -1,4 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import {
+  WORKSPACE_INSTRUCTIONS_SECTION,
+  WORKSPACE_ROOTS_ENV,
+  buildWorkspaceInstructionsSection,
+  parseWorkspaceRootsEnv,
+  readWorkspaceInstructions
+} from './workspace-instructions.js'
 
 // Public Pi extension surface only; Pi is supplied by the user's installation.
 type Context = {
@@ -25,6 +32,7 @@ type HookEvent = {
   prompt?: string
   images?: unknown[]
   systemPrompt?: string
+  systemPromptOptions?: { sections?: Record<string, string> }
   message?: { role?: string; content?: unknown; customType?: string; details?: unknown }
   outcome?: string
   entries?: Draft[]
@@ -56,6 +64,7 @@ type Pi = {
 
 export const ACP_LIFECYCLE_WIDGET = 'pi-acp-lifecycle'
 const REGISTRY = Symbol.for('@agegr/pi-web/session-liveness/v1')
+const WORKSPACE_ROOTS_REGISTRY = Symbol.for('@regadas/pi-acp/workspace-roots/v1')
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
 const canonicalUuid = new RegExp(`^${UUID}$`)
 type SnapshotNode = { id?: unknown; kind?: unknown; state?: unknown; children?: SnapshotNode[] }
@@ -173,6 +182,24 @@ export default function acpExtension(pi: Pi): void {
   globals[REGISTRY] = registry
   let owner: string | null = null
   let context: Context | null = null
+  // Workspace roots are process-start configuration passed by the adapter;
+  // instruction files are read per run so changed files are picked up.
+  // Supported pi reloads extensions (moduleCache:false) and re-runs this
+  // factory after the env below is scrubbed, so the first load caches the
+  // roots in the same symbol-scoped process registry the liveness bridge
+  // uses; a still-present env is parsed fresh and replaces the cache.
+  const rawWorkspaceRoots = process.env[WORKSPACE_ROOTS_ENV]
+  const cachedWorkspaceRoots: unknown = globals[WORKSPACE_ROOTS_REGISTRY]
+  const workspaceRoots =
+    rawWorkspaceRoots !== undefined
+      ? parseWorkspaceRootsEnv(rawWorkspaceRoots)
+      : Array.isArray(cachedWorkspaceRoots) && cachedWorkspaceRoots.every(root => typeof root === 'string')
+        ? (cachedWorkspaceRoots as string[])
+        : []
+  globals[WORKSPACE_ROOTS_REGISTRY] = workspaceRoots
+  // Consume the bridge env: pi's tool descendants (bash, subagents, ...) must
+  // not inherit adapter session configuration.
+  delete process.env[WORKSPACE_ROOTS_ENV]
   let cancelling = false
   let admission: { id: string } | undefined
   let expectedInput: { text: string; hasImages: boolean } | undefined
@@ -638,6 +665,13 @@ export default function acpExtension(pi: Pi): void {
           ? { text: event.prompt, hasImages: Array.isArray(event.images) && event.images.length > 0 }
           : undefined
     }
+    // One replaceable prompt section per run: never append (duplicates across
+    // turns) and never return systemPrompt (that replaces the whole prompt).
+    const sections = event.systemPromptOptions?.sections
+    if (!sections) return
+    const section = buildWorkspaceInstructionsSection(readWorkspaceInstructions(workspaceRoots))
+    if (section) sections[WORKSPACE_INSTRUCTIONS_SECTION] = section
+    else delete sections[WORKSPACE_INSTRUCTIONS_SECTION]
   })
   const unsubscribeWake = pi.events.on(SUPERVISOR_WAKE_EVENT, raw => {
     const wakeEvent = raw as { requestId?: unknown; runId?: unknown } | undefined

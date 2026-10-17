@@ -20,7 +20,14 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
   let reportStop: ((id: string) => void) | undefined
   let reportTerminal: ((id: string) => void) | undefined
   let deliveryGate = ''
+  // Provider receipts for the additional workspace root's instructions: one
+  // uniquely identified status per model request, true when the actual request
+  // carried the marker. Cumulative counters double-count when summed across
+  // settlements, so the driver counts distinct (pid, seq) receipts instead.
+  let wsRequestSeq = 0
+  let reportStatus: ((key: string, text: string) => void) | undefined
   pi.on('session_start', (_event, ctx) => {
+    reportStatus = (key, text) => ctx.ui.setStatus(key, text)
     reportLaunching = id => ctx.ui.setStatus('eval-launching', id)
     reportRetry = code => ctx.ui.setStatus('eval-stop-retry', code)
     reportStop = id => ctx.ui.setStatus('eval-stopped', id)
@@ -142,6 +149,14 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
     ],
     streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream()
+      reportStatus?.(
+        'eval-ws-request',
+        JSON.stringify({
+          pid: process.pid,
+          seq: ++wsRequestSeq,
+          received: JSON.stringify(context.messages).includes('ACP_HARNESS_WS_ROOT_SENTINEL')
+        })
+      )
       // Deliver the structured notice mid-stream: pi's steer path is the only
       // custom-message route that emits the message_start the adapter consumes.
       if (active && currentRun && !noticeSent) {
@@ -340,7 +355,10 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
       JSON.stringify({
         sentinel: event.systemPrompt?.includes('ACP_HARNESS_APPEND_SYSTEM_SENTINEL') ?? false,
         // Marker of the removed adapter appendix; it must stay absent.
-        policy: event.systemPrompt?.includes('ACP completion policy (pi-acp)') ?? false
+        policy: event.systemPrompt?.includes('ACP completion policy (pi-acp)') ?? false,
+        // The adapter-owned workspace-instructions section for the session's
+        // additional root, rendered before this handler runs.
+        wsRoot: event.systemPrompt?.includes('ACP_HARNESS_WS_ROOT_SENTINEL') ?? false
       })
     )
   })

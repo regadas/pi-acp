@@ -19,8 +19,8 @@ const isWindows = process.platform === 'win32'
 const hostBun = isWindows ? null : findExecutableOnPath('bun')
 const bunDir = hostBun ? dirname(hostBun) : ''
 
-test('supported Pi floor is 1.1.0 and covers every historical feature floor', () => {
-  assert.equal(MIN_PI_VERSION, '1.1.0')
+test('supported Pi floor is 1.2.0 and covers every historical feature floor', () => {
+  assert.equal(MIN_PI_VERSION, '1.2.0')
   for (const [feature, version] of Object.entries(PI_FEATURE_MIN_VERSION))
     assert.ok(comparePiVersions(version, MIN_PI_VERSION) <= 0, `${feature} must exist at the supported floor`)
 })
@@ -289,7 +289,7 @@ test('one version caller abort does not kill a probe used by another caller', { 
 test('assertSupportedPiVersion accepts the minimum and newer versions', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
   assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-min', MIN_PI_VERSION)), MIN_PI_VERSION)
-  assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-newer', '1.1.1')), '1.1.1')
+  assert.equal(await assertSupportedPiVersion(makePiStub('pi-ok-newer', '1.2.1')), '1.2.1')
 })
 
 test('assertSupportedPiVersion fails closed on versions older than the minimum', { skip: isWindows }, async () => {
@@ -321,10 +321,10 @@ test(
     clearPiVersionCacheForTests()
     const supportedDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-cwd-supported-'))
     const oldDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-cwd-old-'))
-    makePiStubIn(supportedDir, 'pi-relative', '1.1.1')
+    makePiStubIn(supportedDir, 'pi-relative', '1.2.1')
     makePiStubIn(oldDir, 'pi-relative', '1.0.4')
 
-    assert.equal(await assertSupportedPiVersion('./pi-relative', supportedDir), '1.1.1')
+    assert.equal(await assertSupportedPiVersion('./pi-relative', supportedDir), '1.2.1')
     await assert.rejects(
       assertSupportedPiVersion('./pi-relative', oldDir),
       (err: unknown) => err instanceof PiVersionError && err.message.includes('1.0.4')
@@ -407,14 +407,14 @@ test('PiRpcProcess.spawn proceeds for supported pi versions', { skip: isWindows 
   clearPiVersionCacheForTests()
   // The stub exits immediately in RPC mode; the best-effort get_state
   // handshake tolerates that, so spawn itself must succeed.
-  const stub = makePiStub('pi-supported-spawn', '1.1.1')
+  const stub = makePiStub('pi-supported-spawn', '1.2.1')
   const proc = await PiRpcProcess.spawn({ cwd: process.cwd(), piCommand: stub })
   proc.dispose()
 })
 
 test('PiRpcProcess.spawn reports the child to its owner before resolving', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
-  const stub = makePiStub('pi-onprocess-spawn', '1.1.1')
+  const stub = makePiStub('pi-onprocess-spawn', '1.2.1')
   const reported: PiRpcProcess[] = []
 
   const spawning = PiRpcProcess.spawn({
@@ -433,7 +433,7 @@ test('PiRpcProcess.spawn reports the child to its owner before resolving', { ski
 
 test('PiRpcProcess.spawn disposes the child when its ownership hook throws', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
-  const stub = makePiStub('pi-onprocess-throws', '1.1.1')
+  const stub = makePiStub('pi-onprocess-throws', '1.2.1')
   const reported: PiRpcProcess[] = []
 
   await assert.rejects(
@@ -491,11 +491,11 @@ test('assertSupportedPiVersion probes a default JavaScript Pi install through Bu
   const dir = mkdtempSync(join(tmpdir(), 'pi-acp-bun-probe-'))
   const nodeDir = makeNodeOnlyPath()
   try {
-    makeJsPiStub(dir, '1.1.1', '1.1.2')
+    makeJsPiStub(dir, '1.2.1', '1.2.2')
 
     // The fixture comes first so a real `pi` in Bun's bin dir cannot shadow it.
     await withPath([dir, bunDir, nodeDir], async () => {
-      assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.1')
+      assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.2.1')
     })
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -513,10 +513,10 @@ test(
     const dir = mkdtempSync(join(tmpdir(), 'pi-acp-node-probe-'))
     const nodeDir = makeNodeOnlyPath()
     try {
-      makeJsPiStub(dir, '1.1.1', '1.1.2')
+      makeJsPiStub(dir, '1.2.1', '1.2.2')
 
       await withPath([dir, nodeDir], async () => {
-        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.2')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.2.2')
       })
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -536,10 +536,10 @@ test(
     const nodeDir = makeNodeOnlyPath()
     try {
       const cli = join(dir, 'cli.mjs')
-      makeJsPiStub(dir, '1.1.1', '1.1.2')
+      makeJsPiStub(dir, '1.2.1', '1.2.2')
 
       await withPath([nodeDir, bunDir], async () => {
-        assert.equal(await assertSupportedPiVersion(cli), '1.1.2')
+        assert.equal(await assertSupportedPiVersion(cli), '1.2.2')
       })
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -558,15 +558,15 @@ test(
     const dir = mkdtempSync(join(tmpdir(), 'pi-acp-bun-cache-'))
     const nodeDir = makeNodeOnlyPath()
     try {
-      makeJsPiStub(dir, '1.1.1', '1.1.2')
+      makeJsPiStub(dir, '1.2.1', '1.2.2')
 
       await withPath([dir, bunDir, nodeDir], async () => {
         // Both call orders share one cache: the probes must stay
         // runtime-separated instead of the first result winning.
-        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, false), '1.1.2')
-        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.1')
-        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, false), '1.1.2')
-        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.1.1')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, false), '1.2.2')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.2.1')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, false), '1.2.2')
+        assert.equal(await assertSupportedPiVersion('pi', dir, undefined, true), '1.2.1')
       })
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -590,7 +590,7 @@ test(
       cli,
       '#!/usr/bin/env node\n' +
         `import { writeFileSync } from 'node:fs'\n` +
-        `if (process.argv.includes('--version')) console.log(process.versions.bun ? '1.1.1' : '1.1.2')\n` +
+        `if (process.argv.includes('--version')) console.log(process.versions.bun ? '1.2.1' : '1.2.2')\n` +
         `else writeFileSync(${JSON.stringify(captured)}, JSON.stringify({ argv: process.argv.slice(2), runtime: process.versions.bun ?? 'node' }))\n`,
       'utf-8'
     )
@@ -631,7 +631,7 @@ test(
       cli,
       '#!/usr/bin/env node\n' +
         `import { writeFileSync } from 'node:fs'\n` +
-        `if (process.argv.includes('--version')) console.log(process.versions.bun ? '1.1.1' : '1.1.2')\n` +
+        `if (process.argv.includes('--version')) console.log(process.versions.bun ? '1.2.1' : '1.2.2')\n` +
         `else writeFileSync(${JSON.stringify(captured)}, JSON.stringify({ argv: process.argv.slice(2), runtime: process.versions.bun ?? 'node' }))\n`,
       'utf-8'
     )

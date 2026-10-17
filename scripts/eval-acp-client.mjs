@@ -28,6 +28,11 @@ await writeFile(
 )
 // A user resource discovered natively from the isolated agent directory (no CLI injection).
 await writeFile(join(root, 'agent', 'APPEND_SYSTEM.md'), 'ACP_HARNESS_APPEND_SYSTEM_SENTINEL')
+// An additional workspace root: its instruction file must reach the model through the
+// adapter-owned, root-scoped workspace-instructions prompt section on every run.
+const wsRoot = join(root, 'ws-root')
+await mkdir(wsRoot, { recursive: true })
+await writeFile(join(wsRoot, 'AGENTS.md'), 'ACP_HARNESS_WS_ROOT_SENTINEL: additional workspace root instructions')
 await writeFile(
   wrapper,
   `#!/usr/bin/env node
@@ -102,7 +107,11 @@ try {
         clientInfo: { name: 'acp-client-eval', version: '1' },
         clientCapabilities: { elicitation: { form: {} }, _meta: { terminal_output: true } }
       })
-      const { sessionId } = await client.request('session/new', { cwd: root, mcpServers: [] })
+      const { sessionId } = await client.request('session/new', {
+        cwd: root,
+        mcpServers: [],
+        additionalDirectories: [wsRoot]
+      })
       const prompt = text => client.request('session/prompt', { sessionId, prompt: [{ type: 'text', text }] })
       const texts = () =>
         client.updates
@@ -235,19 +244,6 @@ try {
       check(
         'async triggered assistant response delivered',
         texts().split('HARNESS_RESPONSE').length > initialResponseCount + 1
-      )
-      const systemRows = (await trace()).filter(e => e.statusKey === 'eval-system-prompt')
-      assert.ok(systemRows.length > 0, 'the harness must observe rendered system prompts')
-      assert.ok(
-        systemRows.every(row => {
-          const observed = JSON.parse(row.statusText)
-          return observed.sentinel && !observed.policy
-        }),
-        'every model run keeps the discovered APPEND_SYSTEM.md sentinel and carries no adapter system-prompt appendix'
-      )
-      check(
-        'discovered APPEND_SYSTEM.md sentinel retained and no adapter system-prompt appendix on every model run',
-        true
       )
       const busyIdentity = JSON.parse((await trace()).findLast(e => e.statusKey === 'eval-session').statusText)
       const busyStart = (await trace()).length
@@ -480,7 +476,11 @@ try {
         'session close stops background work before retiring Pi',
         (await trace()).filter(e => e.statusKey === 'eval-stopped').length === stopsBeforeClose + 1
       )
-      const queuedSession = await client.request('session/new', { cwd: root, mcpServers: [] })
+      const queuedSession = await client.request('session/new', {
+        cwd: root,
+        mcpServers: [],
+        additionalDirectories: [wsRoot]
+      })
       const queuedStart = (await trace()).length
       const queuedLaunch = client.request('session/prompt', {
         sessionId: queuedSession.sessionId,
@@ -515,7 +515,11 @@ try {
         queuedRecords.some(e => e.statusKey === 'eval-stopped')
       )
       await client.request('session/close', { sessionId: queuedSession.sessionId })
-      const rejectedSession = await client.request('session/new', { cwd: root, mcpServers: [] })
+      const rejectedSession = await client.request('session/new', {
+        cwd: root,
+        mcpServers: [],
+        additionalDirectories: [wsRoot]
+      })
       const rejectedPrompt = text =>
         client.request('session/prompt', { sessionId: rejectedSession.sessionId, prompt: [{ type: 'text', text }] })
       assert.equal((await rejectedPrompt('/eval-unrelated')).stopReason, 'end_turn')
@@ -528,7 +532,11 @@ try {
       assert.equal((await rejectedPrompt('/eval-confirm')).stopReason, 'end_turn')
       check('real Pi admits idle foreground with restored live child without adoption or stop', true)
       await client.request('session/close', { sessionId: rejectedSession.sessionId })
-      const disconnectSession = await client.request('session/new', { cwd: root, mcpServers: [] })
+      const disconnectSession = await client.request('session/new', {
+        cwd: root,
+        mcpServers: [],
+        additionalDirectories: [wsRoot]
+      })
       const disconnectStart = (await trace()).length
       void client
         .request('session/prompt', {
@@ -563,6 +571,41 @@ try {
   check(
     'ACP disconnect stops owned background work before process exit',
     (await trace()).filter(e => e.statusKey === 'eval-stopped').length === stopsBeforeDisconnect + 1
+  )
+
+  // Full-evaluation-end receipts: every session has run by now, including the
+  // queued, rejected-restored and disconnect scenarios after the hook phase.
+  const systemRows = (await trace()).filter(e => e.statusKey === 'eval-system-prompt')
+  assert.ok(systemRows.length > 0, 'the harness must observe rendered system prompts')
+  assert.ok(
+    systemRows.every(row => {
+      const observed = JSON.parse(row.statusText)
+      return observed.sentinel && !observed.policy && observed.wsRoot
+    }),
+    'every model run keeps the discovered APPEND_SYSTEM.md sentinel, carries no adapter system-prompt appendix, and includes the workspace-root instructions section'
+  )
+  check(
+    'discovered APPEND_SYSTEM.md sentinel retained, no adapter appendix, workspace-root instructions rendered on every model run',
+    true
+  )
+  const wsRequestRows = (await trace()).filter(e => e.statusKey === 'eval-ws-request')
+  assert.ok(wsRequestRows.length > 0, 'the harness must report provider workspace-request receipts')
+  // Receipts are uniquely identified per (pi child, request): count distinct
+  // requests, never cumulative status counters (which double-count when summed).
+  const uniqueRequests = new Map()
+  const piChildren = new Set()
+  for (const row of wsRequestRows) {
+    const receipt = JSON.parse(row.statusText)
+    piChildren.add(receipt.pid)
+    uniqueRequests.set(`${receipt.pid}:${receipt.seq}`, receipt.received)
+  }
+  assert.ok(uniqueRequests.size > 0, 'provider requests must have been observed')
+  console.log(
+    `Workspace-root instructions: ${uniqueRequests.size} distinct provider requests across ${piChildren.size} pi children`
+  )
+  check(
+    'workspace-root instructions reach every distinct provider request at full evaluation end, including extension-triggered runs and post-tool-call continuations',
+    [...uniqueRequests.values()].every(Boolean)
   )
 } finally {
   if (process.env.PI_ACP_EVAL_LOG_DIR) {

@@ -57,7 +57,8 @@ test('app wiring: initialize advertises exactly the implemented capabilities', a
     list: {},
     resume: {},
     close: {},
-    delete: {}
+    delete: {},
+    additionalDirectories: {}
   })
 })
 

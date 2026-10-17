@@ -345,7 +345,7 @@ function withStubPi(): { dir: string; sessionsDir: string; disposedMarker: strin
     stub,
     `#!/usr/bin/env node\n` +
       `const fs = require('node:fs')\n` +
-      `if (process.argv.includes('--version')) { process.stdout.write('1.1.0\\n'); process.exit(0) }\n` +
+      `if (process.argv.includes('--version')) { process.stdout.write('1.2.0\\n'); process.exit(0) }\n` +
       `const replies = {\n` +
       `  get_state: { sessionId: 'stub-session', sessionFile: ${JSON.stringify(join(sessionsDir, 'stub-session.jsonl'))}, model: { provider: 'stub', id: 'stub-model' }, thinkingLevel: 'off' },\n` +
       `  get_available_models: { models: [{ provider: 'stub', id: 'stub-model', name: 'Stub Model' }] },\n` +

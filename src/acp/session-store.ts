@@ -19,6 +19,11 @@ export type StoredSession = {
   cwd: string
   sessionFile: string
   updatedAt: string
+  /**
+   * Additional workspace roots for the session, in request order. Optional so
+   * old records (which have none) stay valid; consumers treat missing as [].
+   */
+  additionalDirectories?: readonly string[]
 }
 
 /**
@@ -57,7 +62,10 @@ function isStoredSession(value: unknown): value is StoredSession {
     typeof record.sessionId === 'string' &&
     typeof record.cwd === 'string' &&
     typeof record.sessionFile === 'string' &&
-    typeof record.updatedAt === 'string'
+    typeof record.updatedAt === 'string' &&
+    (record.additionalDirectories === undefined ||
+      (Array.isArray(record.additionalDirectories) &&
+        record.additionalDirectories.every(root => typeof root === 'string')))
   )
 }
 
@@ -293,7 +301,12 @@ export class SessionStore {
     return [...byId.values()]
   }
 
-  upsert(entry: { sessionId: string; cwd: string; sessionFile: string }): void {
+  upsert(entry: {
+    sessionId: string
+    cwd: string
+    sessionFile: string
+    additionalDirectories?: readonly string[]
+  }): void {
     // Refuse to replace malformed state. This validation is intentionally per
     // record and does not introduce a shared read-modify-write file.
     const current = this.readDirect(entry.sessionId)
@@ -301,13 +314,20 @@ export class SessionStore {
     // discovery upsert must not resurrect that mapping. A session file that
     // exists again is an explicit restore and does replace the tombstone.
     if (current?.deleted === true && !existsSync(entry.sessionFile)) return
+    // An omitted root list preserves the recorded one: ordinary metadata
+    // refreshes (cwd repairs, discovery re-mappings) must not clear workspace
+    // roots. An explicit list — empty included — replaces it.
+    const additionalDirectories =
+      entry.additionalDirectories ??
+      (current && 'session' in current ? current.session.additionalDirectories : undefined)
     const record: SessionRecordFile = {
       version: 1,
       session: {
         sessionId: entry.sessionId,
         cwd: entry.cwd,
         sessionFile: entry.sessionFile,
-        updatedAt: new Date().toISOString()
+        updatedAt: new Date().toISOString(),
+        ...(additionalDirectories ? { additionalDirectories } : {})
       }
     }
     writeFileAtomic(this.recordPath(entry.sessionId), JSON.stringify(record, null, 2) + '\n')

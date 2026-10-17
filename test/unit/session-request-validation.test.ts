@@ -55,42 +55,54 @@ test('PiAcpAgent validates cwd before new/load/resume startup work', async () =>
   assert.equal(createCalls, 0)
 })
 
-test('PiAcpAgent rejects non-empty additionalDirectories on new/load/resume', async () => {
+test('PiAcpAgent validates additional directories before new/load/resume startup work', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-additional-directories-'))
-  const extra = mkdtempSync(join(tmpdir(), 'pi-acp-extra-directory-'))
+  const valid = mkdtempSync(join(tmpdir(), 'pi-acp-valid-extra-directory-'))
+  const missing = join(cwd, 'missing')
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
-  let createCalls = 0
+  const createParams: unknown[] = []
   replaceSessionManager(agent, {
-    async create() {
-      createCalls += 1
-      throw new Error('unreachable')
+    maybeGet() {
+      return undefined
+    },
+    async create(params) {
+      createParams.push((params as { additionalDirectories?: string[] }).additionalDirectories)
+      throw new Error('validation passed')
     }
   })
 
-  const rejection = expectInvalidParamsReason('ADDITIONAL_DIRECTORIES_UNSUPPORTED')
-  await assert.rejects(agent.newSession({ cwd, mcpServers: [], additionalDirectories: [extra] }), rejection)
   await assert.rejects(
-    agent.loadSession({ sessionId: randomUUID(), cwd, mcpServers: [], additionalDirectories: [extra] }),
-    rejection
+    agent.newSession({ cwd, mcpServers: [], additionalDirectories: [missing] }),
+    expectInvalidParamsReason('ADDITIONAL_DIRECTORY_NOT_FOUND')
   )
   await assert.rejects(
-    agent.resumeSession({ sessionId: randomUUID(), cwd, mcpServers: [], additionalDirectories: [extra] }),
-    rejection
+    agent.loadSession({ sessionId: randomUUID(), cwd, mcpServers: [], additionalDirectories: [missing] }),
+    expectInvalidParamsReason('ADDITIONAL_DIRECTORY_NOT_FOUND')
   )
-  assert.equal(createCalls, 0)
+  await assert.rejects(
+    agent.resumeSession({ sessionId: randomUUID(), cwd, mcpServers: [], additionalDirectories: [missing] }),
+    expectInvalidParamsReason('ADDITIONAL_DIRECTORY_NOT_FOUND')
+  )
+  assert.deepEqual(createParams, [], 'invalid roots must not reach session creation')
+
+  await assert.rejects(
+    agent.newSession({ cwd, mcpServers: [], additionalDirectories: [valid] }),
+    error => (error as Error).message === 'validation passed'
+  )
+  assert.deepEqual(createParams, [[valid]], 'normalized roots reach session creation in order')
 })
 
 test('PiAcpAgent accepts empty or omitted additionalDirectories', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'pi-acp-empty-additional-directories-'))
   const sentinel = new Error('validation passed')
   const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
-  let createCalls = 0
+  const createParams: unknown[][] = []
   replaceSessionManager(agent, {
     maybeGet() {
       return undefined
     },
-    async create() {
-      createCalls += 1
+    async create(params) {
+      createParams.push((params as { additionalDirectories?: string[] }).additionalDirectories ?? [])
       throw sentinel
     }
   })
@@ -102,7 +114,7 @@ test('PiAcpAgent accepts empty or omitted additionalDirectories', async () => {
   for (const request of requests) {
     await assert.rejects(agent.newSession(request), error => error === sentinel)
   }
-  assert.equal(createCalls, 2)
+  assert.deepEqual(createParams, [[], []], 'omitted and empty roots both mean none')
 
   await assert.rejects(
     agent.loadSession({ sessionId: randomUUID(), cwd, mcpServers: [], additionalDirectories: [] }),

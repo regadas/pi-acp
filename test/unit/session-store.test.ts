@@ -288,3 +288,58 @@ test('SessionStore.list: tombstones hide legacy entries and long IDs retain hash
     [sessionId]
   )
 })
+
+test('SessionStore: additional directories round-trip, persist across refreshes, and clear explicitly', () => {
+  const { dir, store } = makeStore()
+  const sessionFile = join(dir, 's1.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 's1', cwd: dir })}\n`, 'utf-8')
+
+  store.upsert({ sessionId: 's1', cwd: dir, sessionFile, additionalDirectories: ['/ws/a', '/ws/b'] })
+  assert.deepEqual(store.get('s1')?.additionalDirectories, ['/ws/a', '/ws/b'])
+
+  // Ordinary metadata refreshes (cwd repair, discovery re-mapping) omit the
+  // field and must not clear recorded roots.
+  store.upsert({ sessionId: 's1', cwd: dir, sessionFile: join(dir, 'moved.jsonl') })
+  const refreshed = store.get('s1')!
+  assert.equal(refreshed.sessionFile, join(dir, 'moved.jsonl'))
+  assert.deepEqual(refreshed.additionalDirectories, ['/ws/a', '/ws/b'])
+
+  // An explicit replacement list (empty included) replaces the stored roots.
+  store.upsert({ sessionId: 's1', cwd: dir, sessionFile: refreshed.sessionFile, additionalDirectories: ['/ws/c'] })
+  assert.deepEqual(store.get('s1')?.additionalDirectories, ['/ws/c'])
+  store.upsert({ sessionId: 's1', cwd: dir, sessionFile: refreshed.sessionFile, additionalDirectories: [] })
+  assert.deepEqual(store.get('s1')?.additionalDirectories, [])
+})
+
+test('SessionStore: legacy records without additional directories load with none', () => {
+  const { mapPath, store } = makeStore()
+  writeFileSync(
+    mapPath,
+    JSON.stringify({
+      version: 1,
+      sessions: { legacy: { sessionId: 'legacy', cwd: '/tmp/old', sessionFile: '/tmp/old/l.jsonl', updatedAt: 'x' } }
+    }),
+    'utf-8'
+  )
+
+  assert.equal(store.get('legacy')?.additionalDirectories, undefined)
+
+  // A legacy record with a malformed roots field is corrupt, not silently empty.
+  writeFileSync(
+    mapPath,
+    JSON.stringify({
+      version: 1,
+      sessions: {
+        legacy: {
+          sessionId: 'legacy',
+          cwd: '/tmp/old',
+          sessionFile: '/tmp/old/l.jsonl',
+          updatedAt: 'x',
+          additionalDirectories: 'bogus'
+        }
+      }
+    }),
+    'utf-8'
+  )
+  assert.throws(() => store.get('legacy'), SessionStoreCorruptError)
+})

@@ -35,7 +35,7 @@ export async function withIsolation(prefix, run) {
  * Points every user-state location the adapter and pi resolve at the
  * disposable `dirs` instead of the real home — pi's default session directory
  * follows the disposable agent dir — and scrubs inherited launch and session
- * overrides (`PI_ACP_PI_COMMAND`, `PI_ACP_REEXEC`,
+ * overrides (`PI_ACP_PI_COMMAND`, `PI_ACP_REEXEC`, `PI_ACP_WORKSPACE_ROOTS`,
  * `PI_CODING_AGENT_SESSION_DIR`) so default resolution is exercised and
  * discovery assertions stay deterministic. Everything else (PATH, NODE_*,
  * ...) passes through unchanged.
@@ -52,5 +52,6 @@ export function isolatedEnv(env, dirs) {
   delete isolated.PI_ACP_PI_COMMAND
   delete isolated.PI_ACP_REEXEC
   delete isolated.PI_CODING_AGENT_SESSION_DIR
+  delete isolated.PI_ACP_WORKSPACE_ROOTS
   return isolated
 }

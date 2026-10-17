@@ -8,7 +8,7 @@
 
 - **See the work as it happens.** Stream assistant replies and thinking, follow tool calls, view images, and jump to referenced files. Edits include structured diffs when a pre-edit snapshot is available; compatible clients get terminal-style bash output.
 - **Pick up where you left off.** List, load, resume, close, and delete pi sessions. Loading replays the active branch, including history from before compaction.
-- **Use your pi setup.** Keep your providers, skills, prompt templates, and extensions. Pi owns project trust and resource loading; the adapter leaves your system prompt unchanged.
+- **Use your pi setup.** Keep your providers, skills, prompt templates, and extensions. Pi owns project trust and resource loading; the adapter leaves your system prompt unchanged (multi-root sessions add one clearly-labeled workspace-instructions section).
 - **Choose how pi thinks.** Switch models and thinking levels through standard ACP session controls. Pi-provided commands appear alongside handy adapter commands.
 - **Keep delegated work in the conversation.** Supported async subagent runs launched or revived for a request hold it open through completion delivery and a subsequent model cycle. Explicit background work can opt out via `acp_detach`.
 - **Use Bun when available.** The adapter and supported default JavaScript pi installs automatically use Bun, with no extra configuration. Node remains supported.
@@ -19,7 +19,7 @@ Client features are capability-negotiated, not Zed-specific. Standard ACP conten
 
 ### 1. Install and configure pi
 
-You need **Node.js 22.19.0 or newer** and **pi 1.1.0 or newer** on your `PATH`. Bun is optional.
+You need **Node.js 22.19.0 or newer** and **pi 1.2.0 or newer** on your `PATH`. Bun is optional.
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent
@@ -97,11 +97,11 @@ See the [adapter reference](docs/adapter-reference.md) for path resolution, auth
 
 ## Know before you use it
 
-- **Local execution, not a sandbox.** Pi reads files and runs commands locally; ACP filesystem and terminal delegation are not implemented.
-- **One workspace root per session.** Requests with additional workspace directories are rejected.
+- **Local execution, not a sandbox.** Pi reads files and runs commands locally; ACP filesystem and terminal delegation are not implemented. Additional workspace roots are model/workspace context, not filesystem access control.
+- **Multi-root workspaces: instruction files only.** Additional workspace directories are accepted on `session/new`, `session/load`, and `session/resume` (a full replacement list each time; omitted or empty means none). The session's `cwd` stays the primary root with pi's native settings, extensions, and ancestor context walk unchanged. Each additional root contributes only its own instruction file (`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, or `CLAUDE.MD` — first match, pi's native precedence, no ancestor walk), exposed as a root-scoped system-prompt section. Extra roots never load their own pi settings or extensions. Changing roots restarts the session's pi subprocess: an active turn is cancelled and queued work behind it is discarded.
 - **No client-provided MCP servers.** Non-empty ACP `mcpServers` lists are rejected. Separately configured pi MCP extensions can still provide tools, but do not bridge those requests automatically.
 - **One active writer per persisted session.** Do not operate on the same session concurrently from multiple pi or adapter processes.
-- **Async completion has a tested compatibility boundary.** Integration is tested with pi 1.1.0 and the pi-subagents revision pinned in the [reference](docs/adapter-reference.md#prerequisites). Required runs can keep the request—and queued prompts—busy. Detached runs may outlive session close or disconnect, and have no separate notification service.
+- **Async completion has a tested compatibility boundary.** The adapter requires pi >= 1.2.0 (prompt-section delivery on extension-triggered runs); the real-pi ACP eval bridge, including its async-completion flows, passes on pi 1.2.0 and 1.3.0. The stock pi-subagents integration was tested with pi 1.1.0 and the pi-subagents revision pinned in the [reference](docs/adapter-reference.md#prerequisites) — a historical receipt predating the 1.2.0 floor. Required runs can keep the request—and queued prompts—busy. Detached runs may outlive session close or disconnect, and have no separate notification service.
 
 The adapter implements the stable ACP v1 prompt and session lifecycle, but the MCP gap means it is **not fully ACP v1 conformant**. Client support varies, and minor breaking changes are still possible. See [detailed limitations](docs/adapter-reference.md#limitations) and the [compatibility audit](docs/acp-compatibility-audit.md) for evidence and boundaries.
 

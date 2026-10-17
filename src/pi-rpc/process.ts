@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, writeFileSync, statSync, unlinkSync } from 'node
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildPiInvocation, getPiCommand } from './command.js'
+import { WORKSPACE_ROOTS_ENV } from './workspace-instructions.js'
 import { LfLineDecoder } from './line-decoder.js'
 import { assertSupportedPiVersion, PiVersionError } from './version.js'
 import {
@@ -104,6 +105,8 @@ type SpawnParams = {
   piCommand?: string
   /** If set, pi will persist the session to this exact file (via `--session <path>`). */
   sessionPath?: string
+  /** Additional validated workspace roots passed to the adapter extension via child env. */
+  additionalDirectories?: readonly string[]
   /** Cancels the version preflight before the RPC child is spawned. */
   signal?: AbortSignal
   /**
@@ -405,10 +408,20 @@ export class PiRpcProcess {
       cleanupEmptySession()
       throw piExecutableNotFoundError(cmd)
     }
+    // Workspace roots are child-only configuration: copy the environment
+    // instead of mutating the adapter's own process.env.
+    const env: NodeJS.ProcessEnv = { ...process.env }
+    if (params.additionalDirectories?.length) {
+      env[WORKSPACE_ROOTS_ENV] = JSON.stringify(params.additionalDirectories)
+    } else {
+      // An inherited value (e.g. a poisoned parent environment) must never
+      // configure a root-less child.
+      delete env[WORKSPACE_ROOTS_ENV]
+    }
     const child = spawn(invocation.executable, invocation.args, {
       cwd: params.cwd,
       stdio: 'pipe',
-      env: process.env,
+      env,
       shell: false,
       windowsVerbatimArguments: invocation.windowsVerbatimArguments
     })
