@@ -116,6 +116,15 @@ type SessionRestoreOpts = {
    * itself).
    */
   loadOwned?: boolean
+  /**
+   * Internal: load-admission fence value observed when a root-changing
+   * request was admitted, before its first yield. A newer session/load bumps
+   * it, so from that point on this request's roots are stale: every
+   * re-entry into restoreSession must fail closed instead of re-applying
+   * them (the wrapper's post-return check alone is too late after a
+   * mutation).
+   */
+  rootMutationGeneration?: number
 }
 
 export class PiAcpAgent implements ACPAgent {
@@ -128,6 +137,8 @@ export class PiAcpAgent implements ACPAgent {
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
   private readonly cancellationEpochs = new Map<string, number>()
   private readonly loadGenerations = new Map<string, number>()
+  /** Load admissions only; unlike loadGenerations, close/delete do not bump it. */
+  private readonly loadAdmissionGenerations = new Map<string, number>()
   private readonly activePrompts = new Map<string, Set<Promise<void>>>()
   private readonly activeLoads = new Map<string, Set<Promise<void>>>()
   private readonly closingSessions = new Map<string, Promise<void>>()
@@ -276,6 +287,18 @@ export class PiAcpAgent implements ACPAgent {
     return generation
   }
 
+  /**
+   * Fence counter for root-changing resumes: only a session/load bumps it.
+   * A close/delete coalesces instead — its teardown waits for an in-flight
+   * resume and leaves nothing behind to overwrite, so the pinned close
+   * semantics stay untouched.
+   */
+  private bumpLoadAdmission(sessionId: string): number {
+    const admission = (this.loadAdmissionGenerations.get(sessionId) ?? 0) + 1
+    this.loadAdmissionGenerations.set(sessionId, admission)
+    return admission
+  }
+
   private assertLoadActive(sessionId: string, generation: number): void {
     if (this.closingSessions.has(sessionId) || this.loadGenerations.get(sessionId) !== generation) {
       throw RequestError.requestCancelled({}, `session closed while loading: ${sessionId}`)
@@ -419,6 +442,19 @@ export class PiAcpAgent implements ACPAgent {
     throw RequestError.requestCancelled({}, `session is being deleted: ${sessionId}`)
   }
 
+  /**
+   * A root-changing request fences load admissions at its first yield. A
+   * newer load bumps the counter; the request's roots are stale from that
+   * point on, so every (re-)entry into the restore loop fails closed before
+   * it can wait on, join, or replace children with those stale roots.
+   */
+  private assertRootMutationCurrent(sessionId: string, opts?: SessionRestoreOpts): void {
+    if (opts?.rootMutationGeneration === undefined) return
+    if ((this.loadAdmissionGenerations.get(sessionId) ?? 0) !== opts.rootMutationGeneration) {
+      throw RequestError.requestCancelled({}, `session superseded by a newer load while restoring: ${sessionId}`)
+    }
+  }
+
   private async restoreSession(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
     this.assertNotDeleting(sessionId)
 
@@ -426,6 +462,9 @@ export class PiAcpAgent implements ACPAgent {
     // supplies a replacement root list (load/resume) must not reuse a live
     // child configured with different roots; same roots reuse it.
     while (true) {
+      // Re-entry follows an await (active-load wait or joining an in-flight
+      // restore); a newer load may have taken over during it.
+      this.assertRootMutationCurrent(sessionId, opts)
       const existing = this.sessions.maybeGet(sessionId)
       if (existing) {
         this.assertRequestedSessionCwd(existing.cwd, opts?.cwd)
@@ -649,8 +688,10 @@ export class PiAcpAgent implements ACPAgent {
    * session/load is replaying this session, its freshly restored process is
    * provisional — a failing load evicts and disposes it — so other consumers
    * must not share it mid-flight. They wait for every active load to settle
-   * and then use (or restore) the surviving state. The load itself calls
-   * restoreSession directly and therefore never waits on itself.
+   * and then use (or restore) the surviving state, except root-changing
+   * resumes: superseded by a newer load/close, they fail closed rather than
+   * re-applying stale roots. The load itself calls restoreSession directly
+   * and therefore never waits on itself.
    */
   private async restoreSessionAwaitingLoads(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
     while (true) {
@@ -662,6 +703,17 @@ export class PiAcpAgent implements ACPAgent {
       // flight. Never hand its provisional process to resume/config callers.
       if (!this.activeLoads.has(sessionId) && (this.loadGenerations.get(sessionId) ?? 0) === observedGeneration) {
         return session
+      }
+      // A root-changing request is stale the moment a newer load or close
+      // takes over: its opts name roots the newer owner already replaced, so
+      // retrying would silently re-apply them behind its back. It fails
+      // closed instead; root-less restores (prompts, config mutations) keep
+      // the wait-and-retry path because they re-read the surviving state.
+      if (opts?.additionalDirectories !== undefined) {
+        throw RequestError.requestCancelled(
+          {},
+          `session superseded by a newer load or close while restoring: ${sessionId}`
+        )
       }
       await this.waitForActiveLoads(sessionId)
     }
@@ -1072,6 +1124,7 @@ export class PiAcpAgent implements ACPAgent {
 
     this.bumpCancellationEpoch(params.sessionId)
     const generation = this.bumpLoadGeneration(params.sessionId)
+    this.bumpLoadAdmission(params.sessionId)
 
     return this.trackLoad(params.sessionId, async () => {
       this.assertLoadActive(params.sessionId, generation)
@@ -1144,7 +1197,16 @@ export class PiAcpAgent implements ACPAgent {
 
     const cwd = params.cwd
 
-    const session = await this.restoreSessionAwaitingLoads(params.sessionId, { cwd, additionalDirectories })
+    // Fence captured before this request's first yield: a newer load bumping
+    // the admission counter makes its roots stale for the whole request
+    // lifetime, not just after the restore returns.
+    const rootMutationGeneration = this.loadAdmissionGenerations.get(params.sessionId) ?? 0
+
+    const session = await this.restoreSessionAwaitingLoads(params.sessionId, {
+      cwd,
+      additionalDirectories,
+      rootMutationGeneration
+    })
 
     // Unlike session/load, resume MUST NOT replay conversation history.
     const configOptions = await getSessionConfiguration(session.proc)

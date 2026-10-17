@@ -424,6 +424,211 @@ test(
   }
 )
 
+test(
+  'PiAcpAgent: a load arriving after a changed-root resume passes its teardown guard supersedes the stale resume',
+  { skip: isWindows },
+  async t => {
+    const first = mkdtempSync(join(tmpdir(), 'pi-acp-ws-late-one-'))
+    const second = mkdtempSync(join(tmpdir(), 'pi-acp-ws-late-two-'))
+    const third = mkdtempSync(join(tmpdir(), 'pi-acp-ws-late-three-'))
+    // Gate the replacement child's identity probe, which runs AFTER the
+    // teardown-guard fence: the resume is stalled past the only window its
+    // admission checks cover, exactly where a newer load can slip in.
+    let releaseReplacement!: () => void
+    const replacementGate = new Promise<void>(resolve => {
+      releaseReplacement = resolve
+    })
+    let replacementParked!: () => void
+    const replacementParkedSignal = new Promise<void>(resolve => {
+      replacementParked = resolve
+    })
+    let spawnIndex = 0
+    const { cwd, harness } = seedRaceHarness(t, [first], {
+      onSpawn: proc => {
+        const index = ++spawnIndex
+        if (index !== 2) return
+        const getState = proc.getState.bind(proc)
+        proc.getState = async () => {
+          replacementParked()
+          await replacementGate
+          return getState()
+        }
+      }
+    })
+    await harness.agent.resumeSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [first]
+    })
+    assert.equal(harness.spawnCalls.length, 1)
+
+    const resume = harness.agent.resumeSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [second]
+    })
+    // Attach before releasing so the rejection is never unhandled.
+    const resumeOutcome = assert.rejects(resume, /superseded by a newer load or close while restoring/)
+    await replacementParkedSignal
+
+    const load = harness.agent.loadSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [third]
+    })
+    await tick()
+    releaseReplacement()
+
+    await resumeOutcome
+    await load
+    assert.deepEqual(
+      harness.spawnCalls.map(call => call.additionalDirectories),
+      [[first], [second], [third]],
+      'the stale resume never re-applies its roots behind the newer load'
+    )
+    const finalChild = (harness.agent as unknown as Record<string, any>).sessions.maybeGet('ws-race-session')
+    assert.ok(finalChild, 'the load owns the surviving session')
+    assert.deepEqual(finalChild.additionalDirectories, [third], 'the load roots stay active')
+    assert.deepEqual(
+      harness.store.get('ws-race-session')?.additionalDirectories,
+      [third],
+      "the durable roots stay the load's"
+    )
+  }
+)
+
+test(
+  'PiAcpAgent: a load admitted in the same tick as a changed-root resume supersedes it',
+  { skip: isWindows },
+  async t => {
+    const first = mkdtempSync(join(tmpdir(), 'pi-acp-ws-admit-one-'))
+    const second = mkdtempSync(join(tmpdir(), 'pi-acp-ws-admit-two-'))
+    const third = mkdtempSync(join(tmpdir(), 'pi-acp-ws-admit-three-'))
+    const { cwd, harness } = seedRaceHarness(t, [first])
+    await harness.agent.resumeSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [first]
+    })
+    assert.equal(harness.spawnCalls.length, 1)
+
+    // Admitted with no await between them: the load's synchronous admission
+    // bump lands before the resume's wrapper captures a generation of its
+    // own, so only an admission-time fence can see the supersession.
+    const resume = harness.agent.resumeSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [second]
+    })
+    const resumeOutcome = assert.rejects(resume, /superseded by a newer load while restoring/)
+    const load = harness.agent.loadSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [third]
+    })
+
+    await resumeOutcome
+    await load
+    assert.deepEqual(
+      harness.spawnCalls.map(call => call.additionalDirectories),
+      [[first], [third]],
+      'the stale resume never spawns its roots behind the newer load'
+    )
+    const finalChild = (harness.agent as unknown as Record<string, any>).sessions.maybeGet('ws-race-session')
+    assert.ok(finalChild, 'the load owns the surviving session')
+    assert.deepEqual(finalChild.additionalDirectories, [third], 'the load roots stay active')
+    assert.deepEqual(
+      harness.store.get('ws-race-session')?.additionalDirectories,
+      [third],
+      "the durable roots stay the load's"
+    )
+  }
+)
+
+test(
+  'PiAcpAgent: a changed-root resume joining an in-flight rootless restore fails closed when a newer load supersedes it',
+  { skip: isWindows },
+  async t => {
+    const first = mkdtempSync(join(tmpdir(), 'pi-acp-ws-join-one-'))
+    const second = mkdtempSync(join(tmpdir(), 'pi-acp-ws-join-two-'))
+    const third = mkdtempSync(join(tmpdir(), 'pi-acp-ws-join-three-'))
+    // Gate the FIRST spawn's identity probe: a rootless restore is parked
+    // mid-restore with no live child, the state a joining request waits on.
+    let releaseFirstSpawn!: () => void
+    const firstSpawnGate = new Promise<void>(resolve => {
+      releaseFirstSpawn = resolve
+    })
+    let firstSpawnParked!: () => void
+    const firstSpawnParkedSignal = new Promise<void>(resolve => {
+      firstSpawnParked = resolve
+    })
+    let spawnIndex = 0
+    const { cwd, harness } = seedRaceHarness(t, [first], {
+      onSpawn: proc => {
+        const index = ++spawnIndex
+        if (index !== 1) return
+        const getState = proc.getState.bind(proc)
+        proc.getState = async () => {
+          firstSpawnParked()
+          await firstSpawnGate
+          return getState()
+        }
+      }
+    })
+    const rootless = harness.agent.setSessionConfigOption({
+      sessionId: 'ws-race-session',
+      configId: 'thought_level',
+      value: 'off'
+    })
+    await firstSpawnParkedSignal
+
+    // The root-changing resume joins the parked rootless restore and stalls
+    // on its in-flight promise.
+    const resume = harness.agent.resumeSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [second]
+    })
+    const resumeOutcome = assert.rejects(resume, /superseded by a newer load while restoring/)
+    await tick()
+
+    // A newer load supersedes while the resume still awaits the in-flight
+    // restore; releasing the gate lets it resolve into re-entry.
+    const load = harness.agent.loadSession({
+      sessionId: 'ws-race-session',
+      cwd,
+      mcpServers: [],
+      additionalDirectories: [third]
+    })
+    await tick()
+    releaseFirstSpawn()
+
+    await resumeOutcome
+    await load
+    await rootless
+    assert.deepEqual(
+      harness.spawnCalls.map(call => call.additionalDirectories),
+      [[first], [third]],
+      'the superseded resume never re-enters root replacement'
+    )
+    const finalChild = (harness.agent as unknown as Record<string, any>).sessions.maybeGet('ws-race-session')
+    assert.ok(finalChild, 'the load owns the surviving session')
+    assert.deepEqual(finalChild.additionalDirectories, [third], 'the load roots stay active')
+    assert.deepEqual(
+      harness.store.get('ws-race-session')?.additionalDirectories,
+      [third],
+      "the durable roots stay the load's"
+    )
+  }
+)
+
 test('PiAcpAgent: invalid additional roots reject before any live-session teardown', { skip: isWindows }, async t => {
   const { cwd, harness } = seedRaceHarness(t, [mkdtempSync(join(tmpdir(), 'pi-acp-ws-race-one-'))])
   await harness.agent.resumeSession({
