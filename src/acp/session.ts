@@ -2186,7 +2186,47 @@ export class PiAcpSession {
       }
 
       case 'message_end': {
-        const message = ev.message as { role?: unknown; display?: unknown; content?: unknown } | undefined
+        const message = ev.message as
+          | {
+              role?: unknown
+              display?: unknown
+              content?: unknown
+              stopReason?: unknown
+              errorMessage?: unknown
+            }
+          | undefined
+
+        // pi >= 1.2 delivers every assistant boundary — including terminal
+        // failures — through `message_end`; `done`/`error` never arrive as
+        // `message_update` assistant events. Without this mapping a provider
+        // failure (expired credentials included) settles as a silent
+        // `end_turn` instead of failing the turn.
+        if (message?.role === 'assistant' && typeof message.stopReason === 'string') {
+          if (!ownsPiTurn && (this.piBusyOutOfBand || turn)) break
+          const detail =
+            typeof message.errorMessage === 'string' && message.errorMessage ? `: ${message.errorMessage}` : ''
+          if (message.stopReason === 'error') {
+            this.turnFailure ??= new Error(`pi run failed${detail}`)
+          } else if (message.stopReason === 'aborted') {
+            // Only a client-driven cancellation may map an abort to the ACP
+            // `cancelled` stop reason; anything else is a failed turn.
+            if (!this.cancelRequested) {
+              this.turnFailure ??= new Error(`pi aborted the run unexpectedly${detail}`)
+            }
+          } else if (
+            message.stopReason === 'stop' ||
+            message.stopReason === 'length' ||
+            message.stopReason === 'toolUse'
+          ) {
+            // A known successful completion supersedes a provisional error
+            // from an attempt that pi recovered via retry or compaction.
+            // Only the latest boundary counts, like the `done` event path.
+            this.turnFailure = null
+            this.lastDoneReason = message.stopReason
+          }
+          break
+        }
+
         if (message?.role !== 'custom' || message.display !== true) break
 
         const blocks = translateCustomMessageContent(message.content)

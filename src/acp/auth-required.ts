@@ -11,6 +11,10 @@ export function maybeAuthRequiredError(err: unknown, authMethods: AuthMethod[] =
   const msg = String((err as any)?.message ?? err ?? '')
   const s = msg.toLowerCase()
 
+  // MCP session state is per-connection; a login cannot fix it, so MCP errors
+  // never classify as auth-required even when their text mentions expiry.
+  if (s.includes('mcp session')) return null
+
   // Explicit credential/configuration phrases only. Generic authorization
   // failures ("permission denied", "forbidden", bare "403") are routinely
   // produced by filesystem errors and provider rate/entitlement problems
@@ -27,7 +31,12 @@ export function maybeAuthRequiredError(err: unknown, authMethods: AuthMethod[] =
     'authentication',
     'credential',
     'log in',
-    'login'
+    'login',
+    // Expired credentials (pi: "Your session has expired. Please
+    // reauthenticate.", OAuth "expired_token", workload-identity tokens).
+    'token expired',
+    'expired_token',
+    'reauthenticate'
   ]
 
   // HTTP 401 (unauthenticated) with word boundaries so ids or token counts
@@ -37,11 +46,15 @@ export function maybeAuthRequiredError(err: unknown, authMethods: AuthMethod[] =
   const hit = http401 || patterns.some(p => s.includes(p))
   if (!hit) return null
 
-  // Include the negotiated terminal auth method options in error data.
+  // Include the negotiated terminal auth method options in error data. Keep
+  // the triggering message: substring matching is best-effort, so a
+  // misclassification must stay diagnosable from the error itself.
   return RequestError.authRequired(
     {
       authMethods
     },
-    'Configure an API key or log in with an OAuth provider.'
+    msg
+      ? `Configure an API key or log in with an OAuth provider. (${msg})`
+      : 'Configure an API key or log in with an OAuth provider.'
   )
 }
