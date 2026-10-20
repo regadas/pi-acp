@@ -9,7 +9,7 @@ function isMcpRejection(e: unknown): boolean {
   const err = e as { code?: number; message?: string; data?: { reason?: string } }
   assert.equal(err?.code, -32602)
   assert.equal(err?.data?.reason, 'MCP_SERVERS_UNSUPPORTED')
-  assert.match(String(err?.message), /does not support MCP servers/)
+  assert.match(String(err?.message), /does not bridge client-provided MCP servers/)
   assert.match(String(err?.message), /Remove mcpServers/)
   return true
 }

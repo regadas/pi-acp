@@ -809,7 +809,10 @@ export class PiAcpSession {
       const failure = this.commandTerminalFailure(command)
       if (failure) throw failure
       if (command.cancelled) return null
-      throw error
+      // Command bodies (e.g. provider-backed /compact) hit the same credential
+      // failures as prompt turns; classify before rethrowing. Errors keep their
+      // identity so protocol-meaningful classes (RPC timeouts) survive.
+      throw maybeAuthRequiredError(error, this.authMethods) ?? error
     } finally {
       command.requestOwner = undefined
       await finishAdapterPromptTurn()

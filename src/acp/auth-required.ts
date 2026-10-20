@@ -15,6 +15,11 @@ export function maybeAuthRequiredError(err: unknown, authMethods: AuthMethod[] =
   // never classify as auth-required even when their text mentions expiry.
   if (s.includes('mcp session')) return null
 
+  // Filesystem failures are never credential problems, and their paths can
+  // contain pattern words ("login", "api key"), so exclude the envelopes
+  // before matching.
+  if (/\b(eacces|eperm|enoent|enotdir|eisdir|erofs|enospc|emfile|ebusy|enotempty)\b/.test(s)) return null
+
   // Explicit credential/configuration phrases only. Generic authorization
   // failures ("permission denied", "forbidden", bare "403") are routinely
   // produced by filesystem errors and provider rate/entitlement problems

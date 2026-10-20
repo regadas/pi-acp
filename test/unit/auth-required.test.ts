@@ -39,6 +39,8 @@ test('maybeAuthRequiredError: generic permission/entitlement failures stay inter
     'MCP session expired: token expired',
     'MCP session expired. Please reauthenticate.',
     'Session expired', // bare session expiry is not evidenced as login-fixable
+    "EACCES: permission denied, open '/tmp/login-sessions/turn.jsonl'", // fs envelopes stay internal even with pattern words in the path
+    "ENOENT: no such file or directory, open '/home/u/.pi/api-key-cache/credentials.json'",
     'Signature expired' // request signing, not a user credential
   ]) {
     assert.equal(maybeAuthRequiredError(new Error(message), methods), null, `expected internal for: ${message}`)
