@@ -13,7 +13,10 @@ test('maybeAuthRequiredError: explicit credential problems classify as auth-requ
     'Request failed: 401',
     'unauthenticated request',
     'please log in to continue',
-    'invalid credentials'
+    'invalid credentials',
+    'Your session has expired. Please reauthenticate.',
+    'Error code: expired_token - refresh it and retry',
+    'Workload identity token expired before its exchange completed.'
   ]) {
     const error = maybeAuthRequiredError(new Error(message), methods)
     assert.ok(error, `expected auth-required for: ${message}`)
@@ -30,7 +33,15 @@ test('maybeAuthRequiredError: generic permission/entitlement failures stay inter
     '403 quota exceeded for this billing period',
     'model overloaded (429), retry later',
     'request used 2401 tokens', // bounded 401 match: digits inside a number never classify
-    'file id 84012 not found'
+    'file id 84012 not found',
+    'MCP session expired', // per-connection MCP session id: a login cannot fix it
+    'MCP session has expired', // the explicit MCP guard outranks the expiry patterns
+    'MCP session expired: token expired',
+    'MCP session expired. Please reauthenticate.',
+    'Session expired', // bare session expiry is not evidenced as login-fixable
+    "EACCES: permission denied, open '/tmp/login-sessions/turn.jsonl'", // fs envelopes stay internal even with pattern words in the path
+    "ENOENT: no such file or directory, open '/home/u/.pi/api-key-cache/credentials.json'",
+    'Signature expired' // request signing, not a user credential
   ]) {
     assert.equal(maybeAuthRequiredError(new Error(message), methods), null, `expected internal for: ${message}`)
   }

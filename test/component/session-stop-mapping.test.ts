@@ -1,17 +1,19 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import type { AuthMethod } from '@agentclientprotocol/sdk'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
-function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess): PiAcpSession {
+function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess, authMethods?: AuthMethod[]): PiAcpSession {
   return new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
     mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: []
+    fileCommands: [],
+    authMethods
   })
 }
 
@@ -77,6 +79,164 @@ test('PiAcpSession: assistant error event fails the turn at agent_settled', asyn
     assert.match(String(e?.message), /429 quota exceeded/)
     return true
   })
+})
+
+test('PiAcpSession: expired credentials mid-session reject the turn as auth-required', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_update',
+    assistantMessageEvent: {
+      type: 'error',
+      reason: 'error',
+      error: { errorMessage: 'Your session has expired. Please reauthenticate.' }
+    }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  await assert.rejects(p, (e: any) => {
+    assert.equal(e?.code, -32000)
+    assert.match(String(e?.message), /Configure an API key or log in with an OAuth provider/i)
+    return true
+  })
+})
+
+test('PiAcpSession: pi terminal message_end error rejects the turn as auth-required', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const methods = [{ id: 'pi_terminal_login', name: 'Launch pi in the terminal' }] as AuthMethod[]
+  const session = makeSession(conn, proc, methods)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  // pi >= 1.2 ends a failed assistant run with a terminal message_end carrying
+  // stopReason 'error' + errorMessage; no message_update error event exists.
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: '' }],
+      stopReason: 'error',
+      errorMessage: 'Your session has expired. Please reauthenticate.'
+    }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  await assert.rejects(p, (e: any) => {
+    assert.equal(e?.code, -32000)
+    assert.match(String(e?.message), /Configure an API key or log in with an OAuth provider/i)
+    assert.match(String(e?.message), /Your session has expired\. Please reauthenticate\./)
+    assert.deepEqual((e?.data as any)?.authMethods, methods)
+    return true
+  })
+})
+
+test('PiAcpSession: a recovered auto-retry supersedes the terminal message_end error', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '529 overloaded' }
+  })
+  proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 1, delayMs: 1 })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'recovered' }], stopReason: 'stop' }
+  })
+  proc.emit({ type: 'auto_retry_end', success: true, attempt: 1 })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: terminal message_end length stop maps to max_tokens', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'length' }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'max_tokens')
+})
+
+test('PiAcpSession: compaction-recovered overflow failure settles as end_turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  // pi >= 1.2 recovers a context-overflow failure through compaction: the
+  // error message_end is provisional and the later stop boundary must win.
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'context overflow' }
+  })
+  proc.emit({ type: 'compaction_start', reason: 'overflow' })
+  proc.emit({ type: 'compaction_end' })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [{ type: 'text', text: 'recovered' }], stopReason: 'stop' }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
+})
+
+test('PiAcpSession: terminal message_end abort after a client cancellation stays cancelled', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  await session.cancel()
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'aborted' }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'cancelled')
+})
+
+test('PiAcpSession: out-of-band terminal message_end errors never fail a later turn', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+
+  ;(session as any).piBusyOutOfBand = true
+  proc.emit({
+    type: 'message_end',
+    message: {
+      role: 'assistant',
+      content: [],
+      stopReason: 'error',
+      errorMessage: 'Your session has expired. Please reauthenticate.'
+    }
+  })
+  ;(session as any).piBusyOutOfBand = false
+
+  const p = session.prompt('hello')
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
+  proc.emit({ type: 'agent_settled' })
+
+  assert.equal(await p, 'end_turn')
 })
 
 test('PiAcpSession: aborted error without a client cancellation fails the turn', async () => {

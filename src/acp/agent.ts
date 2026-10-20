@@ -57,18 +57,21 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import type { AvailableCommand } from '@agentclientprotocol/sdk'
 
 /**
- * pi has no MCP support (an extension would be required to bridge MCP
- * servers), so silently accepting `mcpServers` would hand the client a
- * session that is missing its requested tools. Reject explicitly before any
- * session side effects instead of degrading silently.
+ * pi supports MCP servers through its own configuration (user/project
+ * `mcp.json`, extensions), but pi-acp does not yet bridge a client's
+ * `mcpServers` into the session's pi configuration, so silently accepting
+ * them would hand the client a session that is missing its requested tools.
+ * Reject explicitly before any session side effects instead of degrading
+ * silently.
  */
 function assertNoMcpServers(mcpServers: readonly unknown[] | undefined): void {
   if (!mcpServers?.length) return
   throw RequestError.invalidParams(
     { reason: 'MCP_SERVERS_UNSUPPORTED' },
-    `pi does not support MCP servers, so pi-acp cannot connect the ${mcpServers.length} requested MCP server(s). ` +
-      'Remove mcpServers from the session request. To use MCP tools with pi, configure them through a pi extension ' +
-      '(e.g. https://github.com/nicobailon/pi-mcp-adapter) instead.'
+    `pi-acp does not bridge client-provided MCP servers into pi's configuration yet, ` +
+      `so the ${mcpServers.length} requested MCP server(s) cannot be connected. ` +
+      'Remove mcpServers from the session request. To use MCP tools with pi, configure them in pi itself ' +
+      '(native mcp.json or an extension such as https://github.com/nicobailon/pi-mcp-adapter) instead.'
   )
 }
 

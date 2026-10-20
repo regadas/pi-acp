@@ -92,6 +92,34 @@ test('PiAcpAgent: an adapter command waits for out-of-band pi work and runs at i
   assert.equal(proc.disposeCount, 0)
 })
 
+test('PiAcpAgent: a command body failing on expired credentials rejects as auth-required', async () => {
+  const proc = new FakePiRpcProcess() as any
+  const { agent } = makeAgent(proc)
+  proc.compact = async () => {
+    throw new Error('Your session has expired. Please reauthenticate.')
+  }
+
+  await assert.rejects(agent.prompt(promptParams('/compact')), (e: any) => {
+    assert.equal(e?.code, -32000)
+    assert.match(String(e?.message), /Configure an API key or log in with an OAuth provider/i)
+    return true
+  })
+})
+
+test('PiAcpAgent: a command body failing on a filesystem error stays internal', async () => {
+  const proc = new FakePiRpcProcess() as any
+  const { agent } = makeAgent(proc)
+  proc.compact = async () => {
+    throw new Error("pi compact failed: EACCES: permission denied, open '/tmp/login-sessions/turn.jsonl'")
+  }
+
+  await assert.rejects(agent.prompt(promptParams('/compact')), (e: any) => {
+    assert.equal(e?.code, undefined, 'a filesystem failure must not surface as authRequired')
+    assert.match(String(e?.message), /EACCES/)
+    return true
+  })
+})
+
 test('PiAcpAgent: a settlement admits a parked command exactly once and clears its timeout', async () => {
   const proc = new FakePiRpcProcess() as any
   const compactions = trackCompaction(proc)
