@@ -57,3 +57,40 @@ jobs:
       - run: npm ci
       - run: node --import tsx --test --test-name-pattern "Windows \.cmd wrapper" test/unit/pi-rpc-process.test.ts test/unit/pi-version.test.ts
         shell: bash
+
+  # ACP v1 compatibility diagnostics against the pinned upstream acp-tck: the
+  # built adapter plus installed pi run with a disposable user state and a
+  # deterministic local provider (no provider network). Conformance findings
+  # are recorded, not gating: pi has a documented MCP conformance gap, so the
+  # TCK step alone is continue-on-error and diagnostics upload always.
+  tck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.19.0'
+          cache: npm
+      - run: npm ci
+      - run: npm install --global @earendil-works/pi-coding-agent@1.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Check out the pinned acp-tck revision
+        uses: actions/checkout@v4
+        with:
+          repository: agentclientprotocol/acp-tck
+          ref: 3d46e2168aa3c23fe3853d539141a65a54d6a880
+          path: .tck/acp-tck
+      - name: Run the pinned ACP v1 TCK
+        continue-on-error: true
+        run: npm run eval:tck
+        env:
+          PI_ACP_TCK_DIR: ${{ github.workspace }}/.tck/acp-tck
+          PI_ACP_TCK_REPORT_DIR: ${{ runner.temp }}/tck-reports
+      - name: Upload ACP TCK diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acp-tck-report
+          path: ${{ runner.temp }}/tck-reports
+          if-no-files-found: warn

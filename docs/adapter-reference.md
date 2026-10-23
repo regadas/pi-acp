@@ -134,6 +134,52 @@ makes the skip a failure. CI covers it in a dedicated Bun job (Bun setup, build,
 required default-launch eval) alongside the Node-only validate job, plus a Windows job running the real
 cmd.exe wrapper process-tree termination and hanging `--version` probe tree-kill tests; Windows has no
 shell-wrapper eval.
+`npm run eval:tck` runs the pinned upstream [acp-tck](https://github.com/agentclientprotocol/acp-tck) v1
+compatibility suite against the built adapter and the installed pi (>= 1.2.0 on `PATH`): disposable
+user/workspace state, a deterministic local provider extension (two models for `model` selection,
+reasoning levels, image input) and no provider network. The child environment keeps only operational
+variables: inherited provider credentials (AWS/Google/Anthropic/OpenAI and generic key/token/secret
+shapes), ambient pytest/Python/node runtime injection and every ambient `PI_*` override are dropped,
+so the run cannot be customized or redirected from the caller's shell. `PI_ACP_TCK_DIR` must point at a
+clean checkout of
+`agentclientprotocol/acp-tck` at revision `3d46e2168aa3c23fe3853d539141a65a54d6a880`; `uv` on `PATH` provisions the
+TCK's Python (>= 3.14) and dependencies in per-run private temporary state without writing to the
+checkout (bytecode writes are disabled). The JSON
+report (per-requirement status, verdict, failure transcripts) is written under `PI_ACP_TCK_REPORT_DIR`
+(default: `<tmpdir>/pi-acp-tck-reports`), survives the disposable run state, and contains full wire
+transcripts including prompt/session content — do not commit it. Exit codes: only exit `0` with a
+conformant report or exit `1` with a non-conformant report is a verdict — after minimal report-shape
+validation (protocol v1, per-requirement id/tier/status/tests evidence, and all four tier count tables
+— `MANDATORY`, `CAPABILITY`, `ADVISORY` and `INFORMATIONAL`, each with `PASS`/`FAIL`/`SKIPPED`/`NOT_TESTED`
+as nonnegative integers); every
+other exit/verdict combination, a missing/invalid report, and all setup/runner/timeout failures exit
+`3` with a best-effort runner-error JSON alongside the report. `PI_ACP_TCK_TIMEOUT_MS` (default 20
+minutes) is validated up front and is one wall-clock deadline covering the bounded setup probes
+(each individually hard-killed as a whole POSIX process group at the shorter of its own limit or the
+remaining budget, so a probe that traps SIGTERM or leaks children can neither stall the runner nor
+outlive setup; Windows keeps a best-effort single-process kill that the tests do not cover), provisioning
+and the suite; process teardown may extend past it by a bounded cleanup grace only. The runner
+launches every TCK agent through an owned bootstrap that registers the agent root before the adapter
+starts, so separately-sessioned agents (and their pi children, via the agent's own session) are torn
+down on normal, early, watchdog and external-signal exits; each registered identity (pid plus an OS
+start fingerprint) is revalidated before signaling, so exited, reused or unverifiable pids are never
+signaled. Before the final teardown scan the runner seals the registry: a bootstrap that starts during
+or after shutdown — or registers concurrently with it — refuses to run the adapter or recreate the run
+state instead of racing cleanup. The bootstrap imports the built adapter in-process over stdio, so the
+suite exercises the Node-hosted adapter; the entry module's Bun re-exec is not exercised and no Bun
+runtime is claimed. Only the diagnostic
+selectors `-k`/`-v` and the timeout overrides `--timeout`/`--startup-timeout`/`--test-timeout` may be
+passed through (e.g. `npm run eval:tck -- -k diagnostics`); every other extra argument, including
+protocol, report, agent, checkout and logout options and the `--` separator, is rejected as a setup
+error. The run summary surfaces untested mandatory requirements, unexercised cancellation and
+auth/version blocking instead of implying coverage. Known limitation: pi has no MCP support, so
+`ACP-SESSION-003` (session/new with a stdio MCP server) fails by design and `ACP-SESSION-004`
+(connecting to it) is skipped on that prerequisite — the suite runs against the v1-unstable schema
+superset and the verdict is expected to stay NOT CONFORMANT —
+and the synthetic provider exercises real Pi transport, model selection, session persistence and
+cancellable turns, not real tools, provider intelligence or Zed UI behavior. CI runs it in an isolated
+non-blocking diagnostics job (pinned TCK checkout, uv, installed pi 1.2.0) that uploads the report with
+`always()`; it never gates a required job.
 `npm run eval:subagents:completion` and `npm run eval:subagents:cancel` are explicit manual probes, not CI
 coverage: they additionally require `PI_ACP_EVAL_SUBAGENTS` pointing at a clean `nicobailon/pi-subagents`
 git-main checkout at revision `29284cd943c0c7ee852593c6e02d2a60febf6ba4` (declared entry `./index.ts`).
