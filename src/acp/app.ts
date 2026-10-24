@@ -1,6 +1,8 @@
-import { agent as acpAgent, methods, RequestError, type AgentApp } from '@agentclientprotocol/sdk'
+import { agent as acpAgent, methods, RequestError, type AgentApp } from '@agentclientprotocol/sdk/unstable'
+import { agentProtocolRouter, type AgentProtocolRouter } from '@agentclientprotocol/sdk/experimental/v2'
 import { PiAcpAgent, runPromptWithCancellation } from './agent.js'
 import { ClientConnection } from './client.js'
+import { createPiAcpV2AgentApp } from './v2/app.js'
 
 /**
  * Builds the ACP agent app with exactly the methods this adapter implements
@@ -79,4 +81,17 @@ export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null
       runPromptWithCancellation(getInitializedAgent(), ctx.params, ctx.signal)
     )
     .onNotification(methods.agent.session.cancel, ctx => getInitializedAgent().cancel(ctx.params))
+}
+
+/**
+ * The ACP entrypoint: routes each connection's first `initialize` request to
+ * the v1 or v2 handler chain by its requested protocol version (v2-capable
+ * clients asking for version 1 get v1; a version above 2 negotiates down to
+ * 2). The v1 chain is exactly `createPiAcpAgentApp`; the v2 chain is the
+ * experimental subset pi RPC can honestly back.
+ */
+export function createPiAcpProtocolRouter(opts?: {
+  onAgent?: (agent: PiAcpAgent | null) => void
+}): AgentProtocolRouter {
+  return agentProtocolRouter().withV1(createPiAcpAgentApp(opts)).withV2(createPiAcpV2AgentApp(opts))
 }

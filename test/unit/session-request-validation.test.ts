@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { NewSessionRequest } from '@agentclientprotocol/sdk'
+import type { NewSessionRequest } from '@agentclientprotocol/sdk/unstable'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 

@@ -4,7 +4,7 @@ import type {
   CreateElicitationResponse,
   RequestPermissionRequest,
   RequestPermissionResponse
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from '../../src/acp/client.js'
 import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { PiAcpSession } from '../../src/acp/session.js'

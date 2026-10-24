@@ -1,4 +1,4 @@
-import type { AuthMethod } from '@agentclientprotocol/sdk'
+import type { AuthMethod } from '@agentclientprotocol/sdk/unstable'
 
 export const PI_SETUP_METHOD_ID = 'pi_terminal_login'
 

@@ -1,6 +1,17 @@
-import type { SessionConfigOption, SessionNotification } from '@agentclientprotocol/sdk'
+import type { SessionConfigOption, SessionNotification } from '@agentclientprotocol/sdk/unstable'
+import { ndJsonStream, type Stream } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from '../../src/acp/client.js'
 import type { PiRpcEvent, PiRpcTermination } from '../../src/pi-rpc/process.js'
+
+/** A connected in-memory wire pair: bytes written to one side arrive at the other, in order. */
+export function acpStreamPair(): [Stream, Stream] {
+  const agentToClient = new TransformStream<Uint8Array, Uint8Array>()
+  const clientToAgent = new TransformStream<Uint8Array, Uint8Array>()
+  return [
+    ndJsonStream(agentToClient.writable, clientToAgent.readable),
+    ndJsonStream(clientToAgent.writable, agentToClient.readable)
+  ]
+}
 
 type SessionUpdateMsg = SessionNotification
 

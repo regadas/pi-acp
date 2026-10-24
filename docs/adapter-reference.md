@@ -7,6 +7,8 @@ For installation and a quick overview, start with the [README](../README.md).
 
 `pi-acp` targets the stable ACP v1 core using the current `@agentclientprotocol/sdk` builder API. It implements the baseline prompt lifecycle plus stable session list, load, resume, close, and delete methods. It is not fully ACP v1 conformant because client-provided stdio MCP servers are not supported: pi-acp does not bridge them into pi's own MCP configuration (pi 1.3+ supports native MCP servers via `mcp.json`), so requests with a non-empty `mcpServers` list are rejected explicitly instead of being silently ignored; see [Limitations](#limitations).
 
+On top of v1, the adapter serves an experimental subset of the draft ACP v2 protocol, selected per connection by the first `initialize` request; see [Experimental ACP v2 support](#experimental-acp-v2-support). v1 wire behavior is unchanged.
+
 The design targets ACP clients generically. Optional extensions are enabled only by negotiated capabilities, never by client identity; standard ACP content remains the fallback. [Zed](https://zed.dev) is a compatibility benchmark, not the design target. Client support may vary; expect some minor breaking changes.
 
 ## Features
@@ -36,6 +38,27 @@ The design targets ACP clients generically. Optional extensions are enabled only
 - Pi extension select/confirm UI maps to ACP permissions. Input/editor UI maps to stable v1 form elicitation only when the client negotiates it; otherwise pi receives cancellation
   - Native dialog timeouts cancel the ACP request and complete permission cards; late answers are ignored without replying to an expired pi dialog. Explicit answers and cancellation still send the appropriate native response
 - Stable context-window/cost updates and unstable SDK prompt-response cumulative token totals are published when pi reports finite values
+
+## Experimental ACP v2 support
+
+The adapter routes each connection to a v1 or v2 handler chain from the first `initialize` request's `protocolVersion`, using the SDK's protocol router:
+
+- version 1 selects the v1 chain, unchanged — a v2-capable client asking for version 1 gets v1 and never sees v2 methods
+- version 2 or higher selects the v2 chain; a version above every supported one is answered with the highest supported one (2)
+- a version below every supported one is rejected with `-32022` listing the supported versions `[1, 2]`
+- the first wire message must be an `initialize` request (single-entry batches allowed); anything else is rejected as invalid request
+
+The v2 chain is a translation layer over the same pi-backed engine, advertising only what pi RPC can honestly provide:
+
+- `initialize`, `session/new`, `session/list`, `session/resume`, `session/close`, `session/delete`, `session/prompt`, `session/cancel`, and `session/set_config_option` (select values only, matching the v1 engine's model and thinking-level options)
+- `session/resume` maps onto the v1 restore paths: `replayFrom: {"type": "start"}` replays the complete active-branch history through the same machinery as v1 `session/load`; without a cursor it restores without replay like v1 `session/resume`; any other cursor is rejected as invalid params
+- Prompts answer with the v2 `messageId` of the echoed `user_message`; the turn itself is reported as aggregate `state_update` snapshots (`running`, then `idle` with the v1 stop reason, or `idle` with `error` and the JSON-RPC error payload on failure)
+- Engine updates are translated to their v2 shapes: chunks carry synthesized `messageId`s (consecutive chunks of one kind share one id; the ids are unique per connection, so replayed chunks never collide with a message a client may still hold), v1 `tool_call` first reports become `tool_call_update`, config option ids are renamed `id` → `configId`, and command inputs are tagged `type: "text"`
+- Non-empty `mcpServers` are rejected on v2 exactly as on v1 (same explicit error), and empty lists are accepted
+
+Not advertised on v2: `session/fork` (v2 has no `session/load`; it is folded into `session/resume`), subagent sessions, providers, steering, agent-owned terminals, and the `auth/login`/`auth/logout` methods. Because a non-empty v2 `authMethods` list would require those methods, the v2 chain advertises no authentication methods at all: v2 clients must configure pi credentials out of band (for example by logging in with the v1 surface or the pi CLI first). The `_meta.terminal_output` display extension is likewise v1-only; v2 clients receive tool output as standard text content.
+
+The v2 surface is built on `@agentclientprotocol/sdk/experimental/v2`: ACP v2 is still a draft, and both its wire protocol and that SDK entrypoint can change incompatibly in any release. Treat v2 routing as experimental; the v1 chain remains the supported path.
 
 ## Prerequisites
 
@@ -95,6 +118,7 @@ Credential failures — missing or expired keys, expired sessions — are mapped
 
 ## Limitations
 
+- Experimental ACP v2: the draft protocol and the `@agentclientprotocol/sdk/experimental/v2` entrypoint can change incompatibly in any SDK release; the v2 chain is a best-effort subset reusing the v1 engine, advertises no authentication methods (v2 clients configure pi credentials out of band), and does not implement the v2 terminal surfaces, `session/fork`, subagent sessions, providers, or steering. A v2 prompt's stop reason and usage are reported as aggregate `state_update`/`usage_update` session updates rather than a v1-style prompt response payload.
 - No ACP filesystem delegation (`fs/*`) and no ACP terminal delegation (`terminal/*`). pi reads/writes and executes locally. Bash tool calls use the `_meta.terminal_output` display extension only when the client negotiates it; otherwise output is plain tool content.
 - Terminal login uses stable v1 `clientCapabilities.auth.terminal`; the `_meta["terminal-auth"]` launch specification is a separately negotiated extension.
 - Dialog timeout mirroring starts when the adapter receives the pi event, after native transport, so it cannot exactly reproduce the native deadline. Zero and NaN disable native timeouts; finite negative, sub-millisecond, and overflowing Node delays expire at 1 ms, and other finite delays are truncated to integer milliseconds. JSON serializes nonfinite numbers as null: the adapter cannot distinguish a native Infinity timeout (which Node expires) from a disabled/absent timeout. No blanket turn-end UI cancellation is applied; nontimed session-scoped dialogs remain until answered or explicitly cancelled.

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import type { AuthMethod } from '@agentclientprotocol/sdk'
+import type { AuthMethod } from '@agentclientprotocol/sdk/unstable'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import type { SessionNotification } from '@agentclientprotocol/sdk'
+import type { SessionNotification } from '@agentclientprotocol/sdk/unstable'
 import type { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'

@@ -1,4 +1,4 @@
-import { RequestError, type AuthMethod } from '@agentclientprotocol/sdk'
+import { RequestError, type AuthMethod } from '@agentclientprotocol/sdk/unstable'
 
 /**
  * Best-effort detection of missing credentials / not-configured errors from pi/providers.

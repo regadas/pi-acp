@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { PromptRequest } from '@agentclientprotocol/sdk'
+import type { PromptRequest } from '@agentclientprotocol/sdk/unstable'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
