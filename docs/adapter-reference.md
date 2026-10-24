@@ -156,8 +156,9 @@ other exit/verdict combination, a missing/invalid report, and all setup/runner/t
 `3` with a best-effort runner-error JSON alongside the report. `PI_ACP_TCK_TIMEOUT_MS` (default 20
 minutes) is validated up front and is one wall-clock deadline covering the bounded setup probes
 (each a synchronous, non-detached child hard-killed at the shorter of its own limit or the remaining
-budget, so a hung or signal-trapping probe cannot stall the runner; external signals reach probe
-children naturally, and leaked probe children are not force-killed by the runner), provisioning
+budget, so a hung or signal-trapping probe cannot stall the runner; a signal delivered to the process
+group — e.g. Ctrl-C — reaches probe children, a pid-directed signal terminates the runner by default
+handling without a runner-error JSON, and leaked probe children are not force-killed by the runner), provisioning
 and the suite; process teardown may extend past it by a bounded cleanup grace only. The runner
 launches every TCK agent through an owned bootstrap that registers the agent root before the adapter
 starts, so separately-sessioned agents (and their pi children, via the agent's own session) are torn
@@ -172,13 +173,15 @@ selectors `-k`/`-v` and the timeout overrides `--timeout`/`--startup-timeout`/`-
 passed through (e.g. `npm run eval:tck -- -k diagnostics`); every other extra argument, including
 protocol, report, agent, checkout and logout options and the `--` separator, is rejected as a setup
 error. The run summary surfaces untested mandatory requirements, unexercised cancellation and
-auth/version blocking instead of implying coverage. Known limitation: pi has no MCP support, so
+auth/version blocking instead of implying coverage. Known limitation: pi-acp does not bridge
+client-provided MCP servers, so
 `ACP-SESSION-003` (session/new with a stdio MCP server) fails by design and `ACP-SESSION-004`
 (connecting to it) is skipped on that prerequisite — the suite runs against the v1-unstable schema
 superset and the verdict is expected to stay NOT CONFORMANT —
 and the synthetic provider exercises real Pi transport, model selection, session persistence and
 cancellable turns, not real tools, provider intelligence or Zed UI behavior. CI runs it in an isolated
-non-blocking diagnostics job (pinned TCK checkout, uv, installed pi 1.2.0) that uploads the report with
+diagnostics job (pinned TCK checkout, uv, installed pi 1.2.0) that tolerates the exit-0/exit-1
+conformance verdicts, re-raises harness/setup/timeout failures (exit 3), and uploads the report with
 `always()`; it never gates a required job.
 `npm run eval:subagents:completion` and `npm run eval:subagents:cancel` are explicit manual probes, not CI
 coverage: they additionally require `PI_ACP_EVAL_SUBAGENTS` pointing at a clean `nicobailon/pi-subagents`

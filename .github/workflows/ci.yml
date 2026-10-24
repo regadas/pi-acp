@@ -60,9 +60,11 @@ jobs:
 
   # ACP v1 compatibility diagnostics against the pinned upstream acp-tck: the
   # built adapter plus installed pi run with a disposable user state and a
-  # deterministic local provider (no provider network). Conformance findings
-  # are recorded, not gating: pi has a documented MCP conformance gap, so the
-  # TCK step alone is continue-on-error and diagnostics upload always.
+  # deterministic local provider (no provider network). Conformance verdicts
+  # (exit 0/1) are recorded, not gating — pi-acp does not bridge
+  # client-provided MCP servers, so ACP-SESSION-003 fails by design — but
+  # harness/setup/timeout failures (exit 3) re-raise and fail this job;
+  # diagnostics upload always.
   tck:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -82,8 +84,12 @@ jobs:
           ref: 3d46e2168aa3c23fe3853d539141a65a54d6a880
           path: .tck/acp-tck
       - name: Run the pinned ACP v1 TCK
-        continue-on-error: true
-        run: npm run eval:tck
+        run: |
+          status=0
+          npm run eval:tck || status=$?
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+            exit "$status"
+          fi
         env:
           PI_ACP_TCK_DIR: ${{ github.workspace }}/.tck/acp-tck
           PI_ACP_TCK_REPORT_DIR: ${{ runner.temp }}/tck-reports

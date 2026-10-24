@@ -54,7 +54,7 @@ test('the runner cancel prompt carries the fixture marker and the fixture suppor
   assert.ok(fixtureSource.includes("input: ['text', 'image']"), 'fixture models must accept image input')
 })
 
-test('CI runs the pinned TCK as an isolated non-blocking diagnostics job with always-upload', () => {
+test('CI runs the pinned TCK as a diagnostics job that tolerates verdict exits and re-raises harness failures', () => {
   const ci = readFileSync(join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8')
   const start = ci.indexOf('  tck:')
   assert.ok(start >= 0, 'ci.yml must define the tck job')
@@ -72,9 +72,20 @@ test('CI runs the pinned TCK as an isolated non-blocking diagnostics job with al
   assert.ok(job.includes('PI_ACP_TCK_DIR'), 'the tck job must point the runner at its checkout')
   assert.match(
     job,
-    /continue-on-error: true\s*\n\s*run: npm run eval:tck/,
-    'the TCK execution step alone must be continue-on-error'
+    /npm run eval:tck \|\| status=\$\?/,
+    'the TCK step must capture the eval:tck exit instead of failing the step outright'
   )
+  assert.match(
+    job,
+    /\[ "\$status" -ne 0 \] && \[ "\$status" -ne 1 \]/,
+    'exit 0 and exit 1 conformance verdicts must both be tolerated as recorded findings'
+  )
+  assert.match(
+    job,
+    /exit "\$status"/,
+    'every other exit code — notably 3, a harness/setup/timeout failure — must re-raise and fail the job'
+  )
+  assert.ok(!job.includes('continue-on-error'), 'the TCK step must not mask harness/setup/timeout failures as green')
   assert.ok(job.includes('if: always()'), 'diagnostics must upload even when the TCK step fails')
   assert.ok(job.includes('actions/upload-artifact@v4'), 'the tck job must upload the report')
   assert.ok(!ci.slice(0, start).includes('continue-on-error:'), 'the existing required jobs must stay blocking')
@@ -111,10 +122,14 @@ function fakeTckWorld({ launchDirName = 'launch' }: { launchDirName?: string } =
   const lateLog = join(root, 'late-start.log')
   const latePid = join(root, 'late-start.pid')
   const tckRegistry = join(root, 'tck-registry.txt')
-  for (const dir of [bin, tckDir, reportDir, join(launchCwd, 'dist'), tmpRoot]) {
+  // A valid-looking pinned repository the ambient git repo-selection overrides
+  // point at: unlike the PI_ACP_TCK_DIR checkout it must never be judged.
+  const ambientRepo = join(root, 'ambient-pinned-repo')
+  for (const dir of [bin, tckDir, reportDir, join(launchCwd, 'dist'), tmpRoot, ambientRepo]) {
     mkdirSync(dir, { recursive: true })
   }
   writeFileSync(join(tckDir, 'marker.txt'), 'pinned checkout')
+  writeFileSync(join(ambientRepo, 'marker.txt'), 'ambient pinned repository')
   // The sentinel user state a developer shell may export.
   const sentinelHome = join(root, 'sentinel-home')
   mkdirSync(sentinelHome, { recursive: true })
@@ -125,6 +140,17 @@ function fakeTckWorld({ launchDirName = 'launch' }: { launchDirName?: string } =
 if [ "\${FAKE_GIT_BROKEN:-0}" = "1" ]; then
   echo 'fatal: not a git repository (or any of the parent directories): .git' >&2
   exit 128
+fi
+if [ -n "\${GIT_DIR:-}" ]; then
+  # git's ambient repo-selection override: GIT_DIR redirects rev-parse and
+  # status to that repository instead of the -C checkout. The scrub must keep
+  # this branch unreachable for the probes; it emulates the redirect pointing
+  # at a valid pinned repository.
+  case "$*" in
+    *"rev-parse HEAD"*) echo "${pinnedRevision}"; exit 0 ;;
+    *"status --porcelain"*) exit 0 ;;
+    *) echo "unexpected git call: $*" >&2; exit 1 ;;
+  esac
 fi
 case "$*" in
   *"rev-parse HEAD"*) echo "\${FAKE_GIT_REVISION:-${pinnedRevision}}" ;;
@@ -214,8 +240,15 @@ if (process.env.FAKE_TCK_HANG === '1') {
     else if (variant === 'bad-requirement') writeFileSync(reportPath, JSON.stringify({ ...base, requirements: [{ id: 'X', tier: 'WEIRD', status: 'PASS' }] }))
     else if (variant === 'bad-verdict') writeFileSync(reportPath, JSON.stringify({ ...base, verdict: { conformant, tier_counts: { MANDATORY: { PASS: 'many' } } } }))
     else if (variant === 'empty-counts') writeFileSync(reportPath, JSON.stringify({ ...base, verdict: { ...base.verdict, tier_counts: {} } }))
-    else if (variant === 'missing-tier') writeFileSync(reportPath, JSON.stringify({ ...base, verdict: { ...base.verdict, tier_counts: { MANDATORY: base.verdict.tier_counts.MANDATORY } } }))
-    else if (variant === 'negative-count') writeFileSync(reportPath, JSON.stringify({ ...base, verdict: { ...base.verdict, tier_counts: { ...base.verdict.tier_counts, MANDATORY: { ...base.verdict.tier_counts.MANDATORY, FAIL: -1 } } } }))
+    else if (variant?.startsWith('missing-tier:')) {
+      const removed = variant.slice('missing-tier:'.length)
+      const { [removed]: dropped, ...tierCounts } = base.verdict.tier_counts
+      writeFileSync(reportPath, JSON.stringify({ ...base, verdict: { ...base.verdict, tier_counts: tierCounts } }))
+    }
+    else if (variant?.startsWith('negative-count:')) {
+      const tier = variant.slice('negative-count:'.length)
+      writeFileSync(reportPath, JSON.stringify({ ...base, verdict: { ...base.verdict, tier_counts: { ...base.verdict.tier_counts, [tier]: { ...base.verdict.tier_counts[tier], FAIL: -1 } } } }))
+    }
     else if (process.env.FAKE_TCK_VARIANT === 'partial')
       writeFileSync(reportPath, JSON.stringify({
         protocol_version: 1,
@@ -288,6 +321,7 @@ const record = {
     NODE_OPTIONS: process.env.NODE_OPTIONS,
     PI_MODEL: process.env.PI_MODEL, PI_MANAGED_INSTALL_ROOT: process.env.PI_MANAGED_INSTALL_ROOT,
     PI_PACKAGE_DIR: process.env.PI_PACKAGE_DIR, PI_SESSION_FILE: process.env.PI_SESSION_FILE,
+    GIT_DIR: process.env.GIT_DIR, GIT_WORK_TREE: process.env.GIT_WORK_TREE, GIT_INDEX_FILE: process.env.GIT_INDEX_FILE,
     TMPDIR: process.env.TMPDIR, UV_PROJECT_ENVIRONMENT: process.env.UV_PROJECT_ENVIRONMENT,
     UV_CACHE_DIR: process.env.UV_CACHE_DIR, UV_PYTHON_INSTALL_DIR: process.env.UV_PYTHON_INSTALL_DIR,
     PYTHONDONTWRITEBYTECODE: process.env.PYTHONDONTWRITEBYTECODE,
@@ -353,6 +387,9 @@ setTimeout(() => process.exit(0), 120000)
     PI_MANAGED_INSTALL_ROOT: '/sentinel-managed-root',
     PI_PACKAGE_DIR: '/sentinel-package-dir',
     PI_SESSION_FILE: '/sentinel-session-file',
+    GIT_DIR: join(ambientRepo, '.git'),
+    GIT_WORK_TREE: ambientRepo,
+    GIT_INDEX_FILE: join(ambientRepo, '.git', 'index'),
     TMPDIR: tmpRoot,
     TEMP: tmpRoot,
     TMP: tmpRoot,
@@ -626,7 +663,10 @@ test(
         'PI_MODEL',
         'PI_MANAGED_INSTALL_ROOT',
         'PI_PACKAGE_DIR',
-        'PI_SESSION_FILE'
+        'PI_SESSION_FILE',
+        'GIT_DIR',
+        'GIT_WORK_TREE',
+        'GIT_INDEX_FILE'
       ]) {
         assert.equal(observed.env[key], undefined, `${key} must be scrubbed from the agent environment`)
       }
@@ -702,7 +742,7 @@ test(
   'a missing or malformed TCK report is a runner error with a persistent diagnostic',
   { skip: isWindows ? 'POSIX-only fake shims' : false },
   () => {
-    for (const [name, envAddition, kind] of [
+    const reportVariants: Array<[string, Record<string, string>, string]> = [
       ['no report written', { FAKE_TCK_NO_REPORT: '1', FAKE_TCK_EXIT: '5' }, 'tck-no-report'],
       ['malformed report', { FAKE_TCK_MALFORMED: '1', FAKE_TCK_EXIT: '1' }, 'tck-report-invalid'],
       ['wrong protocol version', { FAKE_TCK_REPORT_VARIANT: 'no-protocol', FAKE_TCK_EXIT: '1' }, 'tck-report-invalid'],
@@ -717,10 +757,25 @@ test(
         'tck-report-invalid'
       ],
       ['non-numeric tier counts', { FAKE_TCK_REPORT_VARIANT: 'bad-verdict', FAKE_TCK_EXIT: '0' }, 'tck-report-invalid'],
-      ['empty tier counts', { FAKE_TCK_REPORT_VARIANT: 'empty-counts', FAKE_TCK_EXIT: '1' }, 'tck-report-invalid'],
-      ['missing tier counts', { FAKE_TCK_REPORT_VARIANT: 'missing-tier', FAKE_TCK_EXIT: '1' }, 'tck-report-invalid'],
-      ['negative tier count', { FAKE_TCK_REPORT_VARIANT: 'negative-count', FAKE_TCK_EXIT: '1' }, 'tck-report-invalid']
-    ] as const) {
+      ['empty tier counts', { FAKE_TCK_REPORT_VARIANT: 'empty-counts', FAKE_TCK_EXIT: '1' }, 'tck-report-invalid']
+    ]
+    // Each tier is validated on its own: removing or corrupting exactly one
+    // tier's counts at a time must fail validation for that tier.
+    for (const tier of ['MANDATORY', 'CAPABILITY', 'ADVISORY', 'INFORMATIONAL']) {
+      reportVariants.push(
+        [
+          `missing ${tier} tier counts`,
+          { FAKE_TCK_REPORT_VARIANT: `missing-tier:${tier}`, FAKE_TCK_EXIT: '1' },
+          'tck-report-invalid'
+        ],
+        [
+          `negative ${tier} tier count`,
+          { FAKE_TCK_REPORT_VARIANT: `negative-count:${tier}`, FAKE_TCK_EXIT: '1' },
+          'tck-report-invalid'
+        ]
+      )
+    }
+    for (const [name, envAddition, kind] of reportVariants) {
       const world = fakeTckWorld()
       try {
         const result = runRunner(world, { env: { ...world.env, ...envAddition } })
@@ -820,6 +875,7 @@ test(
       cleanup?: (world: World) => void
       skip?: boolean
       kind?: string
+      elapsedMs?: number
       match: RegExp
     }> = [
       {
@@ -866,17 +922,20 @@ test(
       },
       {
         // A probe that would succeed, but only after the remaining budget:
-        // the bounded probe must kill it instead of waiting.
+        // the bounded probe must hard-kill it instead of waiting for its answer.
         name: 'delayed-success pi probe outside the budget',
         env: { FAKE_PI_DELAY: '2', PI_ACP_TCK_TIMEOUT_MS: '1500' },
-        match: /budget|pi/
+        match: /did not answer within/,
+        elapsedMs: 4500
       },
       {
-        // A probe that ignores SIGTERM: the hard killSignal must still bound
-        // the probe instead of hanging on the soft signal.
+        // A probe that ignores SIGTERM: only the hard killSignal bounds it, so
+        // the kill must fire at the budget — not at the probe's own 5s expiry
+        // — and the timeout message must stay the discriminating signal.
         name: 'SIGTERM-ignoring pi probe',
         env: { FAKE_PI_IGNORE_TERM: '1', PI_ACP_TCK_TIMEOUT_MS: '1500' },
-        match: /budget|pi/
+        match: /did not answer within/,
+        elapsedMs: 4500
       },
       {
         name: 'unsupported pi version',
@@ -926,6 +985,7 @@ test(
       const world = fakeTckWorld()
       try {
         testCase.prepare?.(world)
+        const started = Date.now()
         const result = runRunner(world, {
           env: { ...world.env, ...(testCase.env ?? {}) },
           timeout: 30_000
@@ -933,6 +993,13 @@ test(
         assert.equal(result.error, undefined, String(result.error))
         assert.equal(result.status, 3, `${testCase.name}: expected setup exit 3\n${result.stdout}\n${result.stderr}`)
         assert.match(result.stderr, testCase.match, testCase.name)
+        if (testCase.elapsedMs !== undefined)
+          assert.ok(
+            Date.now() - started < testCase.elapsedMs,
+            `${testCase.name}: expected the hard-killed probe run to settle in under ${testCase.elapsedMs}ms, took ${
+              Date.now() - started
+            }ms`
+          )
         if (
           !['unwritable report directory', 'report directory path is an existing regular file'].includes(testCase.name)
         ) {
@@ -949,6 +1016,35 @@ test(
         testCase.cleanup?.(world)
         rmSync(world.root, { recursive: true, force: true })
       }
+    }
+  }
+)
+
+test(
+  'ambient GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE overrides cannot redirect the pin and clean probes',
+  { skip: isWindows ? 'POSIX-only fake shims' : false },
+  () => {
+    const world = fakeTckWorld()
+    try {
+      // world.env carries the ambient trio pointing at a valid-looking pinned
+      // repository while the actual PI_ACP_TCK_DIR checkout is unpinned: a
+      // retained override would make the git probes answer for the redirect
+      // and run the unchecked directory green instead of exiting 3.
+      const result = runRunner(world, {
+        env: { ...world.env, FAKE_GIT_REVISION: '0000000000000000000000000000000000000000' },
+        timeout: 30_000
+      })
+      assert.equal(result.error, undefined, String(result.error))
+      assert.equal(
+        result.status,
+        3,
+        `the pin probes must judge PI_ACP_TCK_DIR itself, not the ambient redirect: ${result.stdout}\n${result.stderr}`
+      )
+      assert.match(result.stderr, new RegExp(pinnedRevision), 'the unpinned checkout must be rejected by revision')
+      assert.deepEqual(runnerErrorKinds(world), ['setup-error'])
+      assertScratchCleaned(world)
+    } finally {
+      rmSync(world.root, { recursive: true, force: true })
     }
   }
 )

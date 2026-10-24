@@ -130,6 +130,9 @@ const RUNTIME_INJECTION_KEYS = [
   'NODE_PATH',
   'NODE_COMPILE_CACHE'
 ]
+// Ambient repo-selection overrides would redirect the pin/clean git probes
+// away from PI_ACP_TCK_DIR while uv still runs that unchecked directory.
+const GIT_REPO_SELECTION_KEYS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']
 
 const withoutUntrustedOverrides = env => {
   const scrubbed = {}
@@ -141,6 +144,7 @@ const withoutUntrustedOverrides = env => {
     // Ambient pytest customization (e.g. PYTEST_ADDOPTS=--collect-only) can
     // silently empty the suite while still exiting 0.
     if (key.startsWith('PYTEST_')) continue
+    if (GIT_REPO_SELECTION_KEYS.includes(key)) continue
     if (PROVIDER_NAMESPACES.some(namespace => key.startsWith(namespace))) continue
     if (CREDENTIAL_SUFFIX.test(key)) continue
     if (RUNTIME_INJECTION_KEYS.includes(key)) continue
