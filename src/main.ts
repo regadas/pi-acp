@@ -1,5 +1,5 @@
-import { ndJsonStream } from '@agentclientprotocol/sdk'
-import { createPiAcpAgentApp } from './acp/app.js'
+import { ndJsonStream } from '@agentclientprotocol/sdk/unstable'
+import { createPiAcpProtocolRouter } from './acp/app.js'
 import type { PiAcpAgent } from './acp/agent.js'
 import { createShutdownCoordinator } from './acp/shutdown.js'
 import { buildPiInvocation, getPiCommand } from './pi-rpc/command.js'
@@ -78,7 +78,7 @@ const coordinator = createShutdownCoordinator<PiAcpAgent>({
   }
 })
 
-createPiAcpAgentApp({ onAgent: agent => coordinator.trackAgent(agent) }).connect(stream)
+createPiAcpProtocolRouter({ onAgent: agent => coordinator.trackAgent(agent) }).connect(stream)
 
 const shutdown = () => coordinator.shutdown()
 

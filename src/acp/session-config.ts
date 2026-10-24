@@ -1,4 +1,4 @@
-import { RequestError, type SessionConfigOption } from '@agentclientprotocol/sdk'
+import { RequestError, type SessionConfigOption } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
 import type { PiRpcProcess } from '../pi-rpc/process.js'
 import { piRecord } from '../pi-rpc/protocol.js'

@@ -1,4 +1,4 @@
-import { RequestError, type ToolCallContent } from '@agentclientprotocol/sdk'
+import { RequestError, type ToolCallContent } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
 import type { PiAcpSession } from './session.js'
 import {

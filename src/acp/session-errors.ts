@@ -1,4 +1,4 @@
-import { RequestError } from '@agentclientprotocol/sdk'
+import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import type { PiRpcTermination } from '../pi-rpc/process.js'
 
 export function toRequestError(err: unknown): RequestError {
