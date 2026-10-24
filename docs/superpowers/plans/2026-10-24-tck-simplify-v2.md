@@ -44,21 +44,21 @@ Protected parent-owned plan file. Recapture baseline before each writer. The sta
 
 **Files:** scripts/eval-acp-tck.mjs, scripts/fixtures/acp-tck-agent-bootstrap.mjs (minor trims only), test/unit/acp-tck.test.ts, docs/adapter-reference.md, .github/workflows/ci.yml (only if probe wording/job changes), package.json (no change expected).
 
-- [ ] Capture baseline; rebase `test/acp-tck-diagnostics` onto `origin/main` (7d75d554); resolve conflicts (docs/adapter-reference.md likely; main touched src/acp + docs). Stop and report if conflicts exceed mechanical resolution.
-- [ ] Revert the async probe machinery (pending-close ownership, forced settlement, probe SIGINT/SIGTERM handlers, `PROBE_FORCE_GRACE_MS`) to bounded `spawnSync`/`execFileSync` probes with `timeout: min(PROBE_TIMEOUT_MS, remaining)` and `killSignal: 'SIGKILL'`. Not detached: external signals reach probe children naturally. Keep budget validation before probes.
-- [ ] Keep intact: pin checks, `withoutUntrustedOverrides` env scrub, report validation (all four tiers/counts) and exit/verdict mapping, registry bootstrap + seal + identity revalidation teardown, watchdog, `--cancel-prompt` cancellation exercise, passthrough allowlist, private per-run uv state.
-- [ ] Remove tests that only exercised the removed probe machinery (pipe-holding leader cases, probe interruption case); trim orphaned helpers; adjust any assertions/docs that claimed whole-process-group probe kills. Keep the setup-failure table minus deleted modes.
-- [ ] Focused suite, full `npm run validate`, real pinned v1 TCK on Pi 1.2.0 against a fresh clone; confirm no leaked owned processes. Force-push PR #2; update its body if the description changed materially.
+- [x] Capture baseline; rebase `test/acp-tck-diagnostics` onto `origin/main` (7d75d554); resolve conflicts (docs/adapter-reference.md likely; main touched src/acp + docs). Stop and report if conflicts exceed mechanical resolution.
+- [x] Revert the async probe machinery (pending-close ownership, forced settlement, probe SIGINT/SIGTERM handlers, `PROBE_FORCE_GRACE_MS`) to bounded `spawnSync`/`execFileSync` probes with `timeout: min(PROBE_TIMEOUT_MS, remaining)` and `killSignal: 'SIGKILL'`. Not detached: external signals reach probe children naturally. Keep budget validation before probes.
+- [x] Keep intact: pin checks, `withoutUntrustedOverrides` env scrub, report validation (all four tiers/counts) and exit/verdict mapping, registry bootstrap + seal + identity revalidation teardown, watchdog, `--cancel-prompt` cancellation exercise, passthrough allowlist, private per-run uv state.
+- [x] Remove tests that only exercised the removed probe machinery (pipe-holding leader cases, probe interruption case); trim orphaned helpers; adjust any assertions/docs that claimed whole-process-group probe kills. Keep the setup-failure table minus deleted modes.
+- [x] Focused suite, full `npm run validate`, real pinned v1 TCK on Pi 1.2.0 against a fresh clone; confirm no leaked owned processes. Force-push PR #2; update its body if the description changed materially.
 
 ## Task B: SDK 2.x upgrade + experimental v2 routing (stacked PR)
 
 **Files:** package.json (dependency), src/acp/app.ts (router), src/acp/agent.ts (negotiation + v2 handlers or a v2 sibling module), focused tests under test/; docs/adapter-reference.md (status/features).
 
-- [ ] Branch from the updated `test/acp-tck-diagnostics` (e.g. `feat/acp-v2-routing`). Inspect SDK 2.x changes first (changelog, export layout; reference codex-acp's imports `@agentclientprotocol/sdk/unstable` + `sdk/experimental/v2/unstable`). Stop and report if the v1 builder API is gone rather than relocated.
-- [ ] Upgrade the SDK; adapt imports/types with zero v1 behavior drift (entire existing suite must stay green unchanged in substance).
-- [ ] Add a router that selects the v1 or v2 handler chain from `initialize` (peers' pattern). v2 subset backed by pi RPC: initialize, session/new, list, resume-with-replay, close, delete, prompt, cancel, setConfigOption. Advertise honestly; reject non-empty mcpServers on v2 exactly as v1 does.
-- [ ] Add focused v2 tests: negotiation both directions, one v2 session lifecycle (new → prompt via deterministic local provider → cancel path or close), v2 config option, and a v1 regression pin. No provider network.
-- [ ] Full `npm run validate`; confirm `eval:tck` (v1) still green on the stacked branch; open the stacked PR (base = test/acp-tck-diagnostics).
+- [x] Branch from the updated `test/acp-tck-diagnostics` (e.g. `feat/acp-v2-routing`). Inspect SDK 2.x changes first (changelog, export layout; reference codex-acp's imports `@agentclientprotocol/sdk/unstable` + `sdk/experimental/v2/unstable`). Stop and report if the v1 builder API is gone rather than relocated.
+- [x] Upgrade the SDK; adapt imports/types with zero v1 behavior drift (entire existing suite must stay green unchanged in substance).
+- [x] Add a router that selects the v1 or v2 handler chain from `initialize` (peers' pattern). v2 subset backed by pi RPC: initialize, session/new, list, resume-with-replay, close, delete, prompt, cancel, setConfigOption. Advertise honestly; reject non-empty mcpServers on v2 exactly as v1 does.
+- [x] Add focused v2 tests: negotiation both directions, one v2 session lifecycle (new → prompt via deterministic local provider → cancel path or close), v2 config option, and a v1 regression pin. No provider network.
+- [x] Full `npm run validate`; confirm `eval:tck` (v1) still green on the stacked branch; open the stacked PR (base = test/acp-tck-diagnostics).
 
 ## Stop conditions
 
@@ -69,8 +69,10 @@ Protected parent-owned plan file. Recapture baseline before each writer. The sta
 
 ## Parent acceptance / review sequence
 
-- [ ] Inspect both handoffs and diffs; recapture NUL-safe baselines; run/confirm validation evidence (including real pinned v1 TCK on the final stacked head).
-- [ ] Fresh full-mode review: Sol/xhigh (correctness), Opus/medium (architecture/lifecycle), Sonnet/xhigh (tests), Gemini/high (operability) — each receives both PR diffs (A: branch vs origin/main, plus the simplification delta vs the pre-simplify snapshot; B: stacked branch vs A's branch) and returns per-target findings.
-- [ ] Verify seat model/effort/family from native receipts; adjudicate on source/runtime evidence, no votes-as-proof.
-- [ ] One fix worker applies only accepted findings (lane C), recapturing the baseline first; targeted retained-seat verification of fixes and blast radius; cap at two fix rounds this cycle.
-- [ ] Record receipts (routing, wall time, reported cost, dispositions); leave both PRs open for user merge; do not merge or close anything without the user.
+- [x] Inspect both handoffs and diffs; recapture NUL-safe baselines; run/confirm validation evidence (including real pinned v1 TCK on the final stacked head).
+- [x] Fresh full-mode review: Sol/xhigh (correctness), Opus/medium (architecture/lifecycle), Sonnet/xhigh (tests), Gemini/high (operability) — each receives both PR diffs (A: branch vs origin/main, plus the simplification delta vs the pre-simplify snapshot; B: stacked branch vs A's branch) and returns per-target findings.
+- [x] Verify seat model/effort/family from native receipts; adjudicate on source/runtime evidence, no votes-as-proof.
+- [x] One fix worker applies only accepted findings (lane C), recapturing the baseline first; targeted retained-seat verification of fixes and blast radius; cap at two fix rounds this cycle.
+- [x] Record receipts (routing, wall time, reported cost, dispositions); leave both PRs open for user merge; do not merge or close anything without the user.
+
+Execution note: the fix/verify loop ran three bounded rounds (two planned; the third was authorized under the policy's three-round default to close P1 regressions introduced by the second round). Dispositions: `/tmp/pi-acp-parity-review/round{1,2,3}-disposition.md`; final heads PR #2 `c1fe9e4`, PR #3 `75c1740`.
