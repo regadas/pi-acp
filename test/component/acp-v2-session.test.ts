@@ -247,22 +247,27 @@ test('v2 resume with replayFrom start replays history through the v2 shapes', as
     )
     assert.ok(resumed.configOptions?.some(option => option.configId === 'model'))
 
-    const userChunks = received('user_message_chunk')
-    assert.equal(userChunks.length, 1)
-    assert.equal((userChunks[0]!.update as { content: { text: string } }).content.text, 'Hello')
+    const userMessages = received('user_message')
+    assert.equal(userMessages.length, 1)
+    assert.deepEqual((userMessages[0]!.update as { content: Array<{ type: string; text: string }> }).content, [
+      { type: 'text', text: 'Hello' }
+    ])
 
-    const agentChunks = received('agent_message_chunk')
-    assert.equal(agentChunks.length, 1)
-    assert.equal((agentChunks[0]!.update as { content: { text: string } }).content.text, 'Hi there')
+    const agentMessages = received('agent_message')
+    assert.equal(agentMessages.length, 1)
+    assert.deepEqual((agentMessages[0]!.update as { content: Array<{ type: string; text: string }> }).content, [
+      { type: 'text', text: 'Hi there' }
+    ])
+    assert.match((userMessages[0]!.update as { messageId: string }).messageId, /^replay:/)
     assert.notEqual(
-      (userChunks[0]!.update as { messageId: string }).messageId,
-      (agentChunks[0]!.update as { messageId: string }).messageId
+      (userMessages[0]!.update as { messageId: string }).messageId,
+      (agentMessages[0]!.update as { messageId: string }).messageId
     )
 
     // The current-state snapshot follows the replay and precedes the response.
     const idle = received('state_update').find(update => (update.update as { state: string }).state === 'idle')
     assert.ok(idle, 'idle snapshot after resume')
-    assert.ok(updates.indexOf(idle!) > updates.indexOf(agentChunks[0]!))
+    assert.ok(updates.indexOf(idle!) > updates.indexOf(agentMessages[0]!))
   } finally {
     conn.close()
     proc.restore()
@@ -541,7 +546,7 @@ test('v2 prompt followed immediately by cancel: cancelled, no full turn', async 
 test('v2 prompt followed immediately by close: acknowledged without a respawned full turn', async () => {
   const proc = patchSpawn(fakeState('v2-close-race'))
   proc.terminateOnDispose = true
-  const { conn, received } = connectV2()
+  const { conn, updates } = connectV2()
   try {
     await initialize(conn)
     await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
@@ -553,12 +558,20 @@ test('v2 prompt followed immediately by close: acknowledged without a respawned 
     const close = conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-close-race' })
     const [response] = await Promise.all([withTimeout(prompt, 'prompt under close'), withTimeout(close, 'close')])
 
+    // The wire AT the moment the close acknowledges — not post-hoc state:
+    // the cancelled turn's final updates must already have arrived.
+    const atAcknowledgement = updates.slice()
     assert.equal(typeof response.messageId, 'string')
-    // The cancelled turn's idle was flushed before the close was acknowledged.
-    const idle = received('state_update').find(update => (update.update as { state: string }).state === 'idle')
-    assert.ok(idle, 'idle flushed before the close response')
-    assert.equal((idle!.update as { stopReason?: string }).stopReason, 'cancelled')
-    assert.equal(received('agent_message_chunk').length, 0, 'no full turn ran')
+    const idle = atAcknowledgement
+      .map(update => update.update as { sessionUpdate: string; state?: string; stopReason?: string })
+      .find(update => update.sessionUpdate === 'state_update' && update.state === 'idle')
+    assert.ok(idle, 'the cancelled turn flushed its idle state before the close acknowledged')
+    assert.equal(idle!.stopReason, 'cancelled')
+    assert.equal(
+      atAcknowledgement.filter(update => update.update.sessionUpdate === 'agent_message_chunk').length,
+      0,
+      'no full turn ran'
+    )
     const promptsAtClose = proc.prompts.length
     await new Promise(resolve => setTimeout(resolve, 25))
     assert.equal(proc.prompts.length, promptsAtClose, 'no session respawn or further dispatch after close')
@@ -672,14 +685,27 @@ test('v2 edit tool updates translate the structured diff with a git patch', asyn
   }
 })
 
-test('v2 replay message ids are deterministic and adjacent same-kind entries stay separate', async () => {
+test('v2 replay: one message per retained entry, deterministic ids, and repeat replays replace instead of duplicating', async () => {
   const proc = patchSpawn(fakeState('s1'))
   proc.terminateOnDispose = true
-  // Two adjacent user entries followed by an assistant entry.
+  // Two adjacent user entries — the second carries text and an image —
+  // followed by an assistant entry.
   proc.entrySnapshot = {
     entries: [
       { id: 'e1', parentId: null, timestamp: '', type: 'message', message: { role: 'user', content: 'Hello' } },
-      { id: 'e2', parentId: 'e1', timestamp: '', type: 'message', message: { role: 'user', content: 'Second' } },
+      {
+        id: 'e2',
+        parentId: 'e1',
+        timestamp: '',
+        type: 'message',
+        message: {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Second' },
+            { type: 'image', data: 'aGk=', mimeType: 'image/png' }
+          ]
+        }
+      },
       {
         id: 'e3',
         parentId: 'e2',
@@ -695,21 +721,20 @@ test('v2 replay message ids are deterministic and adjacent same-kind entries sta
   const { conn, updates } = connectV2(agent => {
     activeAgent = agent
   })
-  // Chunk ids captured per replay window, waiting for each window's chunks
-  // to arrive so notification delivery lag cannot mix the windows.
-  const windowIds = async (replay: () => Promise<unknown>): Promise<Array<[string, string]>> => {
+  // Message upserts captured per replay window, waiting for each window's
+  // messages to arrive so notification delivery lag cannot mix the windows.
+  const isUpsert = (update: Update) =>
+    update.update.sessionUpdate === 'user_message' ||
+    update.update.sessionUpdate === 'agent_message' ||
+    update.update.sessionUpdate === 'agent_thought'
+  const windowUpserts = async (replay: () => Promise<unknown>): Promise<Array<Record<string, unknown>>> => {
     const from = updates.length
     await withTimeout(replay(), 'replay')
-    await waitFor(
-      () => updates.slice(from).filter(update => update.update.sessionUpdate.endsWith('_chunk')).length >= 3,
-      'replayed chunks'
-    )
+    await waitFor(() => updates.slice(from).filter(isUpsert).length >= 3, 'replayed messages')
     return updates
       .slice(from)
-      .filter(update => update.update.sessionUpdate.endsWith('_chunk'))
-      .map(
-        update => [update.update.sessionUpdate, (update.update as { messageId: string }).messageId] as [string, string]
-      )
+      .filter(isUpsert)
+      .map(update => update.update as Record<string, unknown>)
   }
   try {
     await initialize(conn)
@@ -731,19 +756,213 @@ test('v2 replay message ids are deterministic and adjacent same-kind entries sta
         replayFrom: { type: 'start' }
       })
 
-    const firstIds = await windowIds(replay)
-    const secondIds = await windowIds(replay)
+    const first = await windowUpserts(replay)
+    const second = await windowUpserts(replay)
 
-    // Replaying the same history twice yields identical ids.
-    assert.deepEqual(secondIds, firstIds)
-    assert.deepEqual(firstIds, [
-      ['user_message_chunk', 'replay:user_message_chunk:0'],
-      ['user_message_chunk', 'replay:user_message_chunk:1'],
-      ['agent_message_chunk', 'replay:agent_message_chunk:0']
+    // One message per retained entry: the text+image entry is a single user
+    // message carrying both blocks, adjacent user entries stay separate
+    // messages, and the ids are the entries' identities.
+    assert.deepEqual(first, [
+      { sessionUpdate: 'user_message', messageId: 'replay:e1', content: [{ type: 'text', text: 'Hello' }] },
+      {
+        sessionUpdate: 'user_message',
+        messageId: 'replay:e2',
+        content: [
+          { type: 'text', text: 'Second' },
+          { type: 'image', data: 'aGk=', mimeType: 'image/png' }
+        ]
+      },
+      { sessionUpdate: 'agent_message', messageId: 'replay:e3', content: [{ type: 'text', text: 'Hi there' }] }
     ])
-    // Adjacent same-kind entries never merge: the two user entries carry
-    // distinct ids.
-    assert.notEqual(firstIds[0]![1], firstIds[1]![1])
+    // Replaying the same history again re-sends it under the same ids: v2
+    // message upserts replace a message's content as a whole, so the client
+    // ends up with one copy instead of a duplicate — chunk updates, which
+    // append, must never carry the replayed history.
+    assert.deepEqual(second, first)
+    assert.equal(
+      updates.filter(update => update.update.sessionUpdate.endsWith('_chunk')).length,
+      0,
+      'replayed history never arrives as chunk updates'
+    )
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 replay: overlapping resume windows keep the replay translation until the last window closes', async () => {
+  const proc = patchSpawn(fakeState('s1'))
+  proc.terminateOnDispose = true
+  proc.entrySnapshot = {
+    entries: [
+      { id: 'e1', parentId: null, timestamp: '', type: 'message', message: { role: 'user', content: 'Hello' } },
+      {
+        id: 'e2',
+        parentId: 'e1',
+        timestamp: '',
+        type: 'message',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }] }
+      }
+    ],
+    leafId: 'e2'
+  }
+
+  let activeAgent: PiAcpAgent | null = null
+  const { conn, updates } = connectV2(agent => {
+    activeAgent = agent
+  })
+  try {
+    await initialize(conn)
+    assert.ok(activeAgent)
+    ;(activeAgent as unknown as { store: unknown }).store = {
+      get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: SESSION_FILE, updatedAt: new Date().toISOString() }),
+      upsert() {}
+    }
+
+    // Two concurrent resume-with-replay requests: the engine admits one
+    // load and supersedes the other, but both replay windows are open while
+    // they settle — the loser's window end must not close the winner's.
+    const [first, second] = await Promise.allSettled([
+      conn.agent.request(v2.methods.agent.session.resume, {
+        sessionId: 's1',
+        cwd: TEST_CWD,
+        replayFrom: { type: 'start' }
+      }),
+      conn.agent.request(v2.methods.agent.session.resume, {
+        sessionId: 's1',
+        cwd: TEST_CWD,
+        replayFrom: { type: 'start' }
+      })
+    ])
+    assert.equal(
+      [first, second].filter(result => result.status === 'fulfilled').length,
+      1,
+      'exactly one load wins; the superseded one rejects'
+    )
+    await waitFor(
+      () => updates.filter(update => update.update.sessionUpdate === 'user_message').length >= 1,
+      'replayed user message'
+    )
+    // Whatever settled, the replayed history arrived as message upserts with
+    // replay ids — an early window close would have re-shaped it as live
+    // chunk updates with fresh UUID ids.
+    const replayed = updates.filter(update =>
+      ['user_message', 'agent_message', 'agent_thought'].includes(update.update.sessionUpdate)
+    )
+    assert.ok(replayed.length >= 2)
+    assert.ok(replayed.every(update => /^replay:/.test((update.update as { messageId: string }).messageId)))
+    assert.equal(
+      updates.filter(update => update.update.sessionUpdate.endsWith('_chunk')).length,
+      0,
+      'replayed history never arrives as chunk updates'
+    )
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 bare close then prompt, with no resume: the fence clears and a lazily restored full turn runs', async () => {
+  // A restore through the real store validates the JSONL header, so the
+  // session file carries the header pi itself would have written.
+  const pinFile = join(tmpdir(), 'pi-acp-v2-pin-sess.jsonl')
+  writeFileSync(
+    pinFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'v2-pin',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      cwd: TEST_CWD
+    }) + '\n'
+  )
+  const proc = patchSpawn(fakeState('v2-pin', pinFile))
+  proc.terminateOnDispose = true
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+    const first = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-pin',
+      prompt: [{ type: 'text', text: 'first' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'first prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    await withTimeout(first, 'first prompt')
+
+    await withTimeout(conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-pin' }), 'close')
+
+    // No resume: the close's own settle cleared the fence, and the prompt to
+    // the stored session runs a full turn through the engine's lazy restore
+    // — the same shape v1 has after a close.
+    const second = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-pin',
+      prompt: [{ type: 'text', text: 'second' }]
+    })
+    await waitFor(() => proc.prompts.length === 2, 'lazily restored prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'again' } })
+    proc.emit({ type: 'agent_settled' })
+    const response = await withTimeout(second, 'prompt after bare close')
+    assert.equal(typeof response.messageId, 'string')
+    const idles = received('state_update').filter(update => (update.update as { state: string }).state === 'idle')
+    assert.equal((idles[idles.length - 1]!.update as { stopReason?: string }).stopReason, 'end_turn')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 close completing while a stored-session prompt validates fails the prompt closed without a respawn', async () => {
+  const raceFile = join(tmpdir(), 'pi-acp-v2-race-sess.jsonl')
+  writeFileSync(
+    raceFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'v2-race',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      cwd: TEST_CWD
+    }) + '\n'
+  )
+  const proc = patchSpawn(fakeState('v2-race', raceFile))
+  proc.terminateOnDispose = true
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+    const first = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-race',
+      prompt: [{ type: 'text', text: 'first' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'first prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    await withTimeout(first, 'first prompt')
+    await withTimeout(conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-race' }), 'close')
+
+    // The prompt's stored-session validation awaits a real repository read;
+    // a close completing inside that window owns the session, so the prompt
+    // must fail closed instead of restoring behind the acknowledged close.
+    const second = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-race',
+      prompt: [{ type: 'text', text: 'late' }]
+    })
+    const closing = conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-race' })
+    await assert.rejects(
+      () => withTimeout(second, 'prompt racing a close'),
+      (err: unknown) => {
+        assert.equal((err as { code?: number }).code, -32800)
+        return true
+      }
+    )
+    assert.deepEqual(await withTimeout(closing, 'racing close'), {})
+    assert.equal(received('user_message').length, 1, 'the racing prompt never echoed')
+    const promptsAtRace = proc.prompts.length
+    await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(proc.prompts.length, promptsAtRace, 'no lazy-restore respawn behind the acknowledged close')
+    assert.equal(proc.disposeCount, 1, 'no second session lifetime behind the acknowledged close')
   } finally {
     conn.close()
     proc.restore()

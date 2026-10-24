@@ -1,5 +1,6 @@
-import { RequestError, type ToolCallContent } from '@agentclientprotocol/sdk/unstable'
+import { RequestError, type ToolCallContent, type SessionUpdate } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
+import { replayEntryId } from './replay-entry-id.js'
 import type { PiAcpSession } from './session.js'
 import {
   translateAssistantContent,
@@ -27,6 +28,15 @@ type ReplayOptions = {
   supportsTerminalOutputMeta: boolean
   assertActive(): void
   sendUpdate(update: Parameters<AcpClient['sessionUpdate']>[0]): Promise<void>
+}
+
+/**
+ * Attach the retained entry's identity to one of its chunk updates, so the
+ * v2 chain can group the entry into a single message (see replayEntryId).
+ */
+function ofEntry(entryId: string, update: SessionUpdate): SessionUpdate {
+  ;(update as SessionUpdate & { [replayEntryId]?: string })[replayEntryId] = entryId
+  return update
 }
 
 export async function replaySessionHistory({
@@ -117,13 +127,13 @@ export async function replaySessionHistory({
       for (const block of translateUserContent(m?.content)) {
         await sendUpdate({
           sessionId: session.sessionId,
-          update: {
+          update: ofEntry(entryId, {
             sessionUpdate: 'user_message_chunk',
             content:
               block.kind === 'text'
                 ? { type: 'text', text: block.text }
                 : { type: 'image', data: block.data, mimeType: block.mimeType }
-          }
+          })
         })
       }
       continue
@@ -134,10 +144,10 @@ export async function replaySessionHistory({
         if (block.kind === 'text') {
           await sendUpdate({
             sessionId: session.sessionId,
-            update: {
+            update: ofEntry(entryId, {
               sessionUpdate: 'agent_message_chunk',
               content: { type: 'text', text: block.text }
-            }
+            })
           })
           continue
         }
@@ -145,10 +155,10 @@ export async function replaySessionHistory({
         if (block.kind === 'thinking') {
           await sendUpdate({
             sessionId: session.sessionId,
-            update: {
+            update: ofEntry(entryId, {
               sessionUpdate: 'agent_thought_chunk',
               content: { type: 'text', text: block.text }
-            }
+            })
           })
           continue
         }
@@ -195,13 +205,13 @@ export async function replaySessionHistory({
       for (const block of translateCustomMessageContent(m?.content)) {
         await sendUpdate({
           sessionId: session.sessionId,
-          update: {
+          update: ofEntry(entryId, {
             sessionUpdate: 'agent_message_chunk',
             content:
               block.kind === 'text'
                 ? { type: 'text', text: block.text }
                 : { type: 'image', data: block.data, mimeType: block.mimeType }
-          }
+          })
         })
       }
       continue

@@ -29,15 +29,22 @@ import {
  * request: the first admission emits `running`, the last settlement emits the
  * `idle` snapshot), so pipelined prompts produce no false idle between
  * turns. Each prompt echoes its `user_message` and settles with its own final
- * state, flushed only when the last in-flight prompt settles. The engine
- * serializes the turns themselves; prompt handlers are admitted immediately
- * so a following cancel or close reaches the engine in the same tick.
+ * state, flushed only when the last in-flight prompt settles. close/delete
+ * await every prompt's finalization — turn settled and final updates flushed
+ * — before acknowledging. The engine serializes the turns themselves; prompt
+ * handlers are admitted immediately so a following cancel or close reaches
+ * the engine in the same tick.
  */
 export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null) => void }): v2.AgentApp {
   let active: PiAcpAgent | null = null
   let conn: V2ClientConnection | null = null
   let initializeState: 'uninitialized' | 'initializing' | 'initialized' = 'uninitialized'
-  const promptTails = new Map<string, Promise<void>>()
+  /**
+   * Each in-flight prompt's wrapper finalization — its turn settled and its
+   * final updates flushed. close/delete await them, so the last idle state
+   * precedes the acknowledgement.
+   */
+  const promptTails = new Map<string, Set<Promise<void>>>()
   /** In-flight prompt count per session; the session is foreground-busy while above zero. */
   const promptCounts = new Map<string, number>()
   /** Final state updates of prompts that settled while others still run; flushed when the count reaches zero. */
@@ -45,11 +52,18 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
   /**
    * Sessions with a close/delete still in flight, mirroring the engine's
    * transient fence: a prompt whose insertion the close/delete would prevent
-   * answers with request-cancelled, without an echo. Cleared when the
-   * close/delete settles and on successful resume, so the fence never
-   * outlives the operation it guards.
+   * answers with request-cancelled, without an echo. Cleared only by the
+   * operation that set it, so the fence never outlives its close and never
+   * drops early under an overlapping close/delete or resume.
    */
   const closingSessions = new Set<string>()
+  /**
+   * Close/delete generation per session, bumped when one starts and never
+   * cleared: a prompt validating a stored-but-not-live session snapshots it
+   * before its await, so a close completing during that window fails the
+   * prompt closed instead of restoring behind the acknowledged close.
+   */
+  const closeGenerations = new Map<string, number>()
 
   const getAgent = (): PiAcpAgent => {
     if (!active) throw RequestError.internalError({}, 'pi-acp agent is not connected')
@@ -110,6 +124,7 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       promptCounts.clear()
       pendingFinals.clear()
       closingSessions.clear()
+      closeGenerations.clear()
       opts?.onAgent?.(agent)
 
       connection.signal.addEventListener(
@@ -158,12 +173,9 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       const response =
         restore.method === 'resume'
           ? await agent.resumeSession(restore.request)
-          : // Replay runs inside a replay window so replayed chunks get
-            // deterministic message ids (see V2ClientConnection).
+          : // Replay runs inside a replay window so replayed entries become
+            // deterministic message upserts (see V2ClientConnection).
             await getConnection().replaying(ctx.params.sessionId, () => agent.loadSession(restore.request))
-      // A successful resume re-establishes the session: any stale close fence
-      // for it must not outlive the operation that set it.
-      closingSessions.delete(ctx.params.sessionId)
       // v2 requires a current-state snapshot after any replay and before the
       // response: a prompt of this connection still running is foreground work.
       const state = (promptCounts.get(ctx.params.sessionId) ?? 0) > 0 ? 'running' : 'idle'
@@ -172,25 +184,33 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
     })
     .onRequest(v2.methods.agent.session.close, async ctx => {
       const agent = getInitializedAgent()
-      closingSessions.add(ctx.params.sessionId)
+      const sessionId = ctx.params.sessionId
+      closingSessions.add(sessionId)
+      const generation = (closeGenerations.get(sessionId) ?? 0) + 1
+      closeGenerations.set(sessionId, generation)
       try {
-        await agent.closeSession({ sessionId: ctx.params.sessionId })
-        // Let cancelled prompts emit their final updates and idle state before
-        // the close is acknowledged.
-        await promptTails.get(ctx.params.sessionId)
+        await agent.closeSession({ sessionId })
+        // Every prompt's wrapper finalization — its turn settled and its final
+        // updates flushed — precedes this acknowledgement.
+        await Promise.all(promptTails.get(sessionId) ?? [])
       } finally {
-        closingSessions.delete(ctx.params.sessionId)
+        // The fence ends with this operation; a newer close/delete still in
+        // flight keeps it up.
+        if (closeGenerations.get(sessionId) === generation) closingSessions.delete(sessionId)
       }
       return {}
     })
     .onRequest(v2.methods.agent.session.delete, async ctx => {
       const agent = getInitializedAgent()
-      closingSessions.add(ctx.params.sessionId)
+      const sessionId = ctx.params.sessionId
+      closingSessions.add(sessionId)
+      const generation = (closeGenerations.get(sessionId) ?? 0) + 1
+      closeGenerations.set(sessionId, generation)
       try {
-        await agent.deleteSession({ sessionId: ctx.params.sessionId })
-        await promptTails.get(ctx.params.sessionId)
+        await agent.deleteSession({ sessionId })
+        await Promise.all(promptTails.get(sessionId) ?? [])
       } finally {
-        closingSessions.delete(ctx.params.sessionId)
+        if (closeGenerations.get(sessionId) === generation) closingSessions.delete(sessionId)
       }
       return {}
     })
@@ -210,8 +230,20 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       if (closingSessions.has(sessionId)) {
         throw RequestError.requestCancelled({}, `session closed while prompting: ${sessionId}`)
       }
-      if (!agent.hasLiveSession(sessionId) && !(await agent.hasStoredSession(sessionId))) {
-        throw RequestError.resourceNotFound(sessionId)
+      if (!agent.hasLiveSession(sessionId)) {
+        // Stored-but-not-live: the validation await is a race window, so the
+        // close generation is snapshotted before it and re-checked after — a
+        // close/delete completing during the window owns the session and this
+        // prompt fails closed instead of restoring behind its acknowledgement.
+        // (A cancel landing in the same window has no turn to reach yet; that
+        // narrow loss is a documented residual.)
+        const closeGeneration = closeGenerations.get(sessionId) ?? 0
+        if (!(await agent.hasStoredSession(sessionId))) {
+          throw RequestError.resourceNotFound(sessionId)
+        }
+        if (closeGenerations.get(sessionId) !== closeGeneration) {
+          throw RequestError.requestCancelled({}, `session closed while prompting: ${sessionId}`)
+        }
       }
       const messageId = randomUUID()
       const wasIdle = (promptCounts.get(sessionId) ?? 0) === 0
@@ -225,11 +257,10 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
         ? send(sessionId, { sessionUpdate: 'state_update', state: 'running' } as v2.SessionUpdate)
         : null
       const turn = runPromptWithCancellation(agent, v1PromptRequest(ctx.params), ctx.signal)
-      await echo
-      if (running) await running
-      // Inserted: the request itself never rejects from here on — the turn's
-      // outcome, failure included, is reported only through the idle snapshot.
-      const final = await turn.then(
+      // Handle the turn's outcome from this tick on: a turn that settles or
+      // fails while the sends above are still queued (client backpressure)
+      // must never sit unhandled.
+      const final = turn.then(
         response =>
           ({
             sessionUpdate: 'state_update',
@@ -244,8 +275,25 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
             error: jsonRpcError(error)
           }) as v2.SessionUpdate
       )
-      await settlePrompt(sessionId, final)
-      return { messageId }
+      const tails = promptTails.get(sessionId) ?? new Set<Promise<void>>()
+      promptTails.set(sessionId, tails)
+      // The wrapper's full finalization — turn settled and its final updates
+      // flushed — is what close/delete await before acknowledging.
+      const tail = (async () => {
+        await echo
+        if (running) await running
+        await settlePrompt(sessionId, await final)
+      })()
+      tails.add(tail)
+      try {
+        await tail
+        // Inserted: the request itself never rejects from here on — the turn's
+        // outcome, failure included, is reported only through the idle snapshot.
+        return { messageId }
+      } finally {
+        tails.delete(tail)
+        if (tails.size === 0) promptTails.delete(sessionId)
+      }
     })
     .onNotification(v2.methods.agent.session.cancel, ctx => getInitializedAgent().cancel(ctx.params))
 }

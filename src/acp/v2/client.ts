@@ -9,6 +9,16 @@ import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
 import { randomUUID } from 'node:crypto'
 import type { AcpClient, RequestOptions } from '../client.js'
 import { chunkUpdateKind, toV1PermissionResponse, toV2PermissionRequest, toV2SessionUpdate } from './translate.js'
+import { replayEntryId } from '../replay-entry-id.js'
+
+type ChunkKind = ReturnType<typeof chunkUpdateKind> extends infer K | null ? K : never
+
+/** The v2 message upsert a replayed entry's chunks accumulate into. */
+const UPSERT_OF_CHUNK_KIND: Record<ChunkKind, 'user_message' | 'agent_message' | 'agent_thought'> = {
+  user_message_chunk: 'user_message',
+  agent_message_chunk: 'agent_message',
+  agent_thought_chunk: 'agent_thought'
+}
 
 /**
  * The {@link AcpClient} of an ACP v2 connection: it delivers the v1 session
@@ -22,54 +32,102 @@ import { chunkUpdateKind, toV1PermissionResponse, toV2PermissionRequest, toV2Ses
  * match the id its later replay uses — a documented association limitation
  * (see docs/adapter-reference.md).
  *
- * Inside a {@link replaying} window, replayed chunks each become their own
- * message (adjacent same-kind history entries never merge) with ids
- * deterministic in their position: replaying the same history twice yields
- * identical ids, and ids stay stable while earlier history is unchanged.
+ * Inside {@link replaying} windows, replayed history is delivered as v2
+ * message upserts, one message per retained entry (its chunks grouped),
+ * carrying the deterministic id `replay:<entryId>`. v2 message updates
+ * replace a message's content as a whole, so replaying the same history
+ * again re-sends it under the same ids without duplicating what the client
+ * already holds.
  */
 export class V2ClientConnection implements AcpClient {
   private readonly currentMessage = new Map<string, { kind: string; id: string }>()
-  /** Sessions whose history is being replayed right now. */
-  private readonly replays = new Set<string>()
-  /** Replay chunk counters per session and kind; the key of the next replay message id. */
-  private readonly replayCounts = new Map<string, Map<string, number>>()
+  /** Open replaying windows per session (depth: windows may overlap while a superseded restore settles). */
+  private readonly replayDepth = new Map<string, number>()
+  /** The retained entry whose chunks are accumulating into one message right now. */
+  private readonly replayEntries = new Map<string, { entryId: string; kind: ChunkKind; content: v2.ContentBlock[] }>()
 
   constructor(private readonly ctx: v2.AgentContext) {}
 
   async sessionUpdate(params: SessionNotification): Promise<void> {
+    const sessionId = params.sessionId
     const kind = chunkUpdateKind(params.update)
-    let update: v2.SessionUpdate | undefined
-    if (this.replays.has(params.sessionId)) {
-      // Replayed chunks never group: each is one message, with a
-      // position-stable id so repeated replays reuse it.
-      update =
-        kind !== null
-          ? toV2SessionUpdate(params.update, this.replayMessageId(params.sessionId, kind))
-          : toV2SessionUpdate(params.update, undefined)
-    } else {
-      if (kind === null) {
-        this.currentMessage.delete(params.sessionId)
-      }
-      const messageId = kind !== null ? this.messageIdFor(params.sessionId, kind) : undefined
-      update = toV2SessionUpdate(params.update, messageId)
+    if ((this.replayDepth.get(sessionId) ?? 0) > 0) {
+      await this.replayUpdate(sessionId, kind, params.update)
+      return
     }
-    if (update !== undefined)
-      await this.ctx.notify(v2.methods.client.session.update, { sessionId: params.sessionId, update })
+    if (kind === null) {
+      this.currentMessage.delete(sessionId)
+    }
+    const messageId = kind !== null ? this.messageIdFor(sessionId, kind) : undefined
+    const update = toV2SessionUpdate(params.update, messageId)
+    if (update !== undefined) await this.ctx.notify(v2.methods.client.session.update, { sessionId, update })
+  }
+
+  /**
+   * A replayed update: the chunks of one retained entry accumulate into
+   * that entry's single message; any other update (or the next entry) first
+   * completes the buffered one. Markerless chunks — none exist today — fall
+   * back to the live grouping.
+   */
+  private async replayUpdate(
+    sessionId: string,
+    kind: ChunkKind | null,
+    update: Parameters<AcpClient['sessionUpdate']>[0]['update']
+  ): Promise<void> {
+    const entryId = kind !== null ? (update as typeof update & { [replayEntryId]?: string })[replayEntryId] : undefined
+    if (kind !== null && typeof entryId === 'string') {
+      const current = this.replayEntries.get(sessionId)
+      if (current && (current.entryId !== entryId || current.kind !== kind)) {
+        await this.flushReplayEntry(sessionId)
+      }
+      const entry = this.replayEntries.get(sessionId) ?? { entryId, kind, content: [] as v2.ContentBlock[] }
+      entry.content.push((toV2SessionUpdate(update, `replay:${entryId}`) as { content: v2.ContentBlock }).content)
+      this.replayEntries.set(sessionId, entry)
+      return
+    }
+    await this.flushReplayEntry(sessionId)
+    const messageId = kind !== null ? this.messageIdFor(sessionId, kind) : undefined
+    const translated = toV2SessionUpdate(update, messageId)
+    if (translated !== undefined)
+      await this.ctx.notify(v2.methods.client.session.update, { sessionId, update: translated })
+  }
+
+  /** Emit the buffered entry as its v2 message upsert, with the entry's full content. */
+  private async flushReplayEntry(sessionId: string): Promise<void> {
+    const entry = this.replayEntries.get(sessionId)
+    if (!entry) return
+    this.replayEntries.delete(sessionId)
+    await this.ctx.notify(v2.methods.client.session.update, {
+      sessionId,
+      update: {
+        sessionUpdate: UPSERT_OF_CHUNK_KIND[entry.kind],
+        messageId: `replay:${entry.entryId}`,
+        content: entry.content
+      } as v2.SessionUpdate
+    })
   }
 
   /**
    * Runs `restore`, which replays the history of `sessionId`, inside a replay
-   * window: replayed chunks get deterministic per-position message ids.
+   * window: replayed entries become deterministic message upserts. Windows
+   * may overlap while a superseded restore settles; the depth keeps the
+   * inner window's end from closing the outer one's.
    */
   async replaying<T>(sessionId: string, restore: () => Promise<T>): Promise<T> {
-    this.replays.add(sessionId)
-    this.replayCounts.delete(sessionId)
+    this.replayDepth.set(sessionId, (this.replayDepth.get(sessionId) ?? 0) + 1)
     this.currentMessage.delete(sessionId)
     try {
       return await restore()
     } finally {
-      this.replays.delete(sessionId)
-      this.replayCounts.delete(sessionId)
+      // Only the last window's end completes the history and closes the
+      // replay mode — an inner (superseded) window's end must not.
+      const depth = (this.replayDepth.get(sessionId) ?? 1) - 1
+      if (depth === 0) {
+        this.replayDepth.delete(sessionId)
+        await this.flushReplayEntry(sessionId)
+      } else {
+        this.replayDepth.set(sessionId, depth)
+      }
       this.currentMessage.delete(sessionId)
     }
   }
@@ -111,16 +169,5 @@ export class V2ClientConnection implements AcpClient {
     const entry = { kind, id: randomUUID() }
     this.currentMessage.set(sessionId, entry)
     return entry.id
-  }
-
-  private replayMessageId(sessionId: string, kind: string): string {
-    let counts = this.replayCounts.get(sessionId)
-    if (!counts) {
-      counts = new Map()
-      this.replayCounts.set(sessionId, counts)
-    }
-    const index = counts.get(kind) ?? 0
-    counts.set(kind, index + 1)
-    return `replay:${kind}:${index}`
   }
 }
