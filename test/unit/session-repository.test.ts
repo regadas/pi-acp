@@ -770,10 +770,10 @@ test('repository resolves blank and out-of-root missing mappings to null and tom
   assert.equal(await repository.delete('gone'), null)
   assert.equal(store.get('gone'), null, 'a missing out-of-root mapping tombstones instead of failing')
   assert.equal(existsSync(sentinel), true, 'the parent directory of the missing file is never scanned or swept')
-  assert.equal(
-    enumerated.some(path => path === elsewhere || path.startsWith(join(elsewhere, '/'))),
-    false,
-    'only the configured root is enumerated'
+  assert.deepEqual(
+    [...new Set(enumerated)],
+    [sessions],
+    'only the configured root is enumerated, never a cwd or missing-file-parent walk'
   )
 })
 
@@ -835,10 +835,10 @@ test('repository projects an out-of-root mapping directly and never scans its pa
   assert.equal(existsSync(mapped), false)
   assert.equal(existsSync(newerDuplicate), true, 'the parent directory was never scanned or swept')
   assert.equal(await repository.find('wanted', root), null)
-  assert.equal(
-    enumerated.some(path => path === elsewhere || path.startsWith(join(elsewhere, '/'))),
-    false,
-    'the parent directory of the mapped file is never enumerated for find or delete'
+  assert.deepEqual(
+    [...new Set(enumerated)],
+    [sessions],
+    'find and delete enumerate only the configured root, never the mapped file parent'
   )
 })
 
@@ -878,9 +878,9 @@ test('repository.list projects an out-of-root mapping without surfacing its unma
     (await repository.list(root)).map(record => [record.sessionId, record.sessionFile]),
     [['wanted', mapped]]
   )
-  assert.equal(
-    enumerated.some(path => path === elsewhere || path.startsWith(join(elsewhere, '/'))),
-    false,
-    'the parent directory of the mapped file is never enumerated'
+  assert.deepEqual(
+    [...new Set(enumerated)],
+    [join(root, 'map.json.d'), sessions],
+    'list enumerates only the configured discovery root and its own state directory, never the mapped file parent'
   )
 })
