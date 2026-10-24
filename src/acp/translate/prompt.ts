@@ -1,4 +1,4 @@
-import { RequestError, type ContentBlock } from '@agentclientprotocol/sdk'
+import { RequestError, type ContentBlock } from '@agentclientprotocol/sdk/unstable'
 
 export type PiImage = {
   type: 'image'

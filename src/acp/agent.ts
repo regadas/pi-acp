@@ -1,7 +1,6 @@
 import {
   PROTOCOL_VERSION,
   RequestError,
-  type Agent as ACPAgent,
   type AuthenticateRequest,
   type CancelNotification,
   type CloseSessionRequest,
@@ -24,7 +23,7 @@ import {
   type SetSessionConfigOptionResponse,
   type AuthMethod,
   type StopReason
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
 import { getAuthMethods } from './auth.js'
 import type { PiAcpSession } from './session.js'
@@ -54,7 +53,7 @@ import { normalizeAdditionalDirectories, workspaceRootsEquivalent } from './work
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
-import type { AvailableCommand } from '@agentclientprotocol/sdk'
+import type { AvailableCommand } from '@agentclientprotocol/sdk/unstable'
 
 /**
  * pi supports MCP servers through its own configuration (user/project
@@ -130,7 +129,7 @@ type SessionRestoreOpts = {
   closeAdmission?: number
 }
 
-export class PiAcpAgent implements ACPAgent {
+export class PiAcpAgent {
   private readonly conn: AcpClient
   // Declared before `sessions` so the shared store exists when the manager
   // field initializer runs (class fields initialize in declaration order).
@@ -1000,6 +999,28 @@ export class PiAcpAgent implements ACPAgent {
     // Terminal Auth is handled out-of-band by re-launching the binary with `--terminal-login`.
     // If the client calls `authenticate` for the advertised method anyway, acknowledge it.
     return
+  }
+
+  /**
+   * Whether the session is live in the manager (restorable without a store
+   * read). The v2 chain checks this synchronously before admitting a prompt,
+   * so a live session's admission happens in the request's own tick.
+   */
+  hasLiveSession(sessionId: string): boolean {
+    return this.sessions.maybeGet(sessionId) !== undefined
+  }
+
+  /**
+   * Whether the session is persisted and a prompt could restore it; false
+   * for unknown sessions. Checked after {@link hasLiveSession}; the restore
+   * itself stays authoritative for races.
+   */
+  async hasStoredSession(sessionId: string): Promise<boolean> {
+    try {
+      return (await this.findStoredSession(sessionId)) !== null
+    } catch {
+      return false
+    }
   }
 
   prompt(params: PromptRequest, signal?: AbortSignal): Promise<PromptResponse> {

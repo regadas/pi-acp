@@ -1,4 +1,4 @@
-import { RequestError } from '@agentclientprotocol/sdk'
+import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import { statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { directoriesAlias, directoryKey, displayPath, identityFromStats, type DirectoryKey } from './session-cwd.js'

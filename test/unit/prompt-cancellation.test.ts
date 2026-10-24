@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import type { PromptRequest, PromptResponse } from '@agentclientprotocol/sdk'
+import type { PromptRequest, PromptResponse } from '@agentclientprotocol/sdk/unstable'
 import { PiAcpAgent, runPromptWithCancellation } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { SessionManager } from '../../src/acp/session-manager.js'

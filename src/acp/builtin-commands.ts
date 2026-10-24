@@ -1,4 +1,4 @@
-import { RequestError, type AvailableCommand, type PromptResponse } from '@agentclientprotocol/sdk'
+import { RequestError, type AvailableCommand, type PromptResponse } from '@agentclientprotocol/sdk/unstable'
 import { open } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
