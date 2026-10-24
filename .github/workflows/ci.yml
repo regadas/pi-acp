@@ -83,10 +83,11 @@ jobs:
           repository: agentclientprotocol/acp-tck
           ref: 3d46e2168aa3c23fe3853d539141a65a54d6a880
           path: .tck/acp-tck
+      - run: npm run build
       - name: Run the pinned ACP v1 TCK
         run: |
           status=0
-          npm run eval:tck || status=$?
+          node scripts/eval-acp-tck.mjs || status=$?
           if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
             exit "$status"
           fi

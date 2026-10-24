@@ -72,8 +72,13 @@ test('CI runs the pinned TCK as a diagnostics job that tolerates verdict exits a
   assert.ok(job.includes('PI_ACP_TCK_DIR'), 'the tck job must point the runner at its checkout')
   assert.match(
     job,
-    /npm run eval:tck \|\| status=\$\?/,
-    'the TCK step must capture the eval:tck exit instead of failing the step outright'
+    /- run: npm run build\n(.*\n)*?.*Run the pinned ACP v1 TCK/,
+    'the tck job must build the adapter in a separate step before running the TCK, so build failures fail the job instead of reaching the verdict filter'
+  )
+  assert.match(
+    job,
+    /node scripts\/eval-acp-tck\.mjs \|\| status=\$\?/,
+    'the TCK step must launch the runner directly, so only genuine runner exits reach the exit-code filter'
   )
   assert.match(
     job,

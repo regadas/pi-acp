@@ -3,12 +3,16 @@
 // and the installed pi, with a disposable user/workspace state and a
 // deterministic local provider extension (no provider network, no child
 // agents). TCK conformance findings stay visible in the exit code and the
-// persistent JSON report; only the dedicated CI diagnostics step is
-// non-blocking. Exit codes: 0/1 are verdicts, accepted only for the exact
-// pairs exit 0 + conformant report or exit 1 + non-conformant report;
-// 3 distinguishes every runner/setup error (bad checkout, missing
-// prerequisites, watchdog timeout, missing/invalid/inconsistent report, or
-// any unexpected failure), each with a best-effort persistent diagnostic.
+// persistent JSON report. In CI the diagnostics step is verdict-tolerant —
+// exits 0 (conformant) and 1 (non-conformant) are recorded findings — while
+// every other exit re-raises and fails the job; the step runs this runner
+// directly after a separate build step, so build/launcher failures never
+// pass through the verdict filter. Exit codes: 0/1 are verdicts, accepted
+// only for the exact pairs exit 0 + conformant report or exit 1 +
+// non-conformant report; 3 distinguishes every runner/setup error (bad
+// checkout, missing prerequisites, watchdog timeout, missing/invalid/
+// inconsistent report, or any unexpected failure), each with a best-effort
+// persistent diagnostic.
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
