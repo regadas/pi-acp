@@ -1,13 +1,13 @@
-import { methods, type AgentContext } from '@agentclientprotocol/sdk'
+import { methods, type AgentContext } from '@agentclientprotocol/sdk/unstable'
 import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
   SessionNotification
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
 
-type RequestOptions = { cancellationSignal?: AbortSignal }
+export type RequestOptions = { cancellationSignal?: AbortSignal }
 
 /**
  * Narrow client-facing surface the agent calls back into. This is the subset

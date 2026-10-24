@@ -1,4 +1,4 @@
-import type { ToolCallContent } from '@agentclientprotocol/sdk'
+import type { ToolCallContent } from '@agentclientprotocol/sdk/unstable'
 
 type BashCommandRecord = {
   command?: unknown

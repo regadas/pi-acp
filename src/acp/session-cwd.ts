@@ -1,4 +1,4 @@
-import { RequestError } from '@agentclientprotocol/sdk'
+import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import { realpathSync, statSync, type Stats } from 'node:fs'
 import { posix, win32 } from 'node:path'
 

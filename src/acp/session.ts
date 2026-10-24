@@ -7,7 +7,7 @@ import type {
   ToolCallContent,
   ToolCallLocation,
   Usage
-} from '@agentclientprotocol/sdk'
+} from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
 import { fileSnapshot } from './file-snapshot.js'
 import { isAbsolute, resolve as resolvePath } from 'node:path'

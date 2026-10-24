@@ -1,4 +1,4 @@
-import type { ToolCallLocation, ToolKind } from '@agentclientprotocol/sdk'
+import type { ToolCallLocation, ToolKind } from '@agentclientprotocol/sdk/unstable'
 import { lstatSync, statSync } from 'node:fs'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
 

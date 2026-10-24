@@ -1,5 +1,5 @@
-import type { AuthMethod } from '@agentclientprotocol/sdk'
-import { RequestError } from '@agentclientprotocol/sdk'
+import type { AuthMethod } from '@agentclientprotocol/sdk/unstable'
+import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'

@@ -1,4 +1,4 @@
-import type { AvailableCommand } from '@agentclientprotocol/sdk'
+import type { AvailableCommand } from '@agentclientprotocol/sdk/unstable'
 
 export type PiRpcCommandInfo = {
   name?: unknown
