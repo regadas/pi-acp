@@ -33,18 +33,29 @@ const UPSERT_OF_CHUNK_KIND: Record<ChunkKind, 'user_message' | 'agent_message' |
  * (see docs/adapter-reference.md).
  *
  * Inside {@link replaying} windows, replayed history is delivered as v2
- * message upserts, one message per retained entry (its chunks grouped),
- * carrying the deterministic id `replay:<entryId>`. v2 message updates
- * replace a message's content as a whole, so replaying the same history
- * again re-sends it under the same ids without duplicating what the client
+ * message upserts, one message per retained entry, carrying the
+ * deterministic id `replay:<entryId>`: an entry's blocks accumulate —
+ * including across interruptions by tool calls, which flush and later
+ * re-emit the full cumulative content — and v2 message updates replace a
+ * message's content as a whole, so replaying the same history again
+ * re-sends it under the same ids without duplicating what the client
  * already holds.
  */
 export class V2ClientConnection implements AcpClient {
   private readonly currentMessage = new Map<string, { kind: string; id: string }>()
   /** Open replaying windows per session (depth: windows may overlap while a superseded restore settles). */
   private readonly replayDepth = new Map<string, number>()
-  /** The retained entry whose chunks are accumulating into one message right now. */
-  private readonly replayEntries = new Map<string, { entryId: string; kind: ChunkKind; content: v2.ContentBlock[] }>()
+  /**
+   * Cumulative replayed content per retained (entry, kind), surviving the
+   * intermediate flushes: an entry interrupted by other updates (text,
+   * tool call, text) re-emits ALL its content, not just the last run.
+   */
+  private readonly replayContent = new Map<
+    string,
+    Map<string, { entryId: string; kind: ChunkKind; content: v2.ContentBlock[] }>
+  >()
+  /** The (entry, kind) accumulating right now; flushes emit its full cumulative content. */
+  private readonly currentReplayKey = new Map<string, string>()
 
   constructor(private readonly ctx: v2.AgentContext) {}
 
@@ -76,13 +87,16 @@ export class V2ClientConnection implements AcpClient {
   ): Promise<void> {
     const entryId = kind !== null ? (update as typeof update & { [replayEntryId]?: string })[replayEntryId] : undefined
     if (kind !== null && typeof entryId === 'string') {
-      const current = this.replayEntries.get(sessionId)
-      if (current && (current.entryId !== entryId || current.kind !== kind)) {
+      const key = `${entryId} ${kind}`
+      if (this.currentReplayKey.get(sessionId) !== key) {
         await this.flushReplayEntry(sessionId)
+        this.currentReplayKey.set(sessionId, key)
       }
-      const entry = this.replayEntries.get(sessionId) ?? { entryId, kind, content: [] as v2.ContentBlock[] }
+      const entries = this.replayContent.get(sessionId) ?? new Map()
+      this.replayContent.set(sessionId, entries)
+      const entry = entries.get(key) ?? { entryId, kind, content: [] as v2.ContentBlock[] }
       entry.content.push((toV2SessionUpdate(update, `replay:${entryId}`) as { content: v2.ContentBlock }).content)
-      this.replayEntries.set(sessionId, entry)
+      entries.set(key, entry)
       return
     }
     await this.flushReplayEntry(sessionId)
@@ -92,11 +106,18 @@ export class V2ClientConnection implements AcpClient {
       await this.ctx.notify(v2.methods.client.session.update, { sessionId, update: translated })
   }
 
-  /** Emit the buffered entry as its v2 message upsert, with the entry's full content. */
+  /**
+   * Emit the current entry's v2 message upsert with its full cumulative
+   * content. The accumulator survives the flush: a later chunk of the same
+   * entry re-emits everything, idempotent under v2 upsert replacement
+   * semantics.
+   */
   private async flushReplayEntry(sessionId: string): Promise<void> {
-    const entry = this.replayEntries.get(sessionId)
+    const key = this.currentReplayKey.get(sessionId)
+    if (key === undefined) return
+    this.currentReplayKey.delete(sessionId)
+    const entry = this.replayContent.get(sessionId)?.get(key)
     if (!entry) return
-    this.replayEntries.delete(sessionId)
     await this.ctx.notify(v2.methods.client.session.update, {
       sessionId,
       update: {
@@ -111,10 +132,17 @@ export class V2ClientConnection implements AcpClient {
    * Runs `restore`, which replays the history of `sessionId`, inside a replay
    * window: replayed entries become deterministic message upserts. Windows
    * may overlap while a superseded restore settles; the depth keeps the
-   * inner window's end from closing the outer one's.
+   * inner window's end from closing the outer one's. Each new window drops
+   * the session's buffered replay state first: the newer load wins (the
+   * engine supersedes the older one), so a superseded window's partial entry
+   * cannot merge duplicate blocks into the winner's message. Residual: an
+   * inner window that fails validation before replaying still drops the
+   * outer winner's unflushed partial (contrived: two racing resumes).
    */
   async replaying<T>(sessionId: string, restore: () => Promise<T>): Promise<T> {
     this.replayDepth.set(sessionId, (this.replayDepth.get(sessionId) ?? 0) + 1)
+    this.replayContent.delete(sessionId)
+    this.currentReplayKey.delete(sessionId)
     this.currentMessage.delete(sessionId)
     try {
       return await restore()
@@ -125,6 +153,8 @@ export class V2ClientConnection implements AcpClient {
       if (depth === 0) {
         this.replayDepth.delete(sessionId)
         await this.flushReplayEntry(sessionId)
+        this.replayContent.delete(sessionId)
+        this.currentReplayKey.delete(sessionId)
       } else {
         this.replayDepth.set(sessionId, depth)
       }

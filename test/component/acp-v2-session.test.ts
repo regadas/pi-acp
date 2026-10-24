@@ -1,6 +1,6 @@
 import test, { beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
@@ -555,12 +555,22 @@ test('v2 prompt followed immediately by close: acknowledged without a respawned 
       sessionId: 'v2-close-race',
       prompt: [{ type: 'text', text: 'long work' }]
     })
-    const close = conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-close-race' })
-    const [response] = await Promise.all([withTimeout(prompt, 'prompt under close'), withTimeout(close, 'close')])
+    const closeAcknowledged = withTimeout(
+      conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-close-race' }),
+      'close'
+    ).then(ack => ({ ack, wire: updates.slice() }))
+    const [response, { ack, wire }] = await Promise.all([withTimeout(prompt, 'prompt under close'), closeAcknowledged])
+    assert.deepEqual(ack, {})
 
-    // The wire AT the moment the close acknowledges — not post-hoc state:
-    // the cancelled turn's final updates must already have arrived.
-    const atAcknowledgement = updates.slice()
+    // The wire snapshot is taken INSIDE the close's own resolution — the
+    // structural guarantee is that the close handler acknowledges only after
+    // every in-flight prompt finalized (turn settled and its final updates
+    // flushed through the SDK's ordered write queue, so they were written
+    // before this response). Best-effort at the assertion level: the
+    // in-memory wire applies no backpressure, so the snapshot passing alone
+    // would not distinguish an implementation that raced; the guarantee is
+    // the awaited finalization, pinned by this capture.
+    const atAcknowledgement = wire
     assert.equal(typeof response.messageId, 'string')
     const idle = atAcknowledgement
       .map(update => update.update as { sessionUpdate: string; state?: string; stopReason?: string })
@@ -849,8 +859,15 @@ test('v2 replay: overlapping resume windows keep the replay translation until th
     const replayed = updates.filter(update =>
       ['user_message', 'agent_message', 'agent_thought'].includes(update.update.sessionUpdate)
     )
-    assert.ok(replayed.length >= 2)
-    assert.ok(replayed.every(update => /^replay:/.test((update.update as { messageId: string }).messageId)))
+    // The winner's history arrived intact — full content, exactly once per
+    // entry, not a merge with the superseded window's buffered partial.
+    assert.deepEqual(
+      replayed.map(update => update.update),
+      [
+        { sessionUpdate: 'user_message', messageId: 'replay:e1', content: [{ type: 'text', text: 'Hello' }] },
+        { sessionUpdate: 'agent_message', messageId: 'replay:e2', content: [{ type: 'text', text: 'Hi there' }] }
+      ]
+    )
     assert.equal(
       updates.filter(update => update.update.sessionUpdate.endsWith('_chunk')).length,
       0,
@@ -963,6 +980,220 @@ test('v2 close completing while a stored-session prompt validates fails the prom
     await new Promise(resolve => setTimeout(resolve, 25))
     assert.equal(proc.prompts.length, promptsAtRace, 'no lazy-restore respawn behind the acknowledged close')
     assert.equal(proc.disposeCount, 1, 'no second session lifetime behind the acknowledged close')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 fresh connection prompts a persisted session: lazy restore with no false close-fence rejection', async () => {
+  // A restore through the real store validates the JSONL header, so the
+  // session file carries the header pi itself would have written.
+  const freshFile = join(tmpdir(), 'pi-acp-v2-fresh-sess.jsonl')
+  writeFileSync(
+    freshFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'v2-fresh',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      cwd: TEST_CWD
+    }) + '\n'
+  )
+  const proc = patchSpawn(fakeState('v2-fresh', freshFile))
+  proc.terminateOnDispose = true
+  // Connection one creates and runs the session; its wire then closes.
+  const first = connectV2()
+  try {
+    await initialize(first.conn)
+    await first.conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+    const prompt = first.conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-fresh',
+      prompt: [{ type: 'text', text: 'hello' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'first prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    await withTimeout(prompt, 'first prompt')
+  } finally {
+    first.conn.close()
+  }
+
+  // A fresh connection has zero close history: its stored-session prompt
+  // validation must not misread "no close ever" as "a close raced the
+  // admission" — the prompt lazily restores and runs a full turn.
+  const second = connectV2()
+  try {
+    await initialize(second.conn)
+    const prompt = second.conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-fresh',
+      prompt: [{ type: 'text', text: 'again' }]
+    })
+    await waitFor(() => proc.prompts.length === 2, 'lazily restored prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hi again' } })
+    proc.emit({ type: 'agent_settled' })
+    const response = await withTimeout(prompt, 'prompt on a fresh connection')
+    assert.equal(typeof response.messageId, 'string')
+    const idles = second
+      .received('state_update')
+      .filter(update => (update.update as { state: string }).state === 'idle')
+    assert.equal((idles[idles.length - 1]!.update as { stopReason?: string }).stopReason, 'end_turn')
+  } finally {
+    second.conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 replay of an interleaved entry: one message re-emitting ALL its text across the tool call', async () => {
+  const proc = patchSpawn(fakeState('s1'))
+  proc.terminateOnDispose = true
+  // One assistant entry whose text is interrupted by a tool call, plus the
+  // tool's result entry.
+  proc.entrySnapshot = {
+    entries: [
+      {
+        id: 'e1',
+        parentId: null,
+        timestamp: '',
+        type: 'message',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'Hello ' },
+            { type: 'toolCall', id: 't1', name: 'bash' },
+            { type: 'text', text: ' world' }
+          ]
+        }
+      },
+      {
+        id: 'e2',
+        parentId: 'e1',
+        timestamp: '',
+        type: 'message',
+        message: { role: 'toolResult', toolCallId: 't1', toolName: 'bash', content: 'done', isError: false }
+      }
+    ],
+    leafId: 'e2'
+  }
+
+  let activeAgent: PiAcpAgent | null = null
+  const { conn, updates } = connectV2(agent => {
+    activeAgent = agent
+  })
+  try {
+    await initialize(conn)
+    assert.ok(activeAgent)
+    ;(activeAgent as unknown as { store: unknown }).store = {
+      get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: SESSION_FILE, updatedAt: new Date().toISOString() }),
+      upsert() {}
+    }
+
+    await withTimeout(
+      conn.agent.request(v2.methods.agent.session.resume, {
+        sessionId: 's1',
+        cwd: TEST_CWD,
+        replayFrom: { type: 'start' }
+      }),
+      'resume'
+    )
+    await waitFor(
+      () => updates.filter(update => update.update.sessionUpdate === 'agent_message').length >= 2,
+      'replayed agent messages'
+    )
+
+    // The interleaved entry emits its text before the tool call and then
+    // re-emits the FULL cumulative content — the trailing text must not
+    // replace the earlier run away.
+    const upserts = updates
+      .filter(update => update.update.sessionUpdate === 'agent_message')
+      .map(update => update.update as { messageId: string; content: Array<{ type: string; text?: string }> })
+    assert.equal(upserts.length, 2)
+    assert.equal(upserts[0]!.messageId, 'replay:e1')
+    assert.deepEqual(upserts[0]!.content, [{ type: 'text', text: 'Hello ' }])
+    assert.equal(upserts[1]!.messageId, 'replay:e1')
+    assert.deepEqual(upserts[1]!.content, [
+      { type: 'text', text: 'Hello ' },
+      { type: 'text', text: ' world' }
+    ])
+    // The first run precedes the tool call; the full re-emission follows it.
+    const wire = updates.map(update => update.update.sessionUpdate)
+    assert.ok(wire.indexOf('agent_message') < wire.indexOf('tool_call_update'))
+    assert.ok(wire.lastIndexOf('agent_message') > wire.indexOf('tool_call_update'))
+    assert.equal(
+      updates.filter(update => update.update.sessionUpdate.endsWith('_chunk')).length,
+      0,
+      'replayed history never arrives as chunk updates'
+    )
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 delete racing a close: the fence holds until both settle', async () => {
+  // The session file lives inside the agent's discovery root (as real pi
+  // lays it out): a file outside the root makes the delete's discovery scan
+  // walk the file's whole parent directory.
+  const sessionsDir = join(process.env.PI_CODING_AGENT_DIR!, 'sessions')
+  mkdirSync(sessionsDir, { recursive: true })
+  const overlapFile = join(sessionsDir, 'pi-acp-v2-c3-sess.jsonl')
+  writeFileSync(
+    overlapFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'v2-c3',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      cwd: TEST_CWD
+    }) + '\n'
+  )
+  const proc = patchSpawn(fakeState('v2-c3', overlapFile))
+  proc.terminateOnDispose = true
+  const { conn, updates } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+    const prompt = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-c3',
+      prompt: [{ type: 'text', text: 'long work' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'prompt dispatch')
+
+    // The delete's engine close step cancels the turn and awaits its drain;
+    // the close joins the same step. Both stay in flight until the turn
+    // settles.
+    const deleting = conn.agent.request(v2.methods.agent.session.delete, { sessionId: 'v2-c3' })
+    let racingRejection: Promise<void> | undefined
+    const closing = conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-c3' }).then(ack => {
+      // The delete is still removing the durable record (filesystem work)
+      // while the close has already acknowledged: a prompt in this window
+      // must still hit the fence, not pass it and fail at the engine with
+      // an echoed request-cancelled turn.
+      const racing = conn.agent.request(v2.methods.agent.session.prompt, {
+        sessionId: 'v2-c3',
+        prompt: [{ type: 'text', text: 'late' }]
+      })
+      racingRejection = assert.rejects(
+        () => withTimeout(racing, 'prompt racing the delete'),
+        (err: unknown) => {
+          assert.equal((err as { code?: number }).code, -32800)
+          return true
+        }
+      )
+      return ack
+    })
+
+    proc.emit({ type: 'agent_settled' })
+    await withTimeout(prompt, 'cancelled prompt')
+    assert.deepEqual(await withTimeout(closing, 'close during delete'), {})
+    await racingRejection
+    assert.deepEqual(await withTimeout(deleting, 'delete'), {})
+    assert.equal(
+      updates.filter(update => update.update.sessionUpdate === 'user_message').length,
+      1,
+      'the racing prompt never echoed'
+    )
   } finally {
     conn.close()
     proc.restore()

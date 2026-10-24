@@ -50,13 +50,13 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
   /** Final state updates of prompts that settled while others still run; flushed when the count reaches zero. */
   const pendingFinals = new Map<string, v2.SessionUpdate[]>()
   /**
-   * Sessions with a close/delete still in flight, mirroring the engine's
-   * transient fence: a prompt whose insertion the close/delete would prevent
-   * answers with request-cancelled, without an echo. Cleared only by the
-   * operation that set it, so the fence never outlives its close and never
-   * drops early under an overlapping close/delete or resume.
+   * In-flight close/delete count per session, mirroring the engine's
+   * transient fence: a prompt whose insertion a close/delete would prevent
+   * answers with request-cancelled, without an echo. The count reaches zero
+   * only when the last close/delete settles, so overlapping close/delete
+   * operations never drop the fence early.
    */
-  const closingSessions = new Set<string>()
+  const closingCounts = new Map<string, number>()
   /**
    * Close/delete generation per session, bumped when one starts and never
    * cleared: a prompt validating a stored-but-not-live session snapshots it
@@ -123,7 +123,7 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       promptTails.clear()
       promptCounts.clear()
       pendingFinals.clear()
-      closingSessions.clear()
+      closingCounts.clear()
       closeGenerations.clear()
       opts?.onAgent?.(agent)
 
@@ -185,32 +185,32 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
     .onRequest(v2.methods.agent.session.close, async ctx => {
       const agent = getInitializedAgent()
       const sessionId = ctx.params.sessionId
-      closingSessions.add(sessionId)
-      const generation = (closeGenerations.get(sessionId) ?? 0) + 1
-      closeGenerations.set(sessionId, generation)
+      closingCounts.set(sessionId, (closingCounts.get(sessionId) ?? 0) + 1)
+      closeGenerations.set(sessionId, (closeGenerations.get(sessionId) ?? 0) + 1)
       try {
         await agent.closeSession({ sessionId })
         // Every prompt's wrapper finalization — its turn settled and its final
         // updates flushed — precedes this acknowledgement.
         await Promise.all(promptTails.get(sessionId) ?? [])
       } finally {
-        // The fence ends with this operation; a newer close/delete still in
-        // flight keeps it up.
-        if (closeGenerations.get(sessionId) === generation) closingSessions.delete(sessionId)
+        const inFlight = (closingCounts.get(sessionId) ?? 1) - 1
+        if (inFlight === 0) closingCounts.delete(sessionId)
+        else closingCounts.set(sessionId, inFlight)
       }
       return {}
     })
     .onRequest(v2.methods.agent.session.delete, async ctx => {
       const agent = getInitializedAgent()
       const sessionId = ctx.params.sessionId
-      closingSessions.add(sessionId)
-      const generation = (closeGenerations.get(sessionId) ?? 0) + 1
-      closeGenerations.set(sessionId, generation)
+      closingCounts.set(sessionId, (closingCounts.get(sessionId) ?? 0) + 1)
+      closeGenerations.set(sessionId, (closeGenerations.get(sessionId) ?? 0) + 1)
       try {
         await agent.deleteSession({ sessionId })
         await Promise.all(promptTails.get(sessionId) ?? [])
       } finally {
-        if (closeGenerations.get(sessionId) === generation) closingSessions.delete(sessionId)
+        const inFlight = (closingCounts.get(sessionId) ?? 1) - 1
+        if (inFlight === 0) closingCounts.delete(sessionId)
+        else closingCounts.set(sessionId, inFlight)
       }
       return {}
     })
@@ -227,7 +227,7 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       // an unknown session answers resource-not-found, both without an echo.
       // The live check is synchronous so a live session's admission happens in
       // this request's own tick; only unknown-session checks yield first.
-      if (closingSessions.has(sessionId)) {
+      if ((closingCounts.get(sessionId) ?? 0) > 0) {
         throw RequestError.requestCancelled({}, `session closed while prompting: ${sessionId}`)
       }
       if (!agent.hasLiveSession(sessionId)) {
@@ -241,7 +241,7 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
         if (!(await agent.hasStoredSession(sessionId))) {
           throw RequestError.resourceNotFound(sessionId)
         }
-        if (closeGenerations.get(sessionId) !== closeGeneration) {
+        if ((closeGenerations.get(sessionId) ?? 0) !== closeGeneration) {
           throw RequestError.requestCancelled({}, `session closed while prompting: ${sessionId}`)
         }
       }
