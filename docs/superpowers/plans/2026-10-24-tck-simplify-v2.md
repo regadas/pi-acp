@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- PR A changes only harness/test/doc/CI files (scripts/*tck*, test/unit/acp-tck*, docs/adapter-reference.md, .github/workflows/ci.yml, package.json scripts). No production `src/` changes.
+- PR A changes only harness/test/doc/CI files (scripts/_tck_, test/unit/acp-tck\*, docs/adapter-reference.md, .github/workflows/ci.yml, package.json scripts). No production `src/` changes.
 - PR B touches `src/acp`, package.json dependency, focused tests; v1 wire behavior must remain identical (full existing suite + `eval:tck` v1 pin stay green).
 - The TCK runner stays pinned to protocol v1 and revision 3d46e216; the upstream v2 TCK suite is explicitly out of scope (unstable draft). Record as deferred.
 - MCP servers stay rejected on both v1 and v2 (unchanged this cycle; user deferred that gap).
@@ -24,12 +24,12 @@
 
 ## Topology / lane board (multi-seam, serialized by stacking)
 
-| Lane | Repo/cwd | Exact decision / files | Isolation | Gate | Handoff |
-| --- | --- | --- | --- | --- | --- |
-| A: simplify harness | /Users/regadas/src/pi-acp, branch test/acp-tck-diagnostics rebased onto origin/main | Probe machinery revert + test/doc trims | Same checkout, sole writer | Focused suite, full validate, real pinned v1 TCK on Pi 1.2.0, force-push PR #2 | Updated PR #2 |
-| B: SDK 2.x + v2 routing | Same checkout, new branch stacked on updated test/acp-tck-diagnostics | src/acp router + SDK upgrade + v2 subset + tests | Same checkout after A completes | Full validate, v1 TCK still green, v2 negotiation/lifecycle tests, new stacked PR | New PR (base = PR #2 branch) |
-| Fresh review | Read-only, both PR diffs | 4 seats, per-target findings | None (no writer) | Evidence-backed P0/P1/P2 + verdicts | Managed reports |
-| C: fixes | Same checkout, serial | Parent-accepted findings only | Same checkout | Affected checks + targeted re-review | Final states |
+| Lane                    | Repo/cwd                                                                            | Exact decision / files                           | Isolation                       | Gate                                                                              | Handoff                      |
+| ----------------------- | ----------------------------------------------------------------------------------- | ------------------------------------------------ | ------------------------------- | --------------------------------------------------------------------------------- | ---------------------------- |
+| A: simplify harness     | /Users/regadas/src/pi-acp, branch test/acp-tck-diagnostics rebased onto origin/main | Probe machinery revert + test/doc trims          | Same checkout, sole writer      | Focused suite, full validate, real pinned v1 TCK on Pi 1.2.0, force-push PR #2    | Updated PR #2                |
+| B: SDK 2.x + v2 routing | Same checkout, new branch stacked on updated test/acp-tck-diagnostics               | src/acp router + SDK upgrade + v2 subset + tests | Same checkout after A completes | Full validate, v1 TCK still green, v2 negotiation/lifecycle tests, new stacked PR | New PR (base = PR #2 branch) |
+| Fresh review            | Read-only, both PR diffs                                                            | 4 seats, per-target findings                     | None (no writer)                | Evidence-backed P0/P1/P2 + verdicts                                               | Managed reports              |
+| C: fixes                | Same checkout, serial                                                               | Parent-accepted findings only                    | Same checkout                   | Affected checks + targeted re-review                                              | Final states                 |
 
 Protected parent-owned plan file. Recapture baseline before each writer. The stack means lane B starts only after lane A's branch is pushed.
 
