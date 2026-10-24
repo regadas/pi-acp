@@ -18,7 +18,8 @@ import type {
   SessionInfo,
   SessionUpdate,
   SetSessionConfigOptionRequest,
-  SetSessionConfigOptionResponse
+  SetSessionConfigOptionResponse,
+  ToolCallContent
 } from '@agentclientprotocol/sdk/unstable'
 
 type ChunkSessionUpdate = Extract<
@@ -61,9 +62,15 @@ export function toV2SessionUpdate(
     case 'tool_call_update': {
       // v2 has no first-report variant: a v1 tool_call is the first
       // tool_call_update of that tool call. The fields share their shape;
-      // the brands of the two schema versions' unions do not.
-      const { sessionUpdate: _kind, ...fields } = update
-      return { sessionUpdate: 'tool_call_update', ...fields } as v2.SessionUpdate
+      // the brands of the two schema versions' unions do not. Diff content
+      // needs a real translation: the versions' diff shapes differ, and a
+      // passthrough would be silently dropped by the v2 schema.
+      const { sessionUpdate: _kind, content, ...fields } = update
+      return {
+        sessionUpdate: 'tool_call_update',
+        ...fields,
+        ...(content != null ? { content: content.map(toV2ToolCallContent) } : {})
+      } as v2.SessionUpdate
     }
     case 'available_commands_update':
       return { sessionUpdate: update.sessionUpdate, availableCommands: toV2AvailableCommands(update.availableCommands) }
@@ -76,6 +83,67 @@ export function toV2SessionUpdate(
     default:
       throw new Error(`pi-acp: no ACP v2 translation for ${update.sessionUpdate} session update`)
   }
+}
+
+/** Cap on the old+new text a diff patch is built from; larger edits ship the change paths without a patch, which clients must handle anyway. */
+const MAX_DIFF_PATCH_CHARS = 64 * 1024
+
+/**
+ * The v2 form of a v1 tool-call content item. Only diffs differ between the
+ * versions; the other kinds the engine emits share their shape.
+ */
+export function toV2ToolCallContent(content: ToolCallContent): v2.ToolCallContent {
+  return content.type === 'diff' ? toV2Diff(content) : (content as v2.ToolCallContent)
+}
+
+/**
+ * The v2 form of a v1 structured diff: the file-level change list v2 requires
+ * plus, within a size cap, a whole-file unified `git_patch` preserving the
+ * visible before/after content.
+ */
+function toV2Diff(diff: { path: string; oldText?: string | null; newText: string }): v2.ToolCallContent {
+  const oldText = diff.oldText ?? null
+  const patch = unifiedFilePatch(diff.path, oldText, diff.newText)
+  return {
+    type: 'diff',
+    changes: [{ operation: oldText === null ? 'add' : 'modify', path: diff.path }],
+    ...(patch !== undefined ? { patch: { format: 'git_patch', text: patch } } : {})
+  } as v2.ToolCallContent
+}
+
+/**
+ * A valid whole-file unified diff replacing the old text with the new one:
+ * one hunk, all `-` old lines then all `+` new lines. Not minimal, but exact
+ * and cheap; `undefined` past the size cap.
+ */
+function unifiedFilePatch(path: string, oldText: string | null, newText: string): string | undefined {
+  if ((oldText?.length ?? 0) + newText.length > MAX_DIFF_PATCH_CHARS) return undefined
+
+  const split = (text: string): { lines: string[]; trailingNewline: boolean } => {
+    if (text === '') return { lines: [], trailingNewline: true }
+    const lines = text.split('\n')
+    const trailingNewline = lines[lines.length - 1] === ''
+    if (trailingNewline) lines.pop()
+    return { lines, trailingNewline }
+  }
+  const old = split(oldText ?? '')
+  const next = split(newText)
+
+  // Unified hunk ranges omit a count of 1; a zero-line side starts at 0.
+  const range = (sign: '-' | '+', start: number, count: number): string =>
+    `${sign}${start}${count !== 1 ? `,${count}` : ''}`
+  const header = `@@ ${range('-', old.lines.length === 0 ? 0 : 1, old.lines.length)} ${range(
+    '+',
+    next.lines.length === 0 ? 0 : 1,
+    next.lines.length
+  )} @@`
+
+  const body: string[] = [`--- ${path}`, `+++ ${path}`, header]
+  for (const line of old.lines) body.push(`-${line}`)
+  if (old.lines.length > 0 && !old.trailingNewline) body.push('\\ No newline at end of file')
+  for (const line of next.lines) body.push(`+${line}`)
+  if (next.lines.length > 0 && !next.trailingNewline) body.push('\\ No newline at end of file')
+  return body.join('\n') + '\n'
 }
 
 /** v2 names the id of a config option `configId`; v1 calls it `id`. */

@@ -1001,6 +1001,28 @@ export class PiAcpAgent {
     return
   }
 
+  /**
+   * Whether the session is live in the manager (restorable without a store
+   * read). The v2 chain checks this synchronously before admitting a prompt,
+   * so a live session's admission happens in the request's own tick.
+   */
+  hasLiveSession(sessionId: string): boolean {
+    return this.sessions.maybeGet(sessionId) !== undefined
+  }
+
+  /**
+   * Whether the session is persisted and a prompt could restore it; false
+   * for unknown sessions. Checked after {@link hasLiveSession}; the restore
+   * itself stays authoritative for races.
+   */
+  async hasStoredSession(sessionId: string): Promise<boolean> {
+    try {
+      return (await this.findStoredSession(sessionId)) !== null
+    } catch {
+      return false
+    }
+  }
+
   prompt(params: PromptRequest, signal?: AbortSignal): Promise<PromptResponse> {
     const cancellationEpoch = this.cancellationEpochs.get(params.sessionId) ?? 0
 

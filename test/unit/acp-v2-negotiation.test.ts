@@ -172,3 +172,28 @@ test('router: the requested version is honored on the raw wire', async () => {
   assert.equal(rejected.error.code, -32022)
   assert.deepEqual(rejected.error.data.supported, [1, 2])
 })
+
+test('router: a non-initialize first request is rejected and the connection closes', async () => {
+  const [agentSide, clientSide] = streamPair()
+  const router = createPiAcpProtocolRouter()
+  const lifecycle = router.connect(agentSide as unknown as WireStream)
+  const writer = clientSide.writable.getWriter()
+  const reader = clientSide.readable.getReader()
+
+  await writer.write({ jsonrpc: '2.0', id: 1, method: 'session/list', params: {} })
+  const response = (await withTimeout(reader.read() as Promise<{ value: unknown }>, 'session/list')).value as {
+    error: { code: number; message: string; data?: string }
+  }
+  assert.equal(response.error.code, -32600)
+  assert.match(response.error.data ?? response.error.message, /initialize/)
+
+  // The routed connection is closed after the rejection: its lifecycle ends
+  // and it serves nothing further.
+  await withTimeout(
+    Promise.race([
+      lifecycle.closed,
+      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('connection stayed open')), 2_000))
+    ]),
+    'connection close'
+  )
+})

@@ -1,6 +1,6 @@
 import test, { beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
@@ -89,9 +89,9 @@ function connectV2(onAgent?: (agent: PiAcpAgent | null) => void) {
   }
 }
 
-const fakeState = (sessionId: string): Record<string, unknown> => ({
+const fakeState = (sessionId: string, sessionFile: string = SESSION_FILE): Record<string, unknown> => ({
   sessionId,
-  sessionFile: SESSION_FILE,
+  sessionFile,
   // A streaming run: the turn stays open until agent_settled, so scripted
   // text deltas stream in-turn and are delivered before the prompt settles —
   // the ordering this suite exists to prove. A false isStreaming would make
@@ -343,6 +343,407 @@ test('v2 session/new rejects non-empty mcpServers exactly as v1 does', async () 
       }
     )
     assert.equal(proc.prompts.length, 0, 'no pi work may start for a rejected request')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 close fence is transient: close, then resume and prompt work again', async () => {
+  // A restore through the real store validates the JSONL header, so the
+  // session file carries the header pi itself would have written.
+  const fenceFile = join(tmpdir(), 'pi-acp-v2-fence-sess.jsonl')
+  writeFileSync(
+    fenceFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'v2-fence',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      cwd: TEST_CWD
+    }) + '\n'
+  )
+  const proc = patchSpawn(fakeState('v2-fence', fenceFile))
+  proc.terminateOnDispose = true
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+    const first = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-fence',
+      prompt: [{ type: 'text', text: 'first' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'first prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'done' } })
+    proc.emit({ type: 'agent_settled' })
+    await withTimeout(first, 'first prompt')
+
+    assert.deepEqual(
+      await withTimeout(conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-fence' }), 'close'),
+      {}
+    )
+
+    // The fence only covered the in-flight close: resume re-establishes the
+    // session and the next prompt runs a full turn instead of answering
+    // request-cancelled.
+    await withTimeout(
+      conn.agent.request(v2.methods.agent.session.resume, { sessionId: 'v2-fence', cwd: TEST_CWD }),
+      'resume after close'
+    )
+    const second = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-fence',
+      prompt: [{ type: 'text', text: 'second' }]
+    })
+    await waitFor(() => proc.prompts.length === 2, 'second prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'again' } })
+    proc.emit({ type: 'agent_settled' })
+    const response = await withTimeout(second, 'prompt after close+resume')
+    assert.equal(typeof response.messageId, 'string')
+    const idles = received('state_update').filter(update => (update.update as { state: string }).state === 'idle')
+    assert.equal((idles[idles.length - 1]!.update as { stopReason?: string }).stopReason, 'end_turn')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 close fence is transient: a never-opened session id does not stay poisoned', async () => {
+  const proc = patchSpawn(fakeState('never-opened'))
+  proc.terminateOnDispose = true
+  let activeAgent: PiAcpAgent | null = null
+  const { conn } = connectV2(agent => {
+    activeAgent = agent
+  })
+  try {
+    await initialize(conn)
+    assert.ok(activeAgent)
+    ;(activeAgent as unknown as { store: unknown }).store = {
+      get: () => ({
+        sessionId: 'never-opened',
+        cwd: TEST_CWD,
+        sessionFile: SESSION_FILE,
+        updatedAt: new Date().toISOString()
+      }),
+      upsert() {}
+    }
+
+    // Closing an id this connection never opened succeeds silently; the
+    // fence it sets must not outlive the close.
+    assert.deepEqual(
+      await withTimeout(
+        conn.agent.request(v2.methods.agent.session.close, { sessionId: 'never-opened' }),
+        'close of never-opened id'
+      ),
+      {}
+    )
+
+    await withTimeout(
+      conn.agent.request(v2.methods.agent.session.resume, { sessionId: 'never-opened', cwd: TEST_CWD }),
+      'resume of never-opened id'
+    )
+    const prompt = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'never-opened',
+      prompt: [{ type: 'text', text: 'hello' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hi' } })
+    proc.emit({ type: 'agent_settled' })
+    const response = await withTimeout(prompt, 'prompt after never-opened close')
+    assert.equal(typeof response.messageId, 'string')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 pipelined prompts: one running, no idle between turns', async () => {
+  const proc = patchSpawn(fakeState('v2-pipe'))
+  const { conn, updates, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+
+    const first = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-pipe',
+      prompt: [{ type: 'text', text: 'one' }]
+    })
+    const second = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-pipe',
+      prompt: [{ type: 'text', text: 'two' }]
+    })
+
+    await waitFor(() => proc.prompts.length === 1, 'first turn dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'first turn' } })
+    proc.emit({ type: 'agent_settled' })
+    await waitFor(() => proc.prompts.length === 2, 'second turn dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'second turn' } })
+    proc.emit({ type: 'agent_settled' })
+
+    const [responseOne, responseTwo] = await Promise.all([
+      withTimeout(first, 'first prompt'),
+      withTimeout(second, 'second prompt')
+    ])
+    assert.equal(typeof responseOne.messageId, 'string')
+    assert.equal(typeof responseTwo.messageId, 'string')
+
+    const running = received('state_update').filter(update => (update.update as { state: string }).state === 'running')
+    assert.equal(running.length, 1, 'one running snapshot while both prompts are in flight')
+
+    // No idle may precede the last turn update: the session only reports idle
+    // once every in-flight prompt has settled.
+    const lastChunkIndex = updates.map(update => update.update.sessionUpdate).lastIndexOf('agent_message_chunk')
+    const falseIdle = received('state_update').find(
+      update => (update.update as { state: string }).state === 'idle' && updates.indexOf(update) < lastChunkIndex
+    )
+    assert.equal(falseIdle, undefined, 'no idle snapshot between pipelined turns')
+    const idles = received('state_update').filter(update => (update.update as { state: string }).state === 'idle')
+    assert.ok(idles.length > 0, 'the busy period settles with idle snapshots')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 prompt followed immediately by cancel: cancelled, no full turn', async () => {
+  const proc = patchSpawn(fakeState('v2-cancel'))
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+
+    const prompt = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-cancel',
+      prompt: [{ type: 'text', text: 'long work' }]
+    })
+    await conn.agent.notify(v2.methods.agent.session.cancel, { sessionId: 'v2-cancel' })
+    // Real pi settles its aborted run; the deterministic stand-in does the same.
+    proc.emit({ type: 'agent_settled' })
+    const response = await withTimeout(prompt, 'cancelled prompt')
+
+    // Inserted: the request answers with its messageId, and the turn reports
+    // the cancellation as its idle state.
+    assert.equal(typeof response.messageId, 'string')
+    const idle = received('state_update').find(update => (update.update as { state: string }).state === 'idle')
+    assert.ok(idle, 'idle after the cancelled turn')
+    assert.equal((idle!.update as { stopReason?: string }).stopReason, 'cancelled')
+    assert.equal(received('agent_message_chunk').length, 0, 'no turn output was streamed')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 prompt followed immediately by close: acknowledged without a respawned full turn', async () => {
+  const proc = patchSpawn(fakeState('v2-close-race'))
+  proc.terminateOnDispose = true
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+
+    const prompt = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-close-race',
+      prompt: [{ type: 'text', text: 'long work' }]
+    })
+    const close = conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-close-race' })
+    const [response] = await Promise.all([withTimeout(prompt, 'prompt under close'), withTimeout(close, 'close')])
+
+    assert.equal(typeof response.messageId, 'string')
+    // The cancelled turn's idle was flushed before the close was acknowledged.
+    const idle = received('state_update').find(update => (update.update as { state: string }).state === 'idle')
+    assert.ok(idle, 'idle flushed before the close response')
+    assert.equal((idle!.update as { stopReason?: string }).stopReason, 'cancelled')
+    assert.equal(received('agent_message_chunk').length, 0, 'no full turn ran')
+    const promptsAtClose = proc.prompts.length
+    await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(proc.prompts.length, promptsAtClose, 'no session respawn or further dispatch after close')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 prompt of an unknown session rejects before any user_message echo', async () => {
+  const proc = patchSpawn(fakeState('v2-unknown'))
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await assert.rejects(
+      () =>
+        withTimeout(
+          conn.agent.request(v2.methods.agent.session.prompt, {
+            sessionId: 'no-such-session',
+            prompt: [{ type: 'text', text: 'hello' }]
+          }),
+          'unknown session prompt'
+        ),
+      (err: unknown) => {
+        assert.equal((err as { code?: number }).code, -32002)
+        return true
+      }
+    )
+    assert.equal(received('user_message').length, 0, 'no echo for a rejected prompt')
+    assert.equal(received('state_update').length, 0, 'no state snapshot for a rejected prompt')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 turn failure resolves the prompt request and reports the error via idle', async () => {
+  const proc = patchSpawn(fakeState('v2-error'))
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+    // The pi turn itself fails after insertion.
+    ;(proc as unknown as { prompt: unknown }).prompt = async () => {
+      throw new Error('provider exploded')
+    }
+
+    const response = await withTimeout(
+      conn.agent.request(v2.methods.agent.session.prompt, {
+        sessionId: 'v2-error',
+        prompt: [{ type: 'text', text: 'hello' }]
+      }),
+      'failing prompt'
+    )
+    assert.equal(typeof response.messageId, 'string', 'an inserted prompt never rejects the request')
+
+    const idle = received('state_update').find(update => (update.update as { state: string }).state === 'idle')
+    assert.ok(idle, 'error idle reported')
+    const update = idle!.update as { stopReason?: string; error?: { code: number; message: string } }
+    assert.equal(update.stopReason, 'error')
+    assert.match(update.error?.message ?? '', /provider exploded/)
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 edit tool updates translate the structured diff with a git patch', async () => {
+  const proc = patchSpawn(fakeState('v2-diff'))
+  const workspace = mkdtempSync(join(tmpdir(), 'pi-acp-v2-diff-'))
+  const editedFile = join(workspace, 'file.txt')
+  writeFileSync(editedFile, 'old line\n')
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+
+    proc.emit({
+      type: 'tool_execution_start',
+      toolCallId: 't-edit',
+      toolName: 'edit',
+      args: { path: editedFile, edits: [{ oldText: 'old line', newText: 'new line' }] }
+    })
+    writeFileSync(editedFile, 'new line\n')
+    proc.emit({ type: 'tool_execution_end', toolCallId: 't-edit', toolName: 'edit', result: 'edited', isError: false })
+
+    await waitFor(
+      () => received('tool_call_update').some(update => (update.update as { status?: string }).status === 'completed'),
+      'completed edit tool call'
+    )
+    const completed = received('tool_call_update').find(
+      update => (update.update as { status?: string }).status === 'completed'
+    )
+    const content = (completed!.update as { content?: unknown[] }).content
+    assert.ok(content?.length, 'diff content preserved')
+    const diff = content![0] as {
+      type: string
+      changes: Array<{ operation: string; path: string }>
+      patch?: { format: string; text: string }
+    }
+    assert.equal(diff.type, 'diff')
+    assert.deepEqual(diff.changes, [{ operation: 'modify', path: editedFile }])
+    assert.equal(diff.patch?.format, 'git_patch')
+    assert.match(diff.patch?.text ?? '', /-old line/)
+    assert.match(diff.patch?.text ?? '', /\+new line/)
+    // The translated content is valid per the installed v2 schema guard.
+    assert.ok(v2.ToolCallContent.isDiff(diff as v2.ToolCallContent))
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 replay message ids are deterministic and adjacent same-kind entries stay separate', async () => {
+  const proc = patchSpawn(fakeState('s1'))
+  proc.terminateOnDispose = true
+  // Two adjacent user entries followed by an assistant entry.
+  proc.entrySnapshot = {
+    entries: [
+      { id: 'e1', parentId: null, timestamp: '', type: 'message', message: { role: 'user', content: 'Hello' } },
+      { id: 'e2', parentId: 'e1', timestamp: '', type: 'message', message: { role: 'user', content: 'Second' } },
+      {
+        id: 'e3',
+        parentId: 'e2',
+        timestamp: '',
+        type: 'message',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }] }
+      }
+    ],
+    leafId: 'e3'
+  }
+
+  let activeAgent: PiAcpAgent | null = null
+  const { conn, updates } = connectV2(agent => {
+    activeAgent = agent
+  })
+  // Chunk ids captured per replay window, waiting for each window's chunks
+  // to arrive so notification delivery lag cannot mix the windows.
+  const windowIds = async (replay: () => Promise<unknown>): Promise<Array<[string, string]>> => {
+    const from = updates.length
+    await withTimeout(replay(), 'replay')
+    await waitFor(
+      () => updates.slice(from).filter(update => update.update.sessionUpdate.endsWith('_chunk')).length >= 3,
+      'replayed chunks'
+    )
+    return updates
+      .slice(from)
+      .filter(update => update.update.sessionUpdate.endsWith('_chunk'))
+      .map(
+        update => [update.update.sessionUpdate, (update.update as { messageId: string }).messageId] as [string, string]
+      )
+  }
+  try {
+    await initialize(conn)
+    assert.ok(activeAgent)
+    ;(activeAgent as unknown as { store: unknown }).store = {
+      get: () => ({
+        sessionId: 's1',
+        cwd: TEST_CWD,
+        sessionFile: SESSION_FILE,
+        updatedAt: new Date().toISOString()
+      }),
+      upsert() {}
+    }
+
+    const replay = () =>
+      conn.agent.request(v2.methods.agent.session.resume, {
+        sessionId: 's1',
+        cwd: TEST_CWD,
+        replayFrom: { type: 'start' }
+      })
+
+    const firstIds = await windowIds(replay)
+    const secondIds = await windowIds(replay)
+
+    // Replaying the same history twice yields identical ids.
+    assert.deepEqual(secondIds, firstIds)
+    assert.deepEqual(firstIds, [
+      ['user_message_chunk', 'replay:user_message_chunk:0'],
+      ['user_message_chunk', 'replay:user_message_chunk:1'],
+      ['agent_message_chunk', 'replay:agent_message_chunk:0']
+    ])
+    // Adjacent same-kind entries never merge: the two user entries carry
+    // distinct ids.
+    assert.notEqual(firstIds[0]![1], firstIds[1]![1])
   } finally {
     conn.close()
     proc.restore()
