@@ -1,6 +1,6 @@
 import { createReadStream, existsSync } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
-import { dirname, join, isAbsolute, relative, resolve } from 'node:path'
+import { join, isAbsolute, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { getAgentDir, getGlobalPiSettings, getMergedPiSettings } from './pi-settings.js'
 import { directoriesAlias, directoryKey, type DirectoryKey } from './session-cwd.js'
@@ -265,9 +265,11 @@ function addStoredDiscoveryRoot(
   agentDir: string,
   configuredRoot = sessionDiscoveryRoot(stored.cwd, env, agentDir)
 ): void {
+  // Only configured roots are ever scanned: adding the mapped file's parent
+  // directory once walked a whole project tree. The mapped file itself is
+  // still projected directly, so an unusable mapping only fails its own
+  // bounded header read.
   roots.add(configuredRoot)
-  const fromRoot = relative(resolve(configuredRoot), resolve(stored.sessionFile))
-  if (fromRoot.startsWith('..') || isAbsolute(fromRoot)) roots.add(dirname(stored.sessionFile))
 }
 
 async function jsonlFiles(root: string, skipArtifacts = false): Promise<string[]> {

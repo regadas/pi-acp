@@ -153,8 +153,14 @@ export class V2ClientConnection implements AcpClient {
       if (depth === 0) {
         this.replayDepth.delete(sessionId)
         await this.flushReplayEntry(sessionId)
-        this.replayContent.delete(sessionId)
-        this.currentReplayKey.delete(sessionId)
+        // A window that opened while this flush was awaited re-opened the
+        // replay mode and owns the buffers now; clearing them would erase
+        // its replayed state (its resume would then succeed without its
+        // buffered final entry).
+        if ((this.replayDepth.get(sessionId) ?? 0) === 0) {
+          this.replayContent.delete(sessionId)
+          this.currentReplayKey.delete(sessionId)
+        }
       } else {
         this.replayDepth.set(sessionId, depth)
       }

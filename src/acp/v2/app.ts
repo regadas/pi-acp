@@ -64,6 +64,13 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
    * prompt closed instead of restoring behind the acknowledged close.
    */
   const closeGenerations = new Map<string, number>()
+  /**
+   * Cancel generation per session, bumped by every session/cancel: a prompt
+   * validating a stored-but-not-live session snapshots it before its await,
+   * so a cancel landing in that window — with no turn to reach yet — still
+   * reaches that prompt: its turn is admitted and immediately cancelled.
+   */
+  const cancelGenerations = new Map<string, number>()
 
   const getAgent = (): PiAcpAgent => {
     if (!active) throw RequestError.internalError({}, 'pi-acp agent is not connected')
@@ -125,6 +132,7 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       pendingFinals.clear()
       closingCounts.clear()
       closeGenerations.clear()
+      cancelGenerations.clear()
       opts?.onAgent?.(agent)
 
       connection.signal.addEventListener(
@@ -230,20 +238,24 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       if ((closingCounts.get(sessionId) ?? 0) > 0) {
         throw RequestError.requestCancelled({}, `session closed while prompting: ${sessionId}`)
       }
+      // A cancel landing while a stored-but-not-live session's prompt is
+      // still validating has no turn to reach yet; it is remembered here and
+      // applied to the admitted turn (below) as an immediate cancellation.
+      let cancelledWhileValidating = false
       if (!agent.hasLiveSession(sessionId)) {
         // Stored-but-not-live: the validation await is a race window, so the
         // close generation is snapshotted before it and re-checked after — a
         // close/delete completing during the window owns the session and this
         // prompt fails closed instead of restoring behind its acknowledgement.
-        // (A cancel landing in the same window has no turn to reach yet; that
-        // narrow loss is a documented residual.)
         const closeGeneration = closeGenerations.get(sessionId) ?? 0
+        const cancelGeneration = cancelGenerations.get(sessionId) ?? 0
         if (!(await agent.hasStoredSession(sessionId))) {
           throw RequestError.resourceNotFound(sessionId)
         }
         if ((closeGenerations.get(sessionId) ?? 0) !== closeGeneration) {
           throw RequestError.requestCancelled({}, `session closed while prompting: ${sessionId}`)
         }
+        cancelledWhileValidating = (cancelGenerations.get(sessionId) ?? 0) !== cancelGeneration
       }
       const messageId = randomUUID()
       const wasIdle = (promptCounts.get(sessionId) ?? 0) === 0
@@ -251,12 +263,20 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       // Start the echo and the running snapshot without awaiting them, then
       // admit the prompt to the engine in the same tick: the SDK's write
       // queue keeps the wire order, and an immediately following cancel or
-      // close reaches the engine with the prompt already admitted.
+      // close reaches the engine with the prompt already admitted. A cancel
+      // remembered from the validation window cancels this turn from its
+      // first tick through an already-aborted signal: the client sees a
+      // short cancelled turn, and nothing is restored or dispatched behind
+      // the cancellation.
       const echo = send(sessionId, { sessionUpdate: 'user_message', messageId, content: ctx.params.prompt })
       const running = wasIdle
         ? send(sessionId, { sessionUpdate: 'state_update', state: 'running' } as v2.SessionUpdate)
         : null
-      const turn = runPromptWithCancellation(agent, v1PromptRequest(ctx.params), ctx.signal)
+      const turn = runPromptWithCancellation(
+        agent,
+        v1PromptRequest(ctx.params),
+        cancelledWhileValidating ? AbortSignal.abort() : ctx.signal
+      )
       // Handle the turn's outcome from this tick on: a turn that settles or
       // fails while the sends above are still queued (client backpressure)
       // must never sit unhandled.
@@ -295,7 +315,11 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
         if (tails.size === 0) promptTails.delete(sessionId)
       }
     })
-    .onNotification(v2.methods.agent.session.cancel, ctx => getInitializedAgent().cancel(ctx.params))
+    .onNotification(v2.methods.agent.session.cancel, ctx => {
+      const sessionId = ctx.params.sessionId
+      cancelGenerations.set(sessionId, (cancelGenerations.get(sessionId) ?? 0) + 1)
+      return getInitializedAgent().cancel(ctx.params)
+    })
 }
 
 function jsonRpcError(error: unknown): { code: number; message: string; data?: unknown } {
