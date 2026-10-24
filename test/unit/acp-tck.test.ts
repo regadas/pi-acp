@@ -111,9 +111,6 @@ function fakeTckWorld({ launchDirName = 'launch' }: { launchDirName?: string } =
   const lateLog = join(root, 'late-start.log')
   const latePid = join(root, 'late-start.pid')
   const tckRegistry = join(root, 'tck-registry.txt')
-  const leakChildPid = join(root, 'leak-child.pid')
-  const leakShellPid = join(root, 'leak-shell.pid')
-  const pipeChildPid = join(root, 'pipe-child.pid')
   for (const dir of [bin, tckDir, reportDir, join(launchCwd, 'dist'), tmpRoot]) {
     mkdirSync(dir, { recursive: true })
   }
@@ -142,22 +139,6 @@ esac
 if [ "\${FAKE_PI_CRASH:-0}" = "1" ]; then echo 'pi: boom' >&2; exit 3; fi
 if [ -n "\${FAKE_PI_DELAY:-}" ]; then /bin/sleep "$FAKE_PI_DELAY"; fi
 if [ "\${FAKE_PI_IGNORE_TERM:-0}" = "1" ]; then trap '' TERM; /bin/sleep 5; echo "pi 1.2.0"; exit 0; fi
-if [ -n "\${FAKE_PI_LEAK_CHILD_PID:-}" ]; then
-  # A probe tree that leaks: shell and recorded child both ignore SIGTERM and
-  # would outlive any leader-only or soft kill by their own 30s expiry.
-  trap '' TERM
-  [ -n "\${FAKE_PI_LEAK_SHELL_PID:-}" ] && echo $$ > "\${FAKE_PI_LEAK_SHELL_PID}"
-  ( trap '' TERM; exec /bin/sleep 30 ) &
-  echo $! > "\${FAKE_PI_LEAK_CHILD_PID}"
-  /bin/sleep 30
-fi
-if [ -n "\${FAKE_PI_PIPE_CHILD_PID:-}" ]; then
-  # Leader exits first while a same-group child keeps the inherited probe
-  # pipes open: close must not hang and the group must still be torn down.
-  ( trap '' TERM; exec /bin/sleep 30 ) &
-  echo $! > "\${FAKE_PI_PIPE_CHILD_PID}"
-  exit 0
-fi
 echo "\${FAKE_PI_VERSION:-pi 1.2.0}"
 `
     ],
@@ -399,9 +380,6 @@ setTimeout(() => process.exit(0), 120000)
     lateLog,
     latePid,
     tckRegistry,
-    leakChildPid,
-    leakShellPid,
-    pipeChildPid,
     decoyScript,
     decoyPidFile,
     sentinelHome,
@@ -460,31 +438,6 @@ const killPidFileIfAlive = async (file: string) => {
         process.kill(pid, 'SIGKILL')
       } catch {
         /* already gone */
-      }
-      await awaitPidDeath(pid, 5_000)
-    }
-  } catch {
-    /* the process never recorded its pid */
-  }
-}
-
-/**
- * Same, but for a fixture-owned process GROUP led by the recorded pid: a
- * leader-only kill would orphan the group's unrecorded members (the hanging
- * probe shell's own foreground `sleep`), so the whole group is taken instead.
- */
-const killGroupPidFileIfAlive = async (file: string) => {
-  try {
-    const pid = Number(readFileSync(file, 'utf8'))
-    if (Number.isInteger(pid) && isPidAlive(pid)) {
-      try {
-        process.kill(-pid, 'SIGKILL')
-      } catch {
-        try {
-          process.kill(pid, 'SIGKILL')
-        } catch {
-          /* already gone */
-        }
       }
       await awaitPidDeath(pid, 5_000)
     }
@@ -1093,122 +1046,21 @@ test(
 )
 
 test(
-  'a hard probe timeout kills the whole probe process group, not just the shell',
-  { skip: isWindows ? 'POSIX-only process groups' : false },
-  async () => {
-    const world = fakeTckWorld()
-    const started = Date.now()
-    try {
-      const result = runRunner(world, {
-        env: { ...world.env, FAKE_PI_LEAK_CHILD_PID: world.leakChildPid, PI_ACP_TCK_TIMEOUT_MS: '2500' },
-        timeout: 30_000
-      })
-      assert.equal(result.error, undefined, String(result.error))
-      assert.equal(
-        result.status,
-        3,
-        `the leaky probe must be a bounded setup error: ${result.stdout}\n${result.stderr}`
-      )
-      assert.deepEqual(runnerErrorKinds(world), ['setup-error'])
-      assert.match(result.stderr, /pi|budget/, 'the probe failure must be surfaced')
-      const childPid = Number(readFileSync(world.leakChildPid, 'utf8'))
-      assert.ok(Number.isInteger(childPid), 'the probe child must record its pid before the probe hangs')
-      assert.ok(
-        await awaitPidDeath(childPid, 10_000),
-        'the SIGTERM-ignoring probe child must die with the group kill, not survive the runner'
-      )
-      assert.ok(
-        Date.now() - started < 20_000,
-        'the probe child must die from the hard group kill, not from its own 30s expiry'
-      )
-      assertScratchCleaned(world)
-    } finally {
-      await killPidFileIfAlive(world.leakChildPid)
-      rmSync(world.root, { recursive: true, force: true })
-    }
-  }
-)
-
-test(
-  'a probe timeout still tears down a pipe-holding group after the leader exits',
-  { skip: isWindows ? 'POSIX-only process groups' : false },
-  async () => {
-    const world = fakeTckWorld()
-    const observed = spawnObservedRunner(world, {
-      ...world.env,
-      FAKE_PI_PIPE_CHILD_PID: world.pipeChildPid,
-      PI_ACP_TCK_TIMEOUT_MS: '2500'
-    })
-    try {
-      const status = await exitedWithin(observed, 15_000)
-      assert.equal(status, 3, 'the probe must settle through the timeout instead of hanging on held pipes')
-      assert.match(observed.stderr(), /budget/, 'the timeout diagnostic must be surfaced')
-      assert.deepEqual(runnerErrorKinds(world), ['setup-error'])
-      const childPid = Number(readFileSync(world.pipeChildPid, 'utf8'))
-      assert.ok(Number.isInteger(childPid), 'the pipe-holding child must record its pid')
-      assert.ok(
-        await awaitPidDeath(childPid, 10_000),
-        'the pipe-holding same-group child must die with the group kill, not hold the probe open'
-      )
-      assertScratchCleaned(world)
-    } finally {
-      await killPidFileIfAlive(world.pipeChildPid)
-      await observed.killOwned()
-      rmSync(world.root, { recursive: true, force: true })
-    }
-  }
-)
-
-test(
-  'an interruption still tears down a pipe-holding probe group after the leader exits',
-  { skip: isWindows ? 'POSIX-only process groups' : false },
-  async () => {
-    const world = fakeTckWorld()
-    const observed = spawnObservedRunner(world, { ...world.env, FAKE_PI_PIPE_CHILD_PID: world.pipeChildPid })
-    try {
-      const deadline = Date.now() + 15_000
-      while (!existsSync(world.pipeChildPid) && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 25))
-      }
-      assert.ok(existsSync(world.pipeChildPid), 'the pipe-holding child must start before the signal')
-      observed.signal('SIGTERM')
-      const status = await exitedWithin(observed, 15_000)
-      assert.equal(status, 3, 'the interrupted probe must settle to setup exit 3, not hang on held pipes')
-      assert.match(observed.stderr(), /interrupted by SIGTERM/, 'the interruption must be surfaced')
-      assert.deepEqual(runnerErrorKinds(world), ['setup-error'])
-      const childPid = Number(readFileSync(world.pipeChildPid, 'utf8'))
-      assert.ok(
-        await awaitPidDeath(childPid, 10_000),
-        'the pipe-holding same-group child must die with the group kill, not survive the runner'
-      )
-      assertScratchCleaned(world)
-    } finally {
-      await killPidFileIfAlive(world.pipeChildPid)
-      await observed.killOwned()
-      rmSync(world.root, { recursive: true, force: true })
-    }
-  }
-)
-
-test(
   'pid-file cleanup guards never act on empty, invalid or unsafe pids',
   { skip: isWindows ? 'POSIX-only process groups' : false },
   async () => {
     if (process.env.FAKE_PID_GUARD_INNER === '1') {
       // The real negative control, running inside a disposable detached process
       // group: with the pid>1 guard every input below is a pure no-op. A
-      // regressed guard would kill(0)/kill(-0) only this inner group (never
-      // the outer suite or anything else); pid 1 is never given to the group
-      // helper because kill(-1) is unbounded and must never be exercised.
+      // regressed guard would kill(0) only this inner group (never the outer
+      // suite or anything else).
       const root = process.env.FAKE_PID_GUARD_ROOT!
-      const plain = [join(root, 'empty.pid'), join(root, 'zero.pid'), join(root, 'one.pid'), join(root, 'garbage.pid')]
-      const group = [plain[0], plain[1], plain[3]]
-      writeFileSync(plain[0], '')
-      writeFileSync(plain[1], '0')
-      writeFileSync(plain[2], '1')
-      writeFileSync(plain[3], 'not-a-pid')
-      for (const file of plain) await killPidFileIfAlive(file)
-      for (const file of group) await killGroupPidFileIfAlive(file)
+      const files = [join(root, 'empty.pid'), join(root, 'zero.pid'), join(root, 'one.pid'), join(root, 'garbage.pid')]
+      writeFileSync(files[0], '')
+      writeFileSync(files[1], '0')
+      writeFileSync(files[2], '1')
+      writeFileSync(files[3], 'not-a-pid')
+      for (const file of files) await killPidFileIfAlive(file)
       assert.ok(isPidAlive(process.pid), 'no pid-file input may ever signal the caller')
       return
     }
@@ -1273,52 +1125,6 @@ test(
         }
       }
       rmSync(root, { recursive: true, force: true })
-    }
-  }
-)
-
-test(
-  'a setup interruption tears down the active probe process group and maps to exit 3',
-  { skip: isWindows ? 'POSIX-only process groups' : false },
-  async () => {
-    const world = fakeTckWorld()
-    const observed = spawnObservedRunner(world, {
-      ...world.env,
-      FAKE_PI_LEAK_CHILD_PID: world.leakChildPid,
-      FAKE_PI_LEAK_SHELL_PID: world.leakShellPid
-    })
-    try {
-      const deadline = Date.now() + 15_000
-      while (!existsSync(world.leakChildPid) && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 25))
-      }
-      assert.ok(existsSync(world.leakChildPid), 'the probe child must record its pid before the signal')
-      observed.signal('SIGTERM')
-      const status = await observed.finish()
-      assert.equal(
-        status,
-        3,
-        `an interrupted setup probe must map to setup exit 3, not death by signal: ${observed.stderr()}`
-      )
-      assert.match(observed.stderr(), /interrupted by SIGTERM/, 'the interruption must be surfaced')
-      assert.deepEqual(runnerErrorKinds(world), ['setup-error'])
-      const probePid = Number(readFileSync(world.leakShellPid, 'utf8'))
-      const childPid = Number(readFileSync(world.leakChildPid, 'utf8'))
-      assert.ok(Number.isInteger(probePid) && Number.isInteger(childPid), 'both probe pids must be recorded')
-      assert.ok(
-        await awaitPidDeath(probePid, 10_000),
-        'the interrupted probe shell must die with its group, not survive the runner'
-      )
-      assert.ok(
-        await awaitPidDeath(childPid, 10_000),
-        'the SIGTERM-ignoring probe child must die with its group, not survive the runner'
-      )
-      assertScratchCleaned(world)
-    } finally {
-      await killGroupPidFileIfAlive(world.leakShellPid)
-      await killPidFileIfAlive(world.leakChildPid)
-      await observed.killOwned()
-      rmSync(world.root, { recursive: true, force: true })
     }
   }
 )

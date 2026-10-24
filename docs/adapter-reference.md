@@ -155,9 +155,9 @@ as nonnegative integers); every
 other exit/verdict combination, a missing/invalid report, and all setup/runner/timeout failures exit
 `3` with a best-effort runner-error JSON alongside the report. `PI_ACP_TCK_TIMEOUT_MS` (default 20
 minutes) is validated up front and is one wall-clock deadline covering the bounded setup probes
-(each individually hard-killed as a whole POSIX process group at the shorter of its own limit or the
-remaining budget, so a probe that traps SIGTERM or leaks children can neither stall the runner nor
-outlive setup; Windows keeps a best-effort single-process kill that the tests do not cover), provisioning
+(each a synchronous, non-detached child hard-killed at the shorter of its own limit or the remaining
+budget, so a hung or signal-trapping probe cannot stall the runner; external signals reach probe
+children naturally, and leaked probe children are not force-killed by the runner), provisioning
 and the suite; process teardown may extend past it by a bounded cleanup grace only. The runner
 launches every TCK agent through an owned bootstrap that registers the agent root before the adapter
 starts, so separately-sessioned agents (and their pi children, via the agent's own session) are torn

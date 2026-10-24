@@ -9,7 +9,7 @@
 // 3 distinguishes every runner/setup error (bad checkout, missing
 // prerequisites, watchdog timeout, missing/invalid/inconsistent report, or
 // any unexpected failure), each with a best-effort persistent diagnostic.
-import { spawn, spawnSync, execFileSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -26,7 +26,6 @@ const SETUP_EXIT = 3
 const DEFAULT_RUN_BUDGET_MS = 20 * 60_000
 const MAX_TIMER_MS = 2_147_483_000
 const PROBE_TIMEOUT_MS = 10_000
-const PROBE_FORCE_GRACE_MS = 1_000
 const RESPONSE_TIMEOUT_S = 45
 const STARTUP_TIMEOUT_S = 60
 const TEST_TIMEOUT_S = 180
@@ -153,143 +152,45 @@ const withoutUntrustedOverrides = env => {
 const probeEnv = withoutUntrustedOverrides(process.env)
 
 /**
- * Bounded prerequisite probe. Every probe is capped by the remaining global
- * budget and — on POSIX — spawned as its own process group, so a timeout
- * hard-kills the whole probe tree: a probe that traps SIGTERM, or leaks
- * children like a backgrounded `/bin/sleep`, can neither stall the runner nor
- * outlive the setup phase. Windows keeps the previous best-effort
- * single-process kill, which these tests do not cover.
+ * Bounded prerequisite probe. Every probe runs as a plain synchronous child
+ * capped by the remaining global budget, so a hung or signal-trapping probe
+ * cannot stall the runner: its own timeout hard-kills it at the shorter of
+ * the per-probe limit or that budget. Probes are not detached — external
+ * signals reach them and their children naturally — and a probe that leaks
+ * children is no longer force-killed by the runner.
  */
-const runProbe = async (command, args, { remaining, describe }) => {
+const runProbe = (command, args, { remaining, describe }) => {
   if (remaining() <= 0)
     throw new SetupError(
       'the global time budget was exhausted during setup; raise PI_ACP_TCK_TIMEOUT_MS or fix the slow environment'
     )
   const bound = Math.max(1, Math.min(PROBE_TIMEOUT_MS, remaining()))
-  const fail = detail =>
-    new SetupError(`${describe} did not answer within ${bound}ms of the remaining budget: ${detail}`)
-  if (process.platform === 'win32') {
-    if (command === 'git') {
-      try {
-        return execFileSync(command, args, { encoding: 'utf8', timeout: bound, killSignal: 'SIGKILL' }).trim()
-      } catch (error) {
-        throw fail(error.stderr || error.message)
-      }
-    }
-    const result = spawnSync(command, args, { encoding: 'utf8', timeout: bound, killSignal: 'SIGKILL', env: probeEnv })
-    if (result.error?.code === 'ENOENT')
-      throw new SetupError(`${command} not found on PATH${command === 'pi' ? '; pi >= 1.2.0 is required' : ''}`)
-    if (result.error || result.signal || result.status !== 0) throw fail(String(result.error?.message ?? 'no output'))
-    return result.stdout.trim()
-  }
-  const child = spawn(command, args, { env: probeEnv, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
-  let stdout = ''
-  let stderr = ''
-  child.stdout.setEncoding('utf8').on('data', chunk => {
-    stdout += chunk
-  })
-  child.stderr.setEncoding('utf8').on('data', chunk => {
-    stderr += chunk
-  })
-  // Ownership is pending-close, not leader liveness: a same-group child that
-  // keeps the stdio pipes open after the leader exits still holds this probe
-  // group, so cleanup stays armed until close completes (and never after).
-  let closePending = true
-  const close = new Promise((resolve, reject) => {
-    child.once('error', error => {
-      closePending = false
-      reject(error)
-    })
-    child.once('close', (code, signal) => {
-      closePending = false
-      resolve({ code, signal })
-    })
-  })
-  const killGroup = () => {
-    if (!closePending) return
-    try {
-      process.kill(-child.pid, 'SIGKILL')
-    } catch {
-      // Direct-pid fallback only while the leader handle proves the pid is ours.
-      if (child.pid && child.exitCode === null && child.signalCode === null) {
-        try {
-          process.kill(child.pid, 'SIGKILL')
-        } catch {
-          /* already gone */
-        }
-      }
-    }
-  }
-  let timedOut = false
-  let interrupted = null
-  let forceTimer = null
-  let settleForcedNow
-  const forcedSettlement = new Promise(resolve => {
-    settleForcedNow = resolve
-  })
-  const forceCompletion = () => {
-    if (!closePending || forceTimer) return
-    killGroup()
-    // Destroying the captured pipes releases a pipe-holding group member's
-    // grip on the close event; the bounded settlement below never waits on it.
-    child.stdout?.destroy()
-    child.stderr?.destroy()
-    forceTimer = setTimeout(() => {
-      closePending = false
-      settleForcedNow({ forceClosed: true })
-    }, PROBE_FORCE_GRACE_MS)
-  }
-  const onSignal = signal => {
-    interrupted = signal
-    forceCompletion()
-  }
-  // While the probe runs, an interruption tears the probe group down and maps
-  // to a setup error; without this the runner would die by default signal
-  // handling and leak the detached probe tree it still owns.
-  process.on('SIGINT', onSignal)
-  process.on('SIGTERM', onSignal)
-  const timer = setTimeout(() => {
-    timedOut = true
-    forceCompletion()
-  }, bound)
-  try {
-    const status = await Promise.race([
-      close.catch(error => {
-        if (error.code === 'ENOENT')
-          throw new SetupError(`${command} not found on PATH${command === 'pi' ? '; pi >= 1.2.0 is required' : ''}`)
-        throw fail(error.message)
-      }),
-      forcedSettlement
-    ])
-    if (interrupted)
-      throw new SetupError(
-        `${describe} was interrupted by ${interrupted}; the owned probe process group was torn down before exiting`
-      )
-    if (timedOut || status.forceClosed || status.signal || status.code !== 0)
-      throw fail((stderr || stdout).trim() || 'no output')
-    return stdout.trim()
-  } finally {
-    clearTimeout(timer)
-    clearTimeout(forceTimer)
-    process.off('SIGINT', onSignal)
-    process.off('SIGTERM', onSignal)
-  }
+  const result = spawnSync(command, args, { encoding: 'utf8', timeout: bound, killSignal: 'SIGKILL', env: probeEnv })
+  if (result.error?.code === 'ENOENT')
+    throw new SetupError(`${command} not found on PATH${command === 'pi' ? '; pi >= 1.2.0 is required' : ''}`)
+  if (result.error || result.signal || result.status !== 0)
+    throw new SetupError(
+      `${describe} did not answer within ${bound}ms of the remaining budget: ${
+        (result.stderr || result.stdout || result.error?.message || 'no output').trim() || 'no output'
+      }`
+    )
+  return result.stdout.trim()
 }
 
-const checkSetup = async remaining => {
+const checkSetup = remaining => {
   const tckDir = process.env.PI_ACP_TCK_DIR
   if (!tckDir)
     throw new SetupError(`Set PI_ACP_TCK_DIR to a clean checkout of ${TCK_REPOSITORY} at revision ${TCK_REVISION}`)
   if (!existsSync(tckDir)) throw new SetupError(`PI_ACP_TCK_DIR does not exist: ${tckDir}`)
   const gitArgs = ['-C', tckDir]
-  const head = await runProbe('git', [...gitArgs, 'rev-parse', 'HEAD'], { remaining, describe: 'git rev-parse' })
+  const head = runProbe('git', [...gitArgs, 'rev-parse', 'HEAD'], { remaining, describe: 'git rev-parse' })
   if (head !== TCK_REVISION) throw new SetupError(`acp-tck checkout must be at revision ${TCK_REVISION}, found ${head}`)
-  const status = await runProbe('git', [...gitArgs, 'status', '--porcelain'], { remaining, describe: 'git status' })
+  const status = runProbe('git', [...gitArgs, 'status', '--porcelain'], { remaining, describe: 'git status' })
   if (status !== '') throw new SetupError(`acp-tck checkout must be clean, found:\n${status}`)
   const adapter = resolve('dist/index.js')
   if (!existsSync(adapter)) throw new SetupError(`Built adapter not found at ${adapter}; run npm run build first`)
-  await runProbe('uv', ['--version'], { remaining, describe: 'uv --version' })
-  const versionOutput = await runProbe('pi', ['--version'], { remaining, describe: 'pi --version' })
+  runProbe('uv', ['--version'], { remaining, describe: 'uv --version' })
+  const versionOutput = runProbe('pi', ['--version'], { remaining, describe: 'pi --version' })
   const version = String(versionOutput).match(/(\d+)\.(\d+)/)
   const [major, minor] = version ? [Number(version[1]), Number(version[2])] : [0, 0]
   if (major < 1 || (major === 1 && minor < 2))
@@ -639,7 +540,7 @@ try {
   const budget = validateBudget(process.env.PI_ACP_TCK_TIMEOUT_MS)
   const deadline = Date.now() + budget
   const remaining = () => deadline - Date.now()
-  const setup = await checkSetup(remaining)
+  const setup = checkSetup(remaining)
   try {
     await mkdir(reportDir, { recursive: true })
   } catch (error) {
