@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
 import type { WireStream } from '@agentclientprotocol/sdk/experimental/v2'
+import { ndJsonStream } from '@agentclientprotocol/sdk/unstable'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakePiRpcProcess, acpStreamPair } from '../helpers/fakes.js'
 import { createPiAcpProtocolRouter } from '../../src/acp/app.js'
@@ -86,6 +87,63 @@ function connectV2(onAgent?: (agent: PiAcpAgent | null) => void) {
     conn,
     updates,
     received: (sessionUpdate: string) => updates.filter(update => update.update.sessionUpdate === sessionUpdate)
+  }
+}
+
+/**
+ * connectV2 over a wire whose agent→client direction can be blocked: an
+ * outbound write then stays pending — client backpressure — while the
+ * client→agent direction keeps carrying requests. `attempted` records every
+ * attempted write's session-update kind (or 'other') in wire order.
+ */
+function connectV2Gated(onAgent?: (agent: PiAcpAgent | null) => void) {
+  const updates: Update[] = []
+  const attempted: string[] = []
+  let blocked = false
+  const waiters: Array<() => void> = []
+  const agentToClient = new TransformStream<Uint8Array, Uint8Array>({
+    transform: (chunk, controller) => {
+      const message = JSON.parse(new TextDecoder().decode(chunk)) as {
+        method?: string
+        params?: { update?: { sessionUpdate?: string } }
+      }
+      attempted.push(message.method === 'session/update' ? (message.params?.update?.sessionUpdate ?? '') : 'other')
+      if (!blocked) {
+        controller.enqueue(chunk)
+        return Promise.resolve()
+      }
+      return new Promise<void>(resolve => {
+        waiters.push(() => {
+          controller.enqueue(chunk)
+          resolve()
+        })
+      })
+    }
+  })
+  const clientToAgent = new TransformStream<Uint8Array, Uint8Array>()
+  createPiAcpProtocolRouter({ onAgent }).connect(
+    ndJsonStream(agentToClient.writable, clientToAgent.readable) as unknown as WireStream
+  )
+  const conn = v2
+    .client({ name: 'pi-acp-v2-tests' })
+    .onNotification(v2.methods.client.session.update, ctx => {
+      updates.push(ctx.params)
+    })
+    .connect(ndJsonStream(clientToAgent.writable, agentToClient.readable) as unknown as v2.Stream)
+  return {
+    conn,
+    updates,
+    received: (sessionUpdate: string) => updates.filter(update => update.update.sessionUpdate === sessionUpdate),
+    gate: {
+      block: (): void => {
+        blocked = true
+      },
+      release: (): void => {
+        blocked = false
+        for (const waiter of waiters.splice(0)) waiter()
+      },
+      attempted
+    }
   }
 }
 
@@ -879,6 +937,120 @@ test('v2 replay: overlapping resume windows keep the replay translation until th
   }
 })
 
+test('v2 replay: a window opened while an older window finalizes still emits its full buffered history', async () => {
+  const proc = patchSpawn(fakeState('s1'))
+  proc.terminateOnDispose = true
+  // One buffered entry per window, flushed only by its window's finalizer.
+  proc.entrySnapshot = {
+    entries: [
+      { id: 'a1', parentId: null, timestamp: '', type: 'message', message: { role: 'user', content: 'Older history' } }
+    ],
+    leafId: 'a1'
+  }
+
+  // The older window's load fails AFTER its replay (its post-replay
+  // configuration read throws), so its window finalizes from a rejection with
+  // its entry buffered and its session evicted — the newer window then
+  // restores without a teardown in between. The second configuration read
+  // (the newer window's, after its replay) is held: the newer window pauses
+  // with its history fully buffered while the older window's final upsert
+  // write is still blocked by the gate.
+  let configReads = 0
+  let releaseConfigRead: () => void = () => {}
+  const configRead = new Promise<void>(resolve => {
+    releaseConfigRead = resolve
+  })
+  const originalModels = proc.getAvailableModels.bind(proc)
+  ;(proc as unknown as { getAvailableModels: () => Promise<unknown> }).getAvailableModels = async () => {
+    configReads += 1
+    if (configReads === 1) throw new Error('older window load fails after its replay')
+    if (configReads === 2) await configRead
+    return originalModels()
+  }
+
+  let activeAgent: PiAcpAgent | null = null
+  const { conn, updates, received, gate } = connectV2Gated(agent => {
+    activeAgent = agent
+  })
+  try {
+    await initialize(conn)
+    assert.ok(activeAgent)
+    ;(activeAgent as unknown as { store: unknown }).store = {
+      get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: SESSION_FILE, updatedAt: new Date().toISOString() }),
+      upsert() {}
+    }
+
+    const resume = () =>
+      conn.agent.request(v2.methods.agent.session.resume, {
+        sessionId: 's1',
+        cwd: TEST_CWD,
+        replayFrom: { type: 'start' }
+      })
+
+    gate.block()
+    const older = resume()
+    await waitFor(() => gate.attempted.includes('user_message'), 'older window final upsert attempted')
+
+    proc.entrySnapshot = {
+      entries: [
+        {
+          id: 'b1',
+          parentId: null,
+          timestamp: '',
+          type: 'message',
+          message: { role: 'assistant', content: [{ type: 'text', text: 'Winner full history' }] }
+        }
+      ],
+      leafId: 'b1'
+    }
+    const newer = resume()
+    await waitFor(() => configReads === 2, 'newer window paused at its configuration read')
+
+    // The older window's final upsert write completes; its finalizer's
+    // cleanup runs in that resolution — it must not erase the newer window's
+    // buffered entry.
+    gate.release()
+    await assert.rejects(() => withTimeout(older, 'older resume'))
+    releaseConfigRead()
+    const newerResponse = await withTimeout(newer, 'newer resume')
+    assert.ok(
+      newerResponse.configOptions?.some(option => option.configId === 'model'),
+      'newer resume succeeded'
+    )
+
+    await waitFor(() => received('agent_message').length >= 1, 'newer window buffered history emitted')
+    // The older window's flushed history arrived (the write the newer
+    // window raced)...
+    assert.deepEqual(
+      received('user_message').map(update => update.update),
+      [{ sessionUpdate: 'user_message', messageId: 'replay:a1', content: [{ type: 'text', text: 'Older history' }] }]
+    )
+    // ...and the newer window — the winner, whose resume succeeded — still
+    // emitted its FULL buffered history, not an empty or partial message.
+    assert.deepEqual(
+      received('agent_message').map(update => update.update),
+      [
+        {
+          sessionUpdate: 'agent_message',
+          messageId: 'replay:b1',
+          content: [{ type: 'text', text: 'Winner full history' }]
+        }
+      ]
+    )
+    assert.equal(
+      updates.filter(update => update.update.sessionUpdate.endsWith('_chunk')).length,
+      0,
+      'replayed history never arrives as chunk updates'
+    )
+    // Let the resumed session's deferred publications settle on the open wire
+    // instead of racing the test's close.
+    await new Promise(resolve => setTimeout(resolve, 25))
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
 test('v2 bare close then prompt, with no resume: the fence clears and a lazily restored full turn runs', async () => {
   // A restore through the real store validates the JSONL header, so the
   // session file carries the header pi itself would have written.
@@ -980,6 +1152,60 @@ test('v2 close completing while a stored-session prompt validates fails the prom
     await new Promise(resolve => setTimeout(resolve, 25))
     assert.equal(proc.prompts.length, promptsAtRace, 'no lazy-restore respawn behind the acknowledged close')
     assert.equal(proc.disposeCount, 1, 'no second session lifetime behind the acknowledged close')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 cancel during a stored-session prompt validation cancels that turn when admitted', async () => {
+  // The prompt validates the stored session through a real repository read,
+  // so the file carries the header pi itself would have written.
+  const cancelFile = join(tmpdir(), 'pi-acp-v2-cancel-race-sess.jsonl')
+  writeFileSync(
+    cancelFile,
+    JSON.stringify({
+      type: 'session',
+      version: 3,
+      id: 'v2-cancel-race',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      cwd: TEST_CWD
+    }) + '\n'
+  )
+  const proc = patchSpawn(fakeState('v2-cancel-race', cancelFile))
+  proc.terminateOnDispose = true
+  const { conn, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+    const first = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-cancel-race',
+      prompt: [{ type: 'text', text: 'first' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'first prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    await withTimeout(first, 'first prompt')
+    await withTimeout(conn.agent.request(v2.methods.agent.session.close, { sessionId: 'v2-cancel-race' }), 'close')
+
+    // The stored session's validation reads the file; the cancel notification
+    // is dispatched while that read is still pending — it has no turn to
+    // reach yet, so it must be applied to the prompt the moment it admits.
+    const prompt = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-cancel-race',
+      prompt: [{ type: 'text', text: 'late' }]
+    })
+    await conn.agent.notify(v2.methods.agent.session.cancel, { sessionId: 'v2-cancel-race' })
+    const response = await withTimeout(prompt, 'prompt cancelled during validation')
+
+    assert.equal(typeof response.messageId, 'string')
+    // The prompt was admitted: its echo and its short cancelled turn arrived.
+    assert.equal(received('user_message').length, 2, 'the cancelled prompt still echoed')
+    const idles = received('state_update').filter(update => (update.update as { state: string }).state === 'idle')
+    assert.equal((idles[idles.length - 1]!.update as { stopReason?: string }).stopReason, 'cancelled')
+    assert.equal(received('agent_message_chunk').length, 0, 'no turn output was streamed')
+    assert.equal(proc.prompts.length, 1, 'the cancelled turn never reached pi')
+    assert.equal(proc.disposeCount, 1, 'no lazy-restore respawn behind the cancellation')
   } finally {
     conn.close()
     proc.restore()

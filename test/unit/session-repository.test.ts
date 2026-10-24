@@ -733,3 +733,54 @@ test('repository.list scopes sessions by cwd filesystem identity, not realpath',
     realpathSync.native = originalNative
   }
 })
+
+test('repository fails fast on empty and out-of-root missing mapped session files', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-unusable-mappings-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  const elsewhere = join(root, 'elsewhere')
+  mkdirSync(sessions)
+  mkdirSync(elsewhere)
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'blank', cwd: root, sessionFile: '' })
+  store.upsert({ sessionId: 'gone', cwd: root, sessionFile: join(elsewhere, 'absent.jsonl') })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  // Both mappings previously turned discovery into an unbounded walk (of `.`
+  // or the missing file's parent directory); they fail fast instead.
+  await assert.rejects(repository.find('blank', root), /empty session file/)
+  await assert.rejects(repository.delete('blank'), /empty session file/)
+  await assert.rejects(repository.find('gone', root), /missing session file outside the discovery root/)
+  await assert.rejects(repository.delete('gone'), /missing session file outside the discovery root/)
+})
+
+test('repository projects an out-of-root mapping directly and never scans its parent directory', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-out-of-root-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  const elsewhere = join(root, 'elsewhere')
+  mkdirSync(sessions)
+  mkdirSync(elsewhere)
+  const mapped = join(elsewhere, 'mapped.jsonl')
+  const newerDuplicate = join(elsewhere, 'newer-duplicate.jsonl')
+  const writeSession = (path: string, timestamp: string) =>
+    writeFileSync(
+      path,
+      `${JSON.stringify({ type: 'session', id: 'wanted', cwd: root })}\n${JSON.stringify({ type: 'message', timestamp, message: { role: 'user', content: path } })}\n`
+    )
+  writeSession(mapped, '2026-01-01T00:00:00.000Z')
+  writeSession(newerDuplicate, '2026-01-02T00:00:00.000Z')
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'wanted', cwd: root, sessionFile: mapped })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  assert.equal((await repository.find('wanted', root))?.sessionFile, mapped, 'the mapped file is used directly')
+  // A parent-directory scan would surface the newer duplicate: it would win
+  // the newest comparison and be unlinked alongside the mapped file.
+  assert.equal(await repository.delete('wanted'), mapped, 'only the mapped file, never the out-of-root sibling')
+  assert.equal(existsSync(mapped), false)
+  assert.equal(existsSync(newerDuplicate), true, 'the parent directory was never scanned or swept')
+  assert.equal(await repository.find('wanted', root), null)
+})

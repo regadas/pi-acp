@@ -1,6 +1,6 @@
 import { createReadStream, existsSync } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
-import { dirname, join, isAbsolute, relative, resolve } from 'node:path'
+import { join, isAbsolute, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { getAgentDir, getGlobalPiSettings, getMergedPiSettings } from './pi-settings.js'
 import { directoriesAlias, directoryKey, type DirectoryKey } from './session-cwd.js'
@@ -258,6 +258,15 @@ function sessionDiscoveryRoot(cwd: string, env: NodeJS.ProcessEnv, agentDir: str
   return resolved.custom ? resolved.path : join(agentDir, 'sessions')
 }
 
+/**
+ * Whether `sessionFile` lies outside `root`. Path segments are preserved:
+ * collapsing `..` can conflate distinct paths through symlinks.
+ */
+function outsideDiscoveryRoot(root: string, sessionFile: string): boolean {
+  const fromRoot = relative(resolve(root), resolve(sessionFile))
+  return fromRoot.startsWith('..') || isAbsolute(fromRoot)
+}
+
 function addStoredDiscoveryRoot(
   roots: Set<string>,
   stored: StoredSession,
@@ -265,9 +274,11 @@ function addStoredDiscoveryRoot(
   agentDir: string,
   configuredRoot = sessionDiscoveryRoot(stored.cwd, env, agentDir)
 ): void {
+  // Only configured roots are ever scanned. The mapped file's parent
+  // directory is deliberately NOT added when the mapping lies outside the
+  // root: that walk is unbounded (it scanned a whole project tree once) and
+  // the mapped file itself is projected directly regardless.
   roots.add(configuredRoot)
-  const fromRoot = relative(resolve(configuredRoot), resolve(stored.sessionFile))
-  if (fromRoot.startsWith('..') || isAbsolute(fromRoot)) roots.add(dirname(stored.sessionFile))
 }
 
 async function jsonlFiles(root: string, skipArtifacts = false): Promise<string[]> {
@@ -322,8 +333,20 @@ export class SessionRepository {
     const paths = new Set<string>()
     const roots = new Set<string>()
     if (stored) {
+      // A blank or out-of-root-missing mapping previously turned the scan
+      // below into an unbounded walk (of `.` or the missing file's parent
+      // directory); both are unusable mappings, so they fail fast instead.
+      if (!stored.sessionFile.trim()) {
+        throw new Error(`Stored session ${sessionId} maps to an empty session file`)
+      }
+      const configuredRoot = sessionDiscoveryRoot(stored.cwd, this.env, this.agentDir)
+      if (outsideDiscoveryRoot(configuredRoot, stored.sessionFile) && !existsSync(stored.sessionFile)) {
+        throw new Error(
+          `Stored session ${sessionId} maps to a missing session file outside the discovery root: ${stored.sessionFile}`
+        )
+      }
       paths.add(stored.sessionFile)
-      addStoredDiscoveryRoot(roots, stored, this.env, this.agentDir)
+      addStoredDiscoveryRoot(roots, stored, this.env, this.agentDir, configuredRoot)
     }
     if (cwd || !stored) roots.add(sessionDiscoveryRoot(cwd ?? process.cwd(), this.env, this.agentDir))
     for (const root of roots) for (const file of await jsonlFiles(root)) paths.add(file)
