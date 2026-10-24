@@ -1010,7 +1010,12 @@ test('v2 replay: a window opened while an older window finalizes still emits its
     // cleanup runs in that resolution — it must not erase the newer window's
     // buffered entry.
     gate.release()
-    await assert.rejects(() => withTimeout(older, 'older resume'))
+    // The older window must fail from its replayed configuration read, not
+    // hang: the matcher excludes withTimeout's own rejection.
+    await assert.rejects(
+      () => withTimeout(older, 'older resume'),
+      (err: unknown) => !/timed out/.test(String((err as Error)?.message))
+    )
     releaseConfigRead()
     const newerResponse = await withTimeout(newer, 'newer resume')
     assert.ok(
@@ -1174,7 +1179,10 @@ test('v2 cancel during a stored-session prompt validation cancels that turn when
   )
   const proc = patchSpawn(fakeState('v2-cancel-race', cancelFile))
   proc.terminateOnDispose = true
-  const { conn, received } = connectV2()
+  let activeAgent: PiAcpAgent | null = null
+  const { conn, received } = connectV2(agent => {
+    activeAgent = agent
+  })
   try {
     await initialize(conn)
     await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
@@ -1198,14 +1206,52 @@ test('v2 cancel during a stored-session prompt validation cancels that turn when
     await conn.agent.notify(v2.methods.agent.session.cancel, { sessionId: 'v2-cancel-race' })
     const response = await withTimeout(prompt, 'prompt cancelled during validation')
 
-    assert.equal(typeof response.messageId, 'string')
+    const echoes = received('user_message')
     // The prompt was admitted: its echo and its short cancelled turn arrived.
-    assert.equal(received('user_message').length, 2, 'the cancelled prompt still echoed')
-    const idles = received('state_update').filter(update => (update.update as { state: string }).state === 'idle')
-    assert.equal((idles[idles.length - 1]!.update as { stopReason?: string }).stopReason, 'cancelled')
+    assert.equal(echoes.length, 2, 'the cancelled prompt still echoed')
+    assert.equal(
+      response.messageId,
+      (echoes[1]!.update as { messageId: string }).messageId,
+      'the response carries the echoed message id of the cancelled prompt'
+    )
+    // Both turns' full state sequence: each admission emits its running
+    // snapshot, each settlement its own terminal idle.
+    assert.deepEqual(
+      received('state_update').map(update => {
+        const { state, stopReason } = update.update as { state: string; stopReason?: string }
+        return stopReason === undefined ? state : `${state}:${stopReason}`
+      }),
+      ['running', 'idle:end_turn', 'running', 'idle:cancelled']
+    )
     assert.equal(received('agent_message_chunk').length, 0, 'no turn output was streamed')
     assert.equal(proc.prompts.length, 1, 'the cancelled turn never reached pi')
     assert.equal(proc.disposeCount, 1, 'no lazy-restore respawn behind the cancellation')
+    assert.ok(activeAgent, 'the connection exposed its agent')
+    assert.equal(
+      (activeAgent as PiAcpAgent).hasLiveSession('v2-cancel-race'),
+      false,
+      'window witness: no restore left a live session behind the cancellation'
+    )
+
+    // The cancel generation is a counter, not a sticky boolean: a cancel
+    // landing before a later prompt's validation window must not cancel it.
+    await conn.agent.notify(v2.methods.agent.session.cancel, { sessionId: 'v2-cancel-race' })
+    // Drain the notification's agent-side dispatch before sending the later
+    // prompt, so the cancel is deterministically before its snapshot.
+    await new Promise(resolve => setImmediate(resolve))
+    const later = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-cancel-race',
+      prompt: [{ type: 'text', text: 'after' }]
+    })
+    await waitFor(() => proc.prompts.length === 2, 'later prompt dispatched after the prior cancel')
+    proc.emit({ type: 'agent_start' })
+    proc.emit({ type: 'agent_settled' })
+    await withTimeout(later, 'prompt after a prior cancel')
+    assert.equal(
+      (received('state_update').at(-1)!.update as { stopReason?: string }).stopReason,
+      'end_turn',
+      'a cancel before the validation window must not cancel the later prompt'
+    )
   } finally {
     conn.close()
     proc.restore()
@@ -1358,9 +1404,8 @@ test('v2 replay of an interleaved entry: one message re-emitting ALL its text ac
 })
 
 test('v2 delete racing a close: the fence holds until both settle', async () => {
-  // The session file lives inside the agent's discovery root (as real pi
-  // lays it out): a file outside the root makes the delete's discovery scan
-  // walk the file's whole parent directory.
+  // The session file lives inside the agent's discovery root, as real pi
+  // lays it out.
   const sessionsDir = join(process.env.PI_CODING_AGENT_DIR!, 'sessions')
   mkdirSync(sessionsDir, { recursive: true })
   const overlapFile = join(sessionsDir, 'pi-acp-v2-c3-sess.jsonl')

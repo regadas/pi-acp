@@ -734,31 +734,71 @@ test('repository.list scopes sessions by cwd filesystem identity, not realpath',
   }
 })
 
-test('repository fails fast on empty and out-of-root missing mapped session files', async t => {
-  const { rmSync } = await import('node:fs')
+test('repository resolves blank and out-of-root missing mappings to null and tombstones them', async t => {
+  const { default: fs } = await import('node:fs')
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-unusable-mappings-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const sessions = join(root, 'sessions')
   const elsewhere = join(root, 'elsewhere')
   mkdirSync(sessions)
   mkdirSync(elsewhere)
+  // A valid sibling of the missing mapped file, same session id: scanning
+  // the missing file's parent directory would discover, remap, and unlink it.
+  const sentinel = join(elsewhere, 'gone.jsonl')
+  writeFileSync(sentinel, `${JSON.stringify({ type: 'session', id: 'gone', cwd: root })}\n`)
   const store = new SessionStore(join(root, 'map.json'))
   store.upsert({ sessionId: 'blank', cwd: root, sessionFile: '' })
   store.upsert({ sessionId: 'gone', cwd: root, sessionFile: join(elsewhere, 'absent.jsonl') })
   const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
 
-  // Both mappings previously turned discovery into an unbounded walk (of `.`
-  // or the missing file's parent directory); they fail fast instead.
-  await assert.rejects(repository.find('blank', root), /empty session file/)
-  await assert.rejects(repository.delete('blank'), /empty session file/)
-  await assert.rejects(repository.find('gone', root), /missing session file outside the discovery root/)
-  await assert.rejects(repository.delete('gone'), /missing session file outside the discovery root/)
+  const realReaddir = fs.promises.readdir
+  const enumerated: string[] = []
+  t.mock.method(fs.promises, 'readdir', (...args: Parameters<typeof realReaddir>) => {
+    enumerated.push(String(args[0]))
+    return realReaddir(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+
+  assert.equal(await repository.find('blank', root), null)
+  assert.equal(await repository.find('gone', root), null)
+  assert.equal(await repository.delete('blank'), null)
+  assert.equal(store.get('blank'), null, 'a blank mapping tombstones instead of failing')
+  assert.equal(await repository.delete('gone'), null)
+  assert.equal(store.get('gone'), null, 'a missing out-of-root mapping tombstones instead of failing')
+  assert.equal(existsSync(sentinel), true, 'the parent directory of the missing file is never scanned or swept')
+  assert.equal(
+    enumerated.some(path => path === elsewhere || path.startsWith(join(elsewhere, '/'))),
+    false,
+    'only the configured root is enumerated'
+  )
+})
+
+test('repository.find repairs an in-root missing mapping inside a dotdot-prefixed directory', async t => {
+  const { rmSync } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-dotdot-archive-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(join(sessions, '..archive'), { recursive: true })
+  const actual = join(sessions, 'wanted.jsonl')
+  writeFileSync(actual, `${JSON.stringify({ type: 'session', id: 'wanted', cwd: root })}\n`)
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'wanted', cwd: root, sessionFile: join(sessions, '..archive', 'old.jsonl') })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  // `..archive` is an ordinary in-root directory name: the missing mapping
+  // stays repairable through configured-root discovery.
+  assert.equal((await repository.find('wanted', root))?.sessionFile, actual)
+  assert.equal(store.get('wanted')?.sessionFile, actual)
 })
 
 test('repository projects an out-of-root mapping directly and never scans its parent directory', async t => {
-  const { rmSync } = await import('node:fs')
+  const { default: fs } = await import('node:fs')
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-out-of-root-'))
-  t.after(() => rmSync(root, { recursive: true, force: true }))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const sessions = join(root, 'sessions')
   const elsewhere = join(root, 'elsewhere')
   mkdirSync(sessions)
@@ -776,6 +816,18 @@ test('repository projects an out-of-root mapping directly and never scans its pa
   store.upsert({ sessionId: 'wanted', cwd: root, sessionFile: mapped })
   const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
 
+  const realReaddir = fs.promises.readdir
+  const enumerated: string[] = []
+  t.mock.method(fs.promises, 'readdir', (...args: Parameters<typeof realReaddir>) => {
+    enumerated.push(String(args[0]))
+    return realReaddir(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+
   assert.equal((await repository.find('wanted', root))?.sessionFile, mapped, 'the mapped file is used directly')
   // A parent-directory scan would surface the newer duplicate: it would win
   // the newest comparison and be unlinked alongside the mapped file.
@@ -783,4 +835,52 @@ test('repository projects an out-of-root mapping directly and never scans its pa
   assert.equal(existsSync(mapped), false)
   assert.equal(existsSync(newerDuplicate), true, 'the parent directory was never scanned or swept')
   assert.equal(await repository.find('wanted', root), null)
+  assert.equal(
+    enumerated.some(path => path === elsewhere || path.startsWith(join(elsewhere, '/'))),
+    false,
+    'the parent directory of the mapped file is never enumerated for find or delete'
+  )
+})
+
+test('repository.list projects an out-of-root mapping without surfacing its unmapped siblings', async t => {
+  const { default: fs } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-out-of-root-list-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  const elsewhere = join(root, 'elsewhere')
+  mkdirSync(sessions)
+  mkdirSync(elsewhere)
+  const writeSession = (path: string, id: string, timestamp: string) =>
+    writeFileSync(
+      path,
+      `${JSON.stringify({ type: 'session', id, cwd: root })}\n${JSON.stringify({ type: 'message', timestamp, message: { role: 'user', content: id } })}\n`
+    )
+  const mapped = join(elsewhere, 'mapped.jsonl')
+  writeSession(mapped, 'wanted', '2026-01-01T00:00:00.000Z')
+  writeSession(join(elsewhere, 'sibling.jsonl'), 'sibling', '2026-01-02T00:00:00.000Z')
+  const store = new SessionStore(join(root, 'map.json'))
+  store.upsert({ sessionId: 'wanted', cwd: root, sessionFile: mapped })
+  const repository = new SessionRepository(store, { PI_CODING_AGENT_SESSION_DIR: sessions }, join(root, 'agent'))
+
+  const realReaddir = fs.promises.readdir
+  const enumerated: string[] = []
+  t.mock.method(fs.promises, 'readdir', (...args: Parameters<typeof realReaddir>) => {
+    enumerated.push(String(args[0]))
+    return realReaddir(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+
+  assert.deepEqual(
+    (await repository.list(root)).map(record => [record.sessionId, record.sessionFile]),
+    [['wanted', mapped]]
+  )
+  assert.equal(
+    enumerated.some(path => path === elsewhere || path.startsWith(join(elsewhere, '/'))),
+    false,
+    'the parent directory of the mapped file is never enumerated'
+  )
 })
