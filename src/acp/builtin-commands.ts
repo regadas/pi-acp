@@ -334,7 +334,7 @@ export async function runBuiltinCommand(
     // export file for a command that already settled as cancelled.
     if (ctx.cancelled()) return { stopReason: 'end_turn' }
 
-    let resultPath = ''
+    let resultPath: string
     try {
       const result = await session.proc.exportHtml(outputPath)
       resultPath = result.path

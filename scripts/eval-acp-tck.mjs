@@ -321,7 +321,7 @@ const teardownOwnedProcesses = async ({ child, registryDir }) => {
   const uvLive = () => Boolean(child && child.pid && child.exitCode === null && child.signalCode === null)
   const registeredAgents = async () => {
     const actions = []
-    let names = []
+    let names
     try {
       names = await readdir(registryDir)
     } catch {

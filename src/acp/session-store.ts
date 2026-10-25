@@ -51,8 +51,7 @@ type LegacySessionMapFile = {
 
 /** One per-session record: either live state or a deletion tombstone. */
 type SessionRecordFile =
-  | { version: 1; deleted?: false; session: StoredSession }
-  | { version: 1; deleted: true; sessionId: string }
+  { version: 1; deleted?: false; session: StoredSession } | { version: 1; deleted: true; sessionId: string }
 
 function isStoredSession(value: unknown): value is StoredSession {
   const record = value as StoredSession | null | undefined

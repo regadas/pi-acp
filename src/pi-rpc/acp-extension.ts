@@ -568,7 +568,7 @@ export default function acpExtension(pi: Pi): void {
                 })
               )
               const verified = new Map<string, string>()
-              for (let changed = true; changed; ) {
+              for (let changed = true; changed;) {
                 changed = false
                 for (const [id, status] of statuses) {
                   if (verified.has(id) || (status.parent !== root && verified.get(status.parent) !== status.root))

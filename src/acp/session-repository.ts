@@ -120,8 +120,7 @@ function userMessageTitle(value: Record<string, unknown>): string | null {
   if (typeof message.content === 'string') return message.content.slice(0, TITLE_LIMIT)
   if (!Array.isArray(message.content)) return null
   const block = message.content.find(item => (item as { type?: unknown }).type === 'text') as
-    | { text?: unknown }
-    | undefined
+    { text?: unknown } | undefined
   return typeof block?.text === 'string' ? block.text.slice(0, TITLE_LIMIT) : null
 }
 

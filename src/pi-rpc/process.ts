@@ -99,9 +99,7 @@ type PiRpcProcessOptions = {
 }
 
 type PiExtensionUiResponse =
-  | { id: string; value: string }
-  | { id: string; confirmed: boolean }
-  | { id: string; cancelled: true }
+  { id: string; value: string } | { id: string; confirmed: boolean } | { id: string; cancelled: true }
 
 type SpawnParams = {
   cwd: string
