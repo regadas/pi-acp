@@ -105,8 +105,7 @@ test('model entries missing provider or id are dropped; valid entries survive wi
 
   const options = await getSessionConfiguration(proc)
   const model = options.find(option => option.id === 'model') as
-    | { currentValue?: unknown; options?: Array<{ value?: unknown; name?: unknown }> }
-    | undefined
+    { currentValue?: unknown; options?: Array<{ value?: unknown; name?: unknown }> } | undefined
 
   assert.deepEqual(
     model?.options?.map(option => option.value),
@@ -151,8 +150,7 @@ test('a null state payload degrades to conservative configuration', async () => 
 
   assert.equal(options.find(option => option.id === 'model')?.currentValue, 'test/a')
   const thought = options.find(option => option.id === 'thought_level') as
-    | { currentValue?: unknown; options?: Array<{ value?: unknown }> }
-    | undefined
+    { currentValue?: unknown; options?: Array<{ value?: unknown }> } | undefined
   assert.equal(thought?.currentValue, 'off')
   assert.deepEqual(
     thought?.options?.map(option => option.value),
