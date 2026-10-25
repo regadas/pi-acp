@@ -9,14 +9,14 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22.19.0'
+          node-version: '24.x'
           cache: npm
       - run: npm ci
       - run: npm run validate
-      - run: npm install --global @earendil-works/pi-coding-agent@1.2.0
+      - run: npm install --global @earendil-works/pi-coding-agent@1.4.0
       - run: npm run smoke
       - run: npm run eval:acp
 
@@ -27,10 +27,10 @@ jobs:
   bun:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22.19.0'
+          node-version: '24.x'
           cache: npm
       - uses: oven-sh/setup-bun@v2
       - run: npm ci
@@ -38,7 +38,7 @@ jobs:
       # built adapter, so a fresh checkout needs the build first.
       - run: npm run build
       - run: npm test
-      - run: npm install --global @earendil-works/pi-coding-agent@1.2.0
+      - run: npm install --global @earendil-works/pi-coding-agent@1.4.0
       - run: npm run smoke
       - run: PI_ACP_EVAL_REQUIRE_DIRECT=1 npm run eval:acp
 
@@ -49,10 +49,10 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22.19.0'
+          node-version: '24.x'
           cache: npm
       - run: npm ci
       - run: node --import tsx --test --test-name-pattern "Windows \.cmd wrapper" test/unit/pi-rpc-process.test.ts test/unit/pi-version.test.ts
@@ -69,16 +69,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
-          node-version: '22.19.0'
+          node-version: '24.x'
           cache: npm
       - run: npm ci
-      - run: npm install --global @earendil-works/pi-coding-agent@1.2.0
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: npm install --global @earendil-works/pi-coding-agent@1.4.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
       - name: Check out the pinned acp-tck revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: agentclientprotocol/acp-tck
           ref: 3d46e2168aa3c23fe3853d539141a65a54d6a880
@@ -96,7 +96,7 @@ jobs:
           PI_ACP_TCK_REPORT_DIR: ${{ runner.temp }}/tck-reports
       - name: Upload ACP TCK diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: acp-tck-report
           path: ${{ runner.temp }}/tck-reports
