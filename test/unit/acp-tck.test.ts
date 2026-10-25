@@ -21,7 +21,7 @@ const repoRoot = fileURLToPath(new URL('../..', import.meta.url))
 const runner = join(repoRoot, 'scripts', 'eval-acp-tck.mjs')
 const fixture = join(repoRoot, 'scripts', 'fixtures', 'acp-tck-extension.ts')
 const pinnedRevision = '3d46e2168aa3c23fe3853d539141a65a54d6a880'
-const setupUvSha = '1c37ad07a6a961277cf70c0d37d6f313000f5884'
+const setupUvSha = '07a047e608db84b3d8c06cd9a7c7dcc9c355c18e'
 const isWindows = process.platform === 'win32'
 
 test('eval:tck builds the adapter, runs the tck runner, and pins the same revision everywhere', () => {
@@ -63,10 +63,10 @@ test('CI runs the pinned TCK as a diagnostics job that tolerates verdict exits a
   assert.ok(job.includes(`ref: ${pinnedRevision}`), 'the tck job must pin the upstream revision')
   assert.ok(
     job.includes(`astral-sh/setup-uv@${setupUvSha}`),
-    'the tck job must pin setup-uv to the verified v10.3.0 commit SHA'
+    'the tck job must pin setup-uv to the verified v10.3.2 commit SHA'
   )
   assert.ok(
-    job.includes('npm install --global @earendil-works/pi-coding-agent@1.2.0'),
+    job.includes('npm install --global @earendil-works/pi-coding-agent@1.4.0'),
     'the tck job must install the pinned pi'
   )
   assert.ok(job.includes('PI_ACP_TCK_DIR'), 'the tck job must point the runner at its checkout')
@@ -92,7 +92,7 @@ test('CI runs the pinned TCK as a diagnostics job that tolerates verdict exits a
   )
   assert.ok(!job.includes('continue-on-error'), 'the TCK step must not mask harness/setup/timeout failures as green')
   assert.ok(job.includes('if: always()'), 'diagnostics must upload even when the TCK step fails')
-  assert.ok(job.includes('actions/upload-artifact@v4'), 'the tck job must upload the report')
+  assert.ok(job.includes('actions/upload-artifact@v7'), 'the tck job must upload the report')
   assert.ok(!ci.slice(0, start).includes('continue-on-error:'), 'the existing required jobs must stay blocking')
 })
 

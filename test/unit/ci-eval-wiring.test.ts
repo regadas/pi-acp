@@ -29,7 +29,7 @@ test('CI and release gates run eval:acp after pi install and smoke, before publi
     '.github/workflows/github-release.yml'
   ]) {
     const text = readFileSync(join(repoRoot, workflow), 'utf8')
-    const install = text.indexOf('npm install --global @earendil-works/pi-coding-agent@1.2.0')
+    const install = text.indexOf('npm install --global @earendil-works/pi-coding-agent@1.4.0')
     const smoke = text.indexOf('npm run smoke')
     const evalStep = text.indexOf('npm run eval:acp')
     assert.ok(install >= 0, `${workflow} must install pinned pi`)
@@ -106,7 +106,7 @@ test('CI runs a Bun default-launch gate and the Windows wrapper tree-kill job', 
   // checkout.
   const build = bun.indexOf('npm run build')
   assert.ok(build >= 0, 'the bun job must build dist before smoke')
-  const install = bun.indexOf('npm install --global @earendil-works/pi-coding-agent@1.2.0')
+  const install = bun.indexOf('npm install --global @earendil-works/pi-coding-agent@1.4.0')
   assert.ok(install >= 0, 'the bun job must install the pinned pi')
   assert.ok(bun.indexOf('npm run smoke') > install, 'the bun job must smoke after installing pi')
   assert.ok(bun.indexOf('npm run smoke') > build, 'the bun job must smoke after building dist')

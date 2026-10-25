@@ -11,9 +11,9 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '24.x'
           registry-url: 'https://registry.npmjs.org'
@@ -22,7 +22,7 @@ jobs:
 
       - run: npm ci
       - run: npm run validate
-      - run: npm install --global @earendil-works/pi-coding-agent@1.2.0
+      - run: npm install --global @earendil-works/pi-coding-agent@1.4.0
       - run: npm run smoke
       - run: npm run eval:acp
       - run: npm publish --provenance
