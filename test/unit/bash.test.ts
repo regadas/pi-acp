@@ -9,7 +9,6 @@ import {
   bashResultFields,
   type BashOutputSnapshot
 } from '../../src/acp/translate/bash.js'
-import { toolResultContentBlocks } from '../../src/acp/translate/pi-tools.js'
 
 function textContent(result: unknown): string {
   const content = bashOrderedContent(result)
@@ -39,15 +38,15 @@ test('bashOrderedContent: preserves whitespace-only details fallback', () => {
 })
 
 test('bashResultFields: details/top-level extraction with the shared fallback chain', () => {
-  const fields = (result: unknown) => bashResultFields(result)
-  assert.equal(fields({ details: { stdout: 'a', stderr: 'b' } }).stdout, 'a')
-  assert.equal(fields({ details: { stdout: 'a' }, stdout: 'shadowed' }).stdout, 'a')
-  assert.equal(fields({ stdout: 'top' }).stdout, 'top')
-  assert.equal(fields({ details: { output: 'out' } }).stdout, 'out')
-  assert.equal(fields({ output: 'top-out' }).stdout, 'top-out')
-  assert.equal(fields({ details: { stderr: 'd' }, stderr: 'shadowed' }).stderr, 'd')
-  assert.equal(fields({ stderr: 'top-err' }).stderr, 'top-err')
-  assert.equal(fields({}).exitCode, undefined)
+  assert.equal(bashResultFields({ details: { stdout: 'a', stderr: 'b' } }).stdout, 'a')
+  assert.equal(bashResultFields({ details: { stdout: 'a' }, stdout: 'shadowed' }).stdout, 'a')
+  assert.equal(bashResultFields({ stdout: 'top' }).stdout, 'top')
+  assert.equal(bashResultFields({ stdout: 'top', details: { output: 'd' } }).stdout, 'top')
+  assert.equal(bashResultFields({ details: { output: 'out' } }).stdout, 'out')
+  assert.equal(bashResultFields({ output: 'top-out' }).stdout, 'top-out')
+  assert.equal(bashResultFields({ details: { stderr: 'd' }, stderr: 'shadowed' }).stderr, 'd')
+  assert.equal(bashResultFields({ stderr: 'top-err' }).stderr, 'top-err')
+  assert.equal(bashResultFields({}).exitCode, undefined)
   const exitCodes: Array<[unknown, number]> = [
     [{ details: { exitCode: 0 } }, 0],
     [{ exitCode: 2 }, 2],
@@ -55,21 +54,16 @@ test('bashResultFields: details/top-level extraction with the shared fallback ch
     [{ details: { exitCode: 'x' }, exitCode: 2 }, 2],
     [{ details: { code: 3 } }, 3],
     [{ code: 4 }, 4],
-    [{ details: { exitCode: 1 }, code: 5 }, 1]
+    [{ details: { exitCode: 1 }, code: 5 }, 1],
+    [{ exitCode: 6, details: { code: 7 } }, 6]
   ]
-  for (const [result, expected] of exitCodes) assert.equal(fields(result).exitCode, expected)
+  for (const [result, expected] of exitCodes) assert.equal(bashResultFields(result).exitCode, expected)
 })
 
 test('bashExitCode: falls back to the error status without a numeric exit', () => {
   assert.equal(bashExitCode({ details: { exitCode: 'x' }, exitCode: 2 }, true), 2)
   assert.equal(bashExitCode({}, true), 1)
   assert.equal(bashExitCode({}, false), 0)
-})
-
-test('toolResultContentBlocks: bash fallback reads details.output through the shared extractor', () => {
-  const blocks = toolResultContentBlocks({ details: { output: 'stream out\n' } })
-  assert.equal(blocks.length, 1)
-  assert.match((blocks[0] as { text: string }).text, /stream out/)
 })
 
 /** Snapshot without native truncation metadata (complete output). */

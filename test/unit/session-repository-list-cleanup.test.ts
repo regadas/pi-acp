@@ -640,10 +640,11 @@ test('repository.list propagates metadata stream and fallback stat resource erro
   const stat = fs.promises.stat
   let statError: string | null = null
   let statCalls = 0
-  // Only a list's second stat rejects (the memo identity stat must succeed)
-  // so the rejection surfaces from project's own rethrowResourceExhaustion.
+  let rejectCall = 0
+  // Exactly the rejectCall-th stat rejects: 1 surfaces the identity-stat
+  // rethrow inside scanMetadataCached, 2 project()'s fallback-stat rethrow.
   t.mock.method(fs.promises, 'stat', (...args: Parameters<typeof stat>) => {
-    if (statError && ++statCalls > 1)
+    if (statError && ++statCalls === rejectCall)
       return Promise.reject(Object.assign(new Error('stat failed'), { code: statError }))
     return stat(...args)
   })
@@ -654,11 +655,15 @@ test('repository.list propagates metadata stream and fallback stat resource erro
   assert.equal((await repository.list(root))[0]?.title, null, 'non-resource scan failures retain mtime fallback')
   streamError = null
   fs.writeFileSync(path, `${JSON.stringify({ type: 'session', id: 'errors', cwd: root })}\n`)
-  statError = 'ENFILE'
-  statCalls = 0
-  await assert.rejects(repository.list(root), { code: 'ENFILE' })
+  for (const leg of [1, 2]) {
+    statError = 'ENFILE'
+    statCalls = 0
+    rejectCall = leg
+    await assert.rejects(repository.list(root), { code: 'ENFILE' })
+  }
   statError = 'ENOENT'
   statCalls = 0
+  rejectCall = 2
   assert.deepEqual(await repository.list(root), [])
 })
 

@@ -52,7 +52,7 @@ function updatesFor(conn: FakeAgentSideConnection, toolCallId: string): ToolCall
 
 const coalescingState = (session: PiAcpSession) =>
   session as unknown as {
-    genericBashEmittedBytes: { size: number }
+    genericBashEmittedMeasure: { size: number }
     genericBashContent: { size: number }
   }
 
@@ -85,7 +85,7 @@ test('PiAcpSession: generic bash updates below the growth threshold coalesce', a
     'only the first snapshot, the threshold flush, and the terminal update reach generic clients'
   )
   const state = coalescingState(session)
-  assert.equal(state.genericBashEmittedBytes.size, 0, 'per-tool-call thresholds are cleaned up with the tool call')
+  assert.equal(state.genericBashEmittedMeasure.size, 0, 'per-tool-call thresholds are cleaned up with the tool call')
   assert.equal(state.genericBashContent.size, 0, 'retained content is cleaned up with the tool call')
 })
 
@@ -214,6 +214,14 @@ test('PiAcpSession: coalescing thresholds are tracked per bash tool call', async
   )
 })
 
+const truncatedSnapshot = (
+  window: string,
+  coords: { totalLines: number; totalBytes: number; outputLines: number }
+) => ({
+  content: [{ type: 'text', text: window }],
+  details: { truncation: { truncated: true, truncatedBy: 'lines', ...coords, content: window } }
+})
+
 test('PiAcpSession: capped windows flush on native totalBytes growth at the production threshold', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -221,19 +229,7 @@ test('PiAcpSession: capped windows flush on native totalBytes growth at the prod
   // bytes alone can never cross once pi caps the window.
   const session = makeSession(conn, proc)
   const window = 'y'.repeat(51200)
-  const capped = (totalBytes: number) => ({
-    content: [{ type: 'text', text: window }],
-    details: {
-      truncation: {
-        truncated: true,
-        truncatedBy: 'lines',
-        totalLines: 1400,
-        totalBytes,
-        outputLines: 1280,
-        content: window
-      }
-    }
-  })
+  const capped = (totalBytes: number) => truncatedSnapshot(window, { totalLines: 1400, totalBytes, outputLines: 1280 })
 
   const prompt = session.prompt('run it')
   proc.emit({ type: 'agent_start' })
@@ -254,6 +250,37 @@ test('PiAcpSession: capped windows flush on native totalBytes growth at the prod
       ['completed', fenced('final done\n')]
     ],
     'totalBytes growth flushes the capped window; sub-threshold totalBytes growth stays coalesced'
+  )
+})
+
+test('PiAcpSession: a capped window flushes even when escaping inflated the rendered baseline', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc)
+  // 50,000 backslashes render as >100,000 JSON bytes, while the first capped
+  // snapshot's native totalBytes is only 115,536: a mixed-unit comparison
+  // (115,536 - 100,000+) suppresses a full threshold of new output.
+  const escaped = '\\'.repeat(50000)
+  const window = '\\'.repeat(51200)
+
+  const prompt = session.prompt('run it')
+  proc.emit({ type: 'agent_start' })
+  startBash(proc, 'b1')
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: escaped }] })
+  emitSnapshot(proc, 'b1', truncatedSnapshot(window, { totalLines: 1300, totalBytes: 115536, outputLines: 1280 }))
+  endBash(proc, 'b1', { content: [{ type: 'text', text: 'done\n' }] })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await tick()
+
+  assert.deepEqual(
+    updatesFor(conn, 'b1').map(update => [update.status, update.content]),
+    [
+      ['in_progress', fenced(escaped)],
+      ['in_progress', fenced(window)],
+      ['completed', fenced('done\n')]
+    ],
+    'crossing from a rendered measure to native totalBytes always flushes, whatever escaping did to the baseline'
   )
 })
 

@@ -77,6 +77,12 @@ test('toolResultContentBlocks: extracts bash stdout/stderr from details', () => 
   assert.match(text, /exit code: 0/)
 })
 
+test('toolResultContentBlocks: bash fallback reads details.output through the shared extractor', () => {
+  const blocks = toolResultContentBlocks({ details: { output: 'stream out\n' } })
+  assert.equal(blocks.length, 1)
+  assert.match((blocks[0] as { text: string }).text, /stream out/)
+})
+
 test('toolResultToolCallContent: wraps ordered blocks as ACP tool call content', () => {
   assert.deepEqual(
     toolResultToolCallContent({

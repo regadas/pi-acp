@@ -321,9 +321,9 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private subagentToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, BashOutputSnapshot>()
-  // Output measure of the last emitted generic in_progress bash update, per
-  // tool call: native totalBytes when the snapshot reports it, rendered bytes otherwise.
-  private genericBashEmittedBytes = new Map<string, number>()
+  // Last emitted in_progress measure per generic bash tool call, with its kind:
+  // native and rendered bytes are never compared, so a kind change always flushes.
+  private genericBashEmittedMeasure = new Map<string, { native: boolean; bytes: number }>()
   // Latest rendered content per generic bash tool call, retained so a synthetic
   // terminal failure can still show output that coalescing suppressed.
   private genericBashContent = new Map<string, ToolCallContent[]>()
@@ -354,7 +354,7 @@ export class PiAcpSession {
     additionalDirectories?: readonly string[]
     /** Test seam: maximum wait for an observed out-of-band run to settle. */
     deferredAdmissionTimeoutMs?: number
-    /** Test seam: rendered-output growth before a coalesced generic in_progress bash update is re-sent. */
+    /** Test seam: output growth (native totalBytes, else rendered bytes) before a coalesced generic in_progress bash update is re-sent. */
     genericBashCoalesceBytes?: number
   }) {
     this.sessionId = opts.sessionId
@@ -1399,15 +1399,19 @@ export class PiAcpSession {
   /**
    * Pi caps snapshots at a rolling tail window, so the rendered size plateaus
    * while output keeps growing: growth is measured by the native cumulative
-   * totalBytes when the snapshot reports it, rendered bytes otherwise.
+   * totalBytes when the snapshot reports it, rendered bytes otherwise. The
+   * two measures are never compared: a kind change always flushes, since an
+   * escaping-inflated rendered baseline could otherwise suppress a full
+   * window of new output.
    */
   private shouldEmitGenericBashUpdate(toolCallId: string, content: ToolCallContent[], result: unknown): boolean {
     if (!content.length) return false
     const coords = bashOutputSnapshot(result).coords
+    const native = coords !== undefined
     const bytes = coords ? coords.totalBytes : Buffer.byteLength(JSON.stringify(content))
-    const last = this.genericBashEmittedBytes.get(toolCallId)
-    if (last !== undefined && bytes - last < this.genericBashCoalesceBytes) return false
-    this.genericBashEmittedBytes.set(toolCallId, bytes)
+    const last = this.genericBashEmittedMeasure.get(toolCallId)
+    if (last && last.native === native && bytes - last.bytes < this.genericBashCoalesceBytes) return false
+    this.genericBashEmittedMeasure.set(toolCallId, { native, bytes })
     return true
   }
 
@@ -1515,7 +1519,7 @@ export class PiAcpSession {
     this.bashToolCallIds.delete(toolCallId)
     this.subagentToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
-    this.genericBashEmittedBytes.delete(toolCallId)
+    this.genericBashEmittedMeasure.delete(toolCallId)
     this.genericBashContent.delete(toolCallId)
   }
 
@@ -1523,15 +1527,12 @@ export class PiAcpSession {
     for (const toolCallId of this.currentToolCalls.keys()) {
       // A generic bash card keeps the latest known output — some of it may
       // only exist in a snapshot coalescing suppressed.
-      const genericBashContent =
-        this.bashToolCallIds.has(toolCallId) && !this.supportsTerminalOutputMeta
-          ? this.genericBashContent.get(toolCallId)
-          : undefined
+      const content = this.genericBashContent.get(toolCallId)
       this.emit({
         sessionUpdate: 'tool_call_update',
         toolCallId,
         status: 'failed',
-        ...(genericBashContent?.length ? { content: genericBashContent } : {}),
+        ...(content ? { content } : {}),
         ...(this.bashToolCallIds.has(toolCallId) && this.supportsTerminalOutputMeta
           ? { _meta: bashTerminalExitMeta(toolCallId, 1) }
           : {})
@@ -1544,7 +1545,7 @@ export class PiAcpSession {
     this.bashToolCallIds.clear()
     this.subagentToolCallIds.clear()
     this.bashOutputSnapshots.clear()
-    this.genericBashEmittedBytes.clear()
+    this.genericBashEmittedMeasure.clear()
     this.genericBashContent.clear()
   }
 
