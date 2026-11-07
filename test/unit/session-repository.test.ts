@@ -615,7 +615,68 @@ test('repository.list: foreign metadata scan work is skipped except for competin
   assert.equal(scanned.length, 3, 'only scoped records and their duplicate competitors require full metadata')
   scanned.length = 0
   assert.equal((await repository.list()).length, 32, 'unscoped cross-project discovery remains available')
-  assert.equal(scanned.length, 33)
+  // The first list already scanned the scoped files; the memo skips them here.
+  assert.equal(scanned.length, 30, 'only never-scanned files require a fresh metadata read')
+})
+
+test('repository.list memoizes metadata scans and refreshes them on file changes', async t => {
+  const { default: fs } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-scan-memo-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  const sessionFile = join(sessions, 'memo.jsonl')
+  mkdirSync(sessions)
+  const writeSession = (title: string, timestamp: string) =>
+    writeFileSync(
+      sessionFile,
+      [
+        JSON.stringify({ type: 'session', id: 'memo', cwd: root }),
+        JSON.stringify({ type: 'session_info', timestamp, name: title })
+      ].join('\n') + '\n'
+    )
+  const at = (day: number) => new Date(`2026-02-${String(day).padStart(2, '0')}T00:00:00.000Z`)
+  writeSession('First', '2026-01-01T00:00:00.000Z')
+  utimesSync(sessionFile, at(1), at(1))
+
+  const scanned: string[] = []
+  const create = fs.createReadStream
+  t.mock.method(fs, 'createReadStream', (...args: Parameters<typeof create>) => {
+    scanned.push(String(args[0]))
+    return create(...args)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+  const repository = new SessionRepository(
+    new SessionStore(join(root, 'map.json')),
+    { PI_CODING_AGENT_SESSION_DIR: sessions },
+    join(root, 'agent')
+  )
+
+  const first = await repository.list(root)
+  assert.equal(first[0]?.title, 'First')
+  assert.equal(scanned.length, 1)
+
+  const second = await repository.list(root)
+  assert.deepEqual(second, first, 'unchanged files keep identical records without a rescan')
+  assert.equal(scanned.length, 1, 'an unchanged file is served from the scan memo')
+
+  writeSession('Renamed', '2026-01-02T00:00:00.000Z')
+  utimesSync(sessionFile, at(2), at(2))
+  const third = await repository.list(root)
+  assert.equal(third[0]?.title, 'Renamed')
+  assert.equal(third[0]?.updatedAt, '2026-01-02T00:00:00.000Z')
+  assert.equal(scanned.length, 2, 'a changed file (size and mtime) refreshes the memoized scan')
+
+  // Same-size rewrite: only the bumped mtime distinguishes the new bytes.
+  writeSession('Refresh', '2026-01-03T00:00:00.000Z')
+  utimesSync(sessionFile, at(3), at(3))
+  const fourth = await repository.list(root)
+  assert.equal(fourth[0]?.title, 'Refresh', 'a same-size file with a new mtime must not stay memoized')
+  assert.equal(fourth[0]?.updatedAt, '2026-01-03T00:00:00.000Z')
+  assert.equal(scanned.length, 3)
 })
 
 test('repository carries additional directories through find and list refreshes', async () => {

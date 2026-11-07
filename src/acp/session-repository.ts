@@ -1,4 +1,4 @@
-import { createReadStream, existsSync } from 'node:fs'
+import { createReadStream, existsSync, type Stats } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { join, isAbsolute, resolve } from 'node:path'
 import { homedir } from 'node:os'
@@ -126,6 +126,8 @@ function userMessageTitle(value: Record<string, unknown>): string | null {
 
 type MetadataScanState = { truncated: boolean }
 
+type MetadataScan = { title: string | null; updatedAt: string | null; truncated: boolean }
+
 async function* boundedRecords(path: string, state: MetadataScanState): AsyncGenerator<string> {
   // Read one byte past the limit so an exact full window is distinguishable from EOF.
   const input = createReadStream(path, { start: 0, end: METADATA_FILE_LIMIT })
@@ -181,9 +183,7 @@ async function* boundedRecords(path: string, state: MetadataScanState): AsyncGen
   if (!state.truncated && chunks.length && !oversized) yield take()!
 }
 
-async function scanMetadata(
-  path: string
-): Promise<{ title: string | null; updatedAt: string | null; truncated: boolean } | null> {
+async function scanMetadata(path: string): Promise<MetadataScan | null> {
   let explicitTitle: string | null = null
   let firstUserTitle: string | null = null
   let latestMessageTimestamp: number | null = null
@@ -233,11 +233,12 @@ async function project(
   path: string,
   requestedId?: string,
   knownHeader?: { sessionId: string; cwd: string },
-  strictRead = false
+  strictRead = false,
+  scan: (path: string) => Promise<MetadataScan | null> = scanMetadata
 ): Promise<SessionRecord | null> {
   const header = knownHeader ?? (await validatedHeader(path, requestedId, strictRead))
   if (!header) return null
-  const metadata = await scanMetadata(path)
+  const metadata = await scan(path)
   let mtime: Date | null = null
   if (!metadata?.updatedAt || metadata.truncated) {
     try {
@@ -301,6 +302,25 @@ export class SessionRepository {
     private readonly agentDir = getAgentDir()
   ) {}
 
+  // Scan results keyed by stat identity (size + mtimeMs): an unchanged file
+  // must not be re-read (up to 8 MiB) on every list/find call.
+  private readonly metadataScans = new Map<string, { size: number; mtimeMs: number; scan: MetadataScan | null }>()
+
+  private readonly scanMetadataCached = async (path: string): Promise<MetadataScan | null> => {
+    let identity: Stats
+    try {
+      identity = await stat(path)
+    } catch (error) {
+      rethrowResourceExhaustion(error)
+      return scanMetadata(path)
+    }
+    const cached = this.metadataScans.get(path)
+    if (cached && cached.size === identity.size && cached.mtimeMs === identity.mtimeMs) return cached.scan
+    const scan = await scanMetadata(path)
+    this.metadataScans.set(path, { size: identity.size, mtimeMs: identity.mtimeMs, scan })
+    return scan
+  }
+
   upsert(entry: {
     sessionId: string
     cwd: string
@@ -333,7 +353,9 @@ export class SessionRepository {
     const records: SessionRecord[] = []
     for (let offset = 0; offset < files.length; offset += LOOKUP_CONCURRENCY) {
       const candidates = await Promise.all(
-        files.slice(offset, offset + LOOKUP_CONCURRENCY).map(path => project(path, sessionId, undefined, strictRead))
+        files
+          .slice(offset, offset + LOOKUP_CONCURRENCY)
+          .map(path => project(path, sessionId, undefined, strictRead, this.scanMetadataCached))
       )
       for (const candidate of candidates) if (candidate) records.push(candidate)
     }
@@ -432,14 +454,14 @@ export class SessionRepository {
       const header = headers.get(path)
       if (!header || header.sessionId !== sessionId || !scopedIds.has(sessionId)) continue
       attemptedMappedPaths.add(path)
-      const record = await project(path, undefined, header)
+      const record = await project(path, undefined, header, false, this.scanMetadataCached)
       if (record) byId.set(sessionId, record)
     }
     for (const [path, header] of headers) {
       if (!scopedIds.has(header.sessionId) || attemptedMappedPaths.has(path)) continue
       const previous = byId.get(header.sessionId)
       if (previous && previous.sessionFile === mappedSessions.get(header.sessionId)?.sessionFile) continue
-      const record = await project(path, undefined, header)
+      const record = await project(path, undefined, header, false, this.scanMetadataCached)
       if (record && (!previous || isNewer(record, previous))) byId.set(record.sessionId, record)
     }
     for (const [sessionId, record] of byId) {
@@ -449,7 +471,7 @@ export class SessionRepository {
       // Discovery can yield while another operation establishes a canonical owner.
       while (stored && (stored.sessionFile !== mapped?.sessionFile || stored.cwd !== mapped?.cwd)) {
         mapped = stored
-        selected = (await project(stored.sessionFile, sessionId)) ?? selected
+        selected = (await project(stored.sessionFile, sessionId, undefined, false, this.scanMetadataCached)) ?? selected
         stored = this.store.get(sessionId)
       }
       if (!existsSync(selected.sessionFile)) {

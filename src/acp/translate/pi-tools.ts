@@ -1,4 +1,5 @@
 import type { ToolCallContent } from '@agentclientprotocol/sdk/unstable'
+import { bashResultFields } from './bash.js'
 
 export type ToolResultImageBlock = { data: string; mimeType: string }
 
@@ -56,28 +57,12 @@ export function toolResultContentBlocks(result: unknown): ToolResultContentBlock
   if (ordered.length) return ordered
 
   // The bash tool frequently returns stdout/stderr in `details` rather than content blocks.
-  const anyResult = result as Record<string, unknown>
-  const stdout =
-    (typeof details?.stdout === 'string' ? details.stdout : undefined) ??
-    (typeof anyResult.stdout === 'string' ? anyResult.stdout : undefined) ??
-    (typeof details?.output === 'string' ? details.output : undefined) ??
-    (typeof anyResult.output === 'string' ? anyResult.output : undefined)
-
-  const stderr =
-    (typeof details?.stderr === 'string' ? details.stderr : undefined) ??
-    (typeof anyResult.stderr === 'string' ? anyResult.stderr : undefined)
-
-  const exitCode =
-    (typeof details?.exitCode === 'number' ? details.exitCode : undefined) ??
-    (typeof anyResult.exitCode === 'number' ? anyResult.exitCode : undefined) ??
-    (typeof details?.code === 'number' ? details.code : undefined) ??
-    (typeof anyResult.code === 'number' ? anyResult.code : undefined)
-
-  if ((typeof stdout === 'string' && stdout.trim()) || (typeof stderr === 'string' && stderr.trim())) {
+  const { stdout, stderr, exitCode } = bashResultFields(result)
+  if (stdout?.trim() || stderr?.trim()) {
     const parts: string[] = []
-    if (typeof stdout === 'string' && stdout.trim()) parts.push(stdout)
-    if (typeof stderr === 'string' && stderr.trim()) parts.push(`stderr:\n${stderr}`)
-    if (typeof exitCode === 'number') parts.push(`exit code: ${exitCode}`)
+    if (stdout?.trim()) parts.push(stdout)
+    if (stderr?.trim()) parts.push(`stderr:\n${stderr}`)
+    if (exitCode !== undefined) parts.push(`exit code: ${exitCode}`)
     return [{ type: 'text', text: parts.join('\n\n').trimEnd() }]
   }
 

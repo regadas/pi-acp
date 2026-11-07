@@ -253,7 +253,9 @@ test('repository.list defers stat to missing timestamps and normalizes only the 
 
   const records = await repository.list(root)
   assert.equal(records.find(record => record.sessionId === 'timestamped')?.updatedAt, TIMESTAMP)
-  assert.deepEqual(stats, [missing])
+  // One stat per scanned file keys the metadata memo; the extra `missing`
+  // stat is the deferred mtime fallback for its absent timestamp.
+  assert.deepEqual([...stats].sort(), [missing, missing, timestamped].sort())
   assert.equal(normalizations, 2, 'only the final metadata timestamp and fallback mtime need normalization')
 })
 

@@ -1644,7 +1644,6 @@ export async function runPromptWithCancellation(
 }
 
 function readNearestPackageJson(metaUrl: string): {
-  name?: string
   version?: string
 } {
   try {
@@ -1655,11 +1654,9 @@ function readNearestPackageJson(metaUrl: string): {
       const p = join(dir, 'package.json')
       if (existsSync(p)) {
         const json = JSON.parse(readFileSync(p, 'utf-8')) as {
-          name?: unknown
           version?: unknown
         } | null
         return {
-          name: typeof json?.name === 'string' ? json.name : undefined,
           version: typeof json?.version === 'string' ? json.version : undefined
         }
       }
@@ -1668,5 +1665,5 @@ function readNearestPackageJson(metaUrl: string): {
   } catch {
     // ignore
   }
-  return { name: 'pi-acp', version: '0.0.0' }
+  return { version: '0.0.0' }
 }

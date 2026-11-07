@@ -183,6 +183,9 @@ const PI_TURN_BOUND_EVENT_TYPES = new Set([
 // finite for adapter commands that require exclusive access. Ordinary input
 // uses withdrawable staged admission instead of a run-duration deadline.
 const DEFERRED_ADMISSION_TIMEOUT_MS = 10 * 60_000
+// Every generic-client flush resends the full accumulated output, so in_progress
+// updates coalesce until this much new output has arrived.
+const GENERIC_BASH_COALESCE_BYTES = 64 * 1024
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
 
@@ -308,6 +311,7 @@ export class PiAcpSession {
   private deferredCommandAdmission: DeferredCommandAdmission | null = null
   private deferredCommandAdmissionTimer: NodeJS.Timeout | null = null
   private readonly deferredAdmissionTimeoutMs: number
+  private readonly genericBashCoalesceBytes: number
 
   // For ACP diff support: capture file contents before edit/write mutations,
   // then emit ToolCallContent {type:"diff"}. Compatible structured edit/write
@@ -317,6 +321,8 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private subagentToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, BashOutputSnapshot>()
+  // Rendered bytes of the last emitted generic in_progress bash update, per tool call.
+  private genericBashEmittedBytes = new Map<string, number>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -344,6 +350,8 @@ export class PiAcpSession {
     additionalDirectories?: readonly string[]
     /** Test seam: maximum wait for an observed out-of-band run to settle. */
     deferredAdmissionTimeoutMs?: number
+    /** Test seam: rendered-output growth before a coalesced generic in_progress bash update is re-sent. */
+    genericBashCoalesceBytes?: number
   }) {
     this.sessionId = opts.sessionId
     this.cwd = opts.cwd
@@ -354,6 +362,7 @@ export class PiAcpSession {
     this.supportsTerminalOutputMeta = opts.supportsTerminalOutputMeta ?? false
     this.authMethods = opts.authMethods ?? []
     this.deferredAdmissionTimeoutMs = opts.deferredAdmissionTimeoutMs ?? DEFERRED_ADMISSION_TIMEOUT_MS
+    this.genericBashCoalesceBytes = opts.genericBashCoalesceBytes ?? GENERIC_BASH_COALESCE_BYTES
 
     this.unsubscribe = this.proc.onEvent(ev => this.handlePiEvent(ev))
     // Intentionally never unsubscribed: onTermination fires at most once and
@@ -1383,6 +1392,21 @@ export class PiAcpSession {
     })
   }
 
+  /**
+   * Generic clients re-receive the full accumulated output on every flush,
+   * so in_progress updates are coalesced until the rendered content grows by
+   * the configured threshold. The first non-empty snapshot always lands so
+   * output appears early; the decision also records the emitted size.
+   */
+  private shouldEmitGenericBashUpdate(toolCallId: string, content: ToolCallContent[]): boolean {
+    if (!content.length) return false
+    const bytes = Buffer.byteLength(JSON.stringify(content))
+    const last = this.genericBashEmittedBytes.get(toolCallId)
+    if (last !== undefined && bytes - last < this.genericBashCoalesceBytes) return false
+    this.genericBashEmittedBytes.set(toolCallId, bytes)
+    return true
+  }
+
   private emitBashOutputUpdate(params: {
     toolCallId: string
     status: 'in_progress' | 'completed' | 'failed'
@@ -1393,8 +1417,10 @@ export class PiAcpSession {
       // Generic clients get the full accumulated output as ordered standard
       // content — text fenced in place, images kept in source order — and
       // tool_call_update content replaces earlier content, so the snapshot
-      // stays consistent while streaming.
+      // stays consistent while streaming. Terminal statuses always emit in
+      // full; only in_progress flushes are coalesced.
       const content = bashOrderedContent(params.result)
+      if (params.status === 'in_progress' && !this.shouldEmitGenericBashUpdate(params.toolCallId, content)) return
       this.emit({
         sessionUpdate: 'tool_call_update',
         toolCallId: params.toolCallId,
@@ -1482,6 +1508,7 @@ export class PiAcpSession {
     this.bashToolCallIds.delete(toolCallId)
     this.subagentToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
+    this.genericBashEmittedBytes.delete(toolCallId)
   }
 
   private terminalizeToolCalls(): void {
@@ -1502,6 +1529,7 @@ export class PiAcpSession {
     this.bashToolCallIds.clear()
     this.subagentToolCallIds.clear()
     this.bashOutputSnapshots.clear()
+    this.genericBashEmittedBytes.clear()
   }
 
   private startTurn(t: QueuedPrompt): void {
