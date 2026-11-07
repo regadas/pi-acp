@@ -112,7 +112,7 @@ const MAX_DIFF_PATCH_CHARS = 64 * 1024
  * The v2 form of a v1 tool-call content item. Only diffs differ between the
  * versions; the other kinds the engine emits share their shape.
  */
-export function toV2ToolCallContent(content: ToolCallContent): v2.ToolCallContent {
+function toV2ToolCallContent(content: ToolCallContent): v2.ToolCallContent {
   return content.type === 'diff' ? toV2Diff(content) : (content as v2.ToolCallContent)
 }
 
