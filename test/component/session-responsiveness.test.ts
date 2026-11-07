@@ -33,7 +33,7 @@ test('responsiveness: autonomous progress is visible before input and cannot det
     conn.updates.some(({ update }) => update.sessionUpdate === 'tool_call' && update.toolCallId === 'background-read')
   )
   const prompt = session.prompt('ordinary question')
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'length' } })
   proc.emit({ type: 'auto_retry_end', success: false, finalError: 'unrelated failure' })
   proc.emit({ type: 'agent_settled' })
   await tick()
@@ -177,10 +177,10 @@ for (const admission of ['idle', 'staged', 'cancelled'] as const) {
       await dispatch(...args)
     }
     proc.emit({
-      type: 'message_update',
-      assistantMessageEvent: { type: 'error', reason: 'error', error: { errorMessage: 'foreign stream ended' } }
+      type: 'message_end',
+      message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'foreign stream ended' }
     })
-    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length' } })
+    proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'length' } })
     proc.emit({ type: 'agent_end' })
     proc.emit({ type: 'agent_settled' })
     await tick()

@@ -1,8 +1,9 @@
 import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
 import { randomUUID } from 'node:crypto'
-import { PiAcpAgent, runPromptWithCancellation } from '../agent.js'
+import { PiAcpAgent } from '../agent.js'
 import { V2ClientConnection } from './client.js'
+import type { SessionStore } from '../session-store.js'
 import {
   toV2InitializeResponse,
   toV2ListSessionsResponse,
@@ -35,7 +36,11 @@ import {
  * handlers are admitted immediately so a following cancel or close reaches
  * the engine in the same tick.
  */
-export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null) => void }): v2.AgentApp {
+export function createPiAcpV2AgentApp(opts?: {
+  onAgent?: (agent: PiAcpAgent | null) => void
+  /** Injects the session store backing list/load/delete (tests use temp stores). */
+  store?: SessionStore
+}): v2.AgentApp {
   let active: PiAcpAgent | null = null
   let conn: V2ClientConnection | null = null
   let initializeState: 'uninitialized' | 'initializing' | 'initialized' = 'uninitialized'
@@ -123,7 +128,7 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
     .agent({ name: 'pi-acp' })
     .onConnect(connection => {
       const client = new V2ClientConnection(connection.client)
-      const agent = new PiAcpAgent(client)
+      const agent = new PiAcpAgent(client, opts?.store)
       conn = client
       active = agent
       initializeState = 'uninitialized'
@@ -178,12 +183,20 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
     .onRequest(v2.methods.agent.session.resume, async ctx => {
       const agent = getInitializedAgent()
       const restore = v1RestoreSessionRequest(ctx.params)
+      const client = getConnection()
       const response =
         restore.method === 'resume'
           ? await agent.resumeSession(restore.request)
           : // Replay runs inside a replay window so replayed entries become
-            // deterministic message upserts (see V2ClientConnection).
-            await getConnection().replaying(ctx.params.sessionId, () => agent.loadSession(restore.request))
+            // deterministic message upserts (see V2ClientConnection). A
+            // superseded load's buffers drop only once this load has passed
+            // validation and replaced it — a rejected resume must not erase
+            // the active replay's buffered final entry.
+            await client.replaying(ctx.params.sessionId, () =>
+              agent.loadSession(restore.request, {
+                onSupersedingReplay: () => client.supersedeReplayBuffers(ctx.params.sessionId)
+              })
+            )
       // v2 requires a current-state snapshot after any replay and before the
       // response: a prompt of this connection still running is foreground work.
       const state = (promptCounts.get(ctx.params.sessionId) ?? 0) > 0 ? 'running' : 'idle'
@@ -272,8 +285,7 @@ export function createPiAcpV2AgentApp(opts?: { onAgent?: (agent: PiAcpAgent | nu
       const running = wasIdle
         ? send(sessionId, { sessionUpdate: 'state_update', state: 'running' } as v2.SessionUpdate)
         : null
-      const turn = runPromptWithCancellation(
-        agent,
+      const turn = agent.prompt(
         v1PromptRequest(ctx.params),
         cancelledWhileValidating ? AbortSignal.abort() : ctx.signal
       )

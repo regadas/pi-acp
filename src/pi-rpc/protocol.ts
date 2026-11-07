@@ -37,8 +37,6 @@ export type PiAssistantMessageEvent =
       toolCall?: unknown
     }
   | { type: 'toolcall_end'; contentIndex?: number; id?: string; toolName?: string; toolCall?: unknown }
-  | { type: 'done'; reason?: string; usage?: unknown }
-  | { type: 'error'; reason?: string; error?: { errorMessage?: unknown } }
   | { type: string; [key: string]: unknown }
 
 export type PiRpcEvent = {
@@ -73,11 +71,34 @@ const KNOWN_EVENTS = new Set([
   'summarization_retry_scheduled',
   'summarization_retry_attempt_start',
   'summarization_retry_finished',
-  'auto_compaction_start',
-  'auto_compaction_end',
   'compaction_start',
   'compaction_end'
 ])
+
+/** The pi-side extension's single-line lifecycle widget (written by acp-extension.ts). */
+export const ACP_LIFECYCLE_WIDGET = 'pi-acp-lifecycle'
+
+/** The lifecycle widget's parsed payload. */
+export type LifecycleWidgetState = {
+  version: 1
+  owner: string
+  state: string
+  error?: unknown
+}
+
+/** Decode the lifecycle widget line; null for any other key or a malformed payload. */
+export function decodeLifecycleWidget(event: PiRpcEvent): LifecycleWidgetState | null {
+  if (event.widgetKey !== ACP_LIFECYCLE_WIDGET) return null
+  const lines = event.widgetLines
+  if (!Array.isArray(lines) || lines.length !== 1 || typeof lines[0] !== 'string') return null
+  try {
+    const state = JSON.parse(lines[0]) as { version?: unknown; owner?: unknown; state?: unknown; error?: unknown }
+    if (state.version !== 1 || typeof state.owner !== 'string' || typeof state.state !== 'string') return null
+    return { version: 1, owner: state.owner, state: state.state, error: state.error }
+  } catch {
+    return null
+  }
+}
 
 /** pi RPC payloads are untrusted; project non-objects to {} and consume only known fields (arrays pass through). */
 export function piRecord(value: unknown): Readonly<Record<string, unknown>> {

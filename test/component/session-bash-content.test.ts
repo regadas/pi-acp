@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 // Isolated workspace: repository-local .pi settings/commands must not leak in.
@@ -33,10 +34,8 @@ function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess, supp
   return new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: [],
     supportsTerminalOutputMeta
   })
 }
@@ -453,11 +452,10 @@ test('PiAcpAgent: load replay keeps interleaved generic bash content in source o
 
   try {
     const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = {
+    const agent = new PiAcpAgent(asAgentConn(conn), {
       get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: '/tmp/s.jsonl', updatedAt: 'x' }),
       upsert: () => {}
-    }
+    } as unknown as SessionStore)
     ;(agent as any).scheduleDeferred = () => {}
 
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} } as any)

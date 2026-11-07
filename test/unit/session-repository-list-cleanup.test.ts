@@ -7,6 +7,8 @@ import { dirname, join } from 'node:path'
 import { SessionRepository } from '../../src/acp/session-repository.js'
 import { SessionStore } from '../../src/acp/session-store.js'
 
+const isWindows = process.platform === 'win32'
+
 const MIB = 1024 * 1024
 const TIMESTAMP = '2026-01-02T03:04:05.000Z'
 
@@ -96,6 +98,44 @@ test('repository.list keeps recursive custom discovery even in subagent-artifact
     (await repository.list(root)).map(record => record.sessionId),
     ['custom-child']
   )
+})
+
+test('repository.list discovers a custom session directory through symlink/..', { skip: isWindows }, async t => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'pi-acp-list-link-'))
+  const physical = join(root, 'physical')
+  const lexical = join(root, 'lexical')
+  fs.mkdirSync(join(physical, 'nested'), { recursive: true })
+  fs.mkdirSync(lexical)
+  // link -> physical/nested, so `link/..` physically resolves to `physical`,
+  // while a lexical `join` collapse names `lexical` — the wrong directory.
+  fs.symlinkSync(join(physical, 'nested'), join(lexical, 'link'))
+  writeSession(join(physical, 's1.jsonl'), 'link-s1', root)
+  const store = new SessionStore(join(root, 'map.json'))
+  const repository = new SessionRepository(
+    store,
+    { PI_CODING_AGENT_SESSION_DIR: `${join(lexical, 'link')}/..` },
+    join(root, 'agent')
+  )
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  const records = await repository.list()
+  assert.deepEqual(
+    records.map(record => record.sessionId),
+    ['link-s1'],
+    'discovery walks the physical directory the symlink/.. session dir resolves to'
+  )
+  assert.equal(fs.realpathSync.native(records[0]!.sessionFile), fs.realpathSync.native(join(physical, 's1.jsonl')))
+})
+
+test('repository.list caps retained metadata scans', async t => {
+  const { root, sessions, repository } = fixture(t)
+  for (let index = 0; index < 300; index++) writeSession(join(sessions, `s${index}.jsonl`), `cap-${index}`, root)
+
+  const records = await repository.list()
+  assert.equal(records.length, 300, 'every session is listed')
+  const retained = (repository as unknown as { metadataScans: Map<string, unknown> }).metadataScans
+  assert.ok(retained.size <= 256, `retained scans are capped, got ${retained.size}`)
+  assert.ok(retained.has(join(sessions, 's299.jsonl')), 'the most recent scans are retained')
 })
 
 test('repository header reads stop after a small first-line chunk and close the handle', async t => {

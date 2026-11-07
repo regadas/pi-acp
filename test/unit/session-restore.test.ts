@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { FakeAgentSideConnection, asAgentConn, fakeSessionConfigSync } from '../helpers/fakes.js'
 
 class FakeSessions {
@@ -72,9 +73,7 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
   }
 
   try {
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).sessions = sessions as any
-    ;(agent as any).store = {
+    const agent = new PiAcpAgent(asAgentConn(conn), {
       get(sessionId: string) {
         if (sessionId !== 'stored-session') return null
         return {
@@ -87,7 +86,8 @@ test('PiAcpAgent: prompt auto-restores a missing session from SessionStore', asy
       upsert(entry: any) {
         storeUpserts.push(entry)
       }
-    }
+    } as unknown as SessionStore)
+    ;(agent as any).sessions = sessions as any
 
     const result = await agent.prompt({
       sessionId: 'stored-session',
@@ -179,16 +179,15 @@ test('PiAcpAgent: setSessionConfigOption auto-restores via pi session discovery 
   }
 
   try {
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).sessions = sessions as any
-    ;(agent as any).store = {
+    const agent = new PiAcpAgent(asAgentConn(conn), {
       get() {
         return null
       },
       upsert(entry: any) {
         storeUpserts.push(entry)
       }
-    }
+    } as unknown as SessionStore)
+    ;(agent as any).sessions = sessions as any
 
     const result = await agent.setSessionConfigOption({
       sessionId: 'fallback-session',
@@ -251,11 +250,8 @@ test('PiAcpAgent: restore discovery receives the request cwd', async () => {
     }) as any
 
   try {
-    const agent = new PiAcpAgent(asAgentConn(conn)) as any
-    const store = { upsert() {} }
-    agent.store = store
+    const agent = new PiAcpAgent(asAgentConn(conn), { upsert() {} } as unknown as SessionStore) as any
     agent.repository = {
-      store,
       async find(sessionId: string, cwd?: string) {
         observedCwds.push(cwd)
         return { sessionId, cwd: requestedCwd, sessionFile, title: null, updatedAt: null }

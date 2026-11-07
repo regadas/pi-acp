@@ -33,10 +33,8 @@ function makeAgent(proc: FakePiRpcProcess, opts?: { deferredAdmissionTimeoutMs?:
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     ...(opts?.deferredAdmissionTimeoutMs !== undefined
       ? { deferredAdmissionTimeoutMs: opts.deferredAdmissionTimeoutMs }
       : {})
@@ -274,10 +272,8 @@ test('PiAcpSession: an expired command admission rejects a queued prompt instead
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     deferredAdmissionTimeoutMs: 30
   })
 
@@ -325,10 +321,8 @@ test('PiAcpSession: a cancel-quarantined channel still settles queued work as ca
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const running = session.runCommand(ctx => {
@@ -356,10 +350,8 @@ test('PiAcpSession: runCommand refuses to run local work once the child is gone'
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emitTermination({ reason: 'exit', code: 7, signal: null, expected: false })
@@ -381,10 +373,8 @@ test('PiAcpSession: runCommand still reports a cancellation after an expected ex
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   // Adapter-driven teardown, not a fault.
@@ -407,10 +397,8 @@ test('PiAcpSession: an unexpected exit fails a prompt queued behind a parked com
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     deferredAdmissionTimeoutMs: 60_000
   })
 
@@ -440,10 +428,8 @@ test('PiAcpSession: an unexpected exit fails a built-in queued behind a parked c
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     deferredAdmissionTimeoutMs: 60_000
   })
 
@@ -481,10 +467,8 @@ test('PiAcpSession: an unexpected exit rejects a parked command with the termina
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     deferredAdmissionTimeoutMs: 1_000
   })
 
@@ -514,10 +498,8 @@ test('PiAcpSession: an expected exit still settles a parked command as cancelled
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     deferredAdmissionTimeoutMs: 1_000
   })
 
@@ -543,10 +525,8 @@ test('PiAcpSession: cancelling before an unexpected exit keeps the parked comman
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     deferredAdmissionTimeoutMs: 1_000
   })
 
@@ -575,10 +555,8 @@ test('PiAcpSession: shutdown settles a parked command without waiting out its ad
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     deferredAdmissionTimeoutMs: 60_000
   })
 
@@ -606,10 +584,8 @@ test('PiAcpSession: a command queued behind a hard-failing prompt rejects and le
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   // Queued synchronously behind the active prompt, before its failure lands.
@@ -650,10 +626,8 @@ test('PiAcpSession: an unexpected exit between runCommand entry and its admissio
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   // Admission resolves synchronously (the gate is clear), but the caller only
@@ -676,10 +650,8 @@ test('PiAcpSession: an unexpected exit while a command body runs rejects instead
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   let release!: () => void
@@ -721,10 +693,8 @@ test('PiAcpSession: an expected exit while a command body runs still reports a c
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   let release!: () => void
@@ -750,10 +720,8 @@ test('PiAcpSession: a fault quarantine while a command is parked rejects instead
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   // An autonomous run parks the command.
@@ -788,10 +756,8 @@ test('PiAcpSession: an idle cancellation does not mask a later command crash', a
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   // A harmless cancel with nothing running leaves no work to settle, but it
@@ -820,10 +786,8 @@ test('PiAcpSession: a cancellation landing while a command waits is not erased b
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'agent_start' })
@@ -859,10 +823,8 @@ test('PiAcpSession: runCommand refuses to run local work on a fault-quarantined 
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   // A fault quarantine kills the channel synchronously, so no termination event
@@ -887,10 +849,8 @@ test('PiAcpSession: runCommand still reports a cancellation on an expected dispo
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   session.dispose()

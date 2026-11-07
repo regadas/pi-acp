@@ -139,6 +139,25 @@ function readFileOrNull(path: string): string | null {
 
 let tempCounter = 0
 
+/** Bound concurrent record reads so a large state directory cannot exhaust fds. */
+const RECORD_READ_CONCURRENCY = 32
+
+/**
+ * Order-preserving bounded-concurrency map: the results keep the input order
+ * while only `limit` operations run at once.
+ */
+export async function boundedAll<T, R>(items: readonly T[], limit: number, run: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length)
+  for (let offset = 0; offset < items.length; offset += limit) {
+    await Promise.all(
+      items.slice(offset, offset + limit).map(async (item, index) => {
+        results[offset + index] = await run(item)
+      })
+    )
+  }
+  return results
+}
+
 type SyncBufferWriter = (fd: number, buffer: Buffer, offset: number, length: number) => number
 
 /** Write a buffer completely even when the underlying write makes partial progress. */
@@ -287,9 +306,12 @@ export class SessionStore {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
-    for (const name of names) {
-      const path = join(this.stateDir, name)
-      const record = parseRecord(path, await readFile(path, 'utf8'))
+    const paths = names.map(name => join(this.stateDir, name))
+    // Parsing stays sequential so corruption surfaces exactly like get()'s.
+    const contents = await boundedAll(paths, RECORD_READ_CONCURRENCY, path => readFile(path, 'utf8'))
+    for (let index = 0; index < paths.length; index++) {
+      const path = paths[index]!
+      const record = parseRecord(path, contents[index]!)
       const id = record.deleted ? record.sessionId : record.session.sessionId
       if (path !== this.recordPath(id)) {
         throw new SessionStoreCorruptError(path, `record filename does not match sessionId ${id}`)

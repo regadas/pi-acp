@@ -122,17 +122,13 @@ test('app wiring: connection abort disposes every live session exactly once', as
 
   manager.getOrCreate('session-a', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: callbackConn,
-    proc: procA as any,
-    fileCommands: []
+    proc: procA as any
   })
   manager.getOrCreate('session-b', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: callbackConn,
-    proc: procB as any,
-    fileCommands: []
+    proc: procB as any
   })
 
   conn.close()

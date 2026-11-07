@@ -137,10 +137,8 @@ async function runFixture(fixture: GoldenFixture): Promise<{ pi: PiEffect[]; acp
   const session = new PiAcpSession({
     sessionId: fixture.session.sessionId,
     cwd: fixture.session.cwd,
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     supportsTerminalOutputMeta: fixture.session.supportsTerminalOutputMeta ?? false
   })
 

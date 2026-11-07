@@ -27,8 +27,7 @@ function makeAgent(sessionId: string, sessionFile: string, opts?: { onSpawn?: (p
   const events: string[] = []
   const originalSpawn = PiRpcProcess.spawn
 
-  const agent = new PiAcpAgent(asAgentConn(conn)) as unknown as Record<string, unknown>
-  agent.store = store
+  const agent = new PiAcpAgent(asAgentConn(conn), store) as unknown as Record<string, unknown>
   agent.sessions = new SessionManager(store)
 
   const spawn = async (params: { cwd: string; sessionPath?: string; additionalDirectories?: string[] }) => {
@@ -316,7 +315,7 @@ test(
     // session file untouched) so the racing replacement sees exactly the state
     // a real interleaving would: deletion decided, not yet executed.
     const agentAny = harness.agent as unknown as Record<string, any>
-    const realRepository = agentAny.sessionRepository()
+    const realRepository = agentAny.repository
     let releaseDelete!: () => void
     const deleteGate = new Promise<void>(resolve => {
       releaseDelete = resolve

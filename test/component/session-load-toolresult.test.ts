@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { replaySessionHistory } from '../../src/acp/history-replay.js'
@@ -130,8 +131,7 @@ for (const name of ['generic-client', 'zed', undefined]) {
 
     try {
       const conn = new FakeAgentSideConnection()
-      const agent = new PiAcpAgent(asAgentConn(conn))
-      ;(agent as any).store = new FakeStore()
+      const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
 
       await agent.initialize({
         protocolVersion: 1,
@@ -174,8 +174,7 @@ for (const name of ['generic-client', 'zed', undefined]) {
 
     try {
       const conn = new FakeAgentSideConnection()
-      const agent = new PiAcpAgent(asAgentConn(conn))
-      ;(agent as any).store = new FakeStore()
+      const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
 
       await agent.initialize({
         protocolVersion: 1,
@@ -233,8 +232,7 @@ test('PiAcpAgent: loadSession retains bash image blocks alongside negotiated ter
 
   try {
     const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
 
     await agent.initialize({
       protocolVersion: 1,
@@ -265,8 +263,7 @@ test('PiAcpAgent: loadSession retains bash image blocks as standard content for 
 
   try {
     const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
 
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} } as any)
     await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })
@@ -310,8 +307,7 @@ test('PiAcpAgent: loadSession keeps failed replayed tools monotonic (never compl
 
   try {
     const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
 
     await agent.initialize({ protocolVersion: 1, clientCapabilities: {} } as any)
     await agent.loadSession({ sessionId: 's1', cwd: TEST_CWD, mcpServers: [] })

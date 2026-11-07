@@ -26,10 +26,8 @@ test('PiAcpAgent: /export emits a percent-encoded file URI for paths with specia
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: dir,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const agent = new PiAcpAgent(asAgentConn(conn))

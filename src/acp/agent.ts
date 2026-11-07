@@ -41,7 +41,7 @@ import {
 } from './session-config.js'
 import { SessionStore } from './session-store.js'
 import { SessionRepository } from './session-repository.js'
-import { PiRpcProcess, PiRpcRequestTimeoutError } from '../pi-rpc/process.js'
+import { PiRpcRequestTimeoutError } from '../pi-rpc/process.js'
 import { piRecord } from '../pi-rpc/protocol.js'
 import { isThinkingLevel, type ThinkingLevel } from './thinking-levels.js'
 import { promptToPiMessage } from './translate/prompt.js'
@@ -86,7 +86,6 @@ function sessionPathsEquivalent(left: string, right: string): boolean {
 const BUILTIN_COMMAND_NAMES = new Set(builtinAvailableCommands().map(command => command.name))
 
 function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableCommand[] {
-  // Preserve order, de-dupe by name (first wins).
   const out: AvailableCommand[] = []
   const seen = new Set<string>()
 
@@ -131,11 +130,9 @@ type SessionRestoreOpts = {
 
 export class PiAcpAgent {
   private readonly conn: AcpClient
-  // Declared before `sessions` so the shared store exists when the manager
-  // field initializer runs (class fields initialize in declaration order).
-  private readonly store = new SessionStore()
-  private repository = new SessionRepository(this.store)
-  private readonly sessions = new SessionManager(this.store)
+  private readonly store: SessionStore
+  private readonly repository: SessionRepository
+  private readonly sessions: SessionManager
   private readonly restoringSessions = new Map<string, Promise<PiAcpSession>>()
   private readonly cancellationEpochs = new Map<string, number>()
   private readonly loadGenerations = new Map<string, number>()
@@ -150,8 +147,9 @@ export class PiAcpAgent {
    */
   private readonly activeResumes = new Map<string, Set<Promise<void>>>()
   /**
-   * Close admissions only; never cleaned up. Config mutations capture it
-   * at admission so a close admitted after them invalidates their work.
+   * Close admissions; cleaned up once a close/delete fully settles and no
+   * tracked work remains. Config mutations capture it at admission so a close
+   * admitted after them invalidates their work.
    */
   private readonly closeAdmissionGenerations = new Map<string, number>()
   private readonly activePrompts = new Map<string, Set<Promise<void>>>()
@@ -217,13 +215,11 @@ export class PiAcpAgent {
     await this.sessions.disposeAllAndWait(timeoutMs)
   }
 
-  constructor(conn: AcpClient) {
+  constructor(conn: AcpClient, store: SessionStore = new SessionStore()) {
     this.conn = conn
-  }
-
-  private sessionRepository(): SessionRepository {
-    if (this.repository.store !== this.store) this.repository = new SessionRepository(this.store)
-    return this.repository
+    this.store = store
+    this.repository = new SessionRepository(store)
+    this.sessions = new SessionManager(store)
   }
 
   private async cleanupFailedNewSession(sessionId: string): Promise<void> {
@@ -232,8 +228,8 @@ export class PiAcpAgent {
       .then(async () => {
         this.sessions.close(sessionId)
         await this.sessions.waitForRetiredProcesses([sessionId, ...aliases], this.replacementTerminationTimeoutMs)
-        if (aliases.length) await this.sessionRepository().delete(sessionId)
-        else this.sessionRepository().tombstone(sessionId)
+        if (aliases.length) await this.repository.delete(sessionId)
+        else this.repository.tombstone(sessionId)
       })
       .finally(() => {
         if (this.deletingSessions.get(sessionId) === cleanup) this.deletingSessions.delete(sessionId)
@@ -261,7 +257,7 @@ export class PiAcpAgent {
     sessionId: string,
     cwd?: string
   ): Promise<{ cwd: string; sessionFile: string; additionalDirectories: readonly string[] } | null> {
-    const session = await this.sessionRepository().find(sessionId, cwd)
+    const session = await this.repository.find(sessionId, cwd)
     return session
       ? {
           cwd: session.cwd,
@@ -293,6 +289,41 @@ export class PiAcpAgent {
     ) {
       this.cancellationEpochs.delete(sessionId)
     }
+  }
+
+  /**
+   * Drop a settled session's per-session admission bookkeeping. Only called
+   * once a close/delete fully settled and nothing tracked remains — the
+   * close drained prompts, resumes, loads and config mutations — so no
+   * in-flight reader can still compare against these fences, and a missing
+   * key keeps failing closed exactly like a mismatched one. A session used
+   * again re-seeds its fences on the next admission. A load still validating
+   * keeps its captured counters: dropping them would read the baseline back
+   * (`?? 0`) and admit it behind the acknowledged close, so cleanup retries
+   * once that span settles (its fences have then landed).
+   */
+  private cleanupSessionAdmissionState(sessionId: string): void {
+    if (
+      this.sessions.maybeGet(sessionId) ||
+      this.activePrompts.has(sessionId) ||
+      this.activeLoads.has(sessionId) ||
+      this.activeResumes.has(sessionId) ||
+      this.restoringSessions.has(sessionId) ||
+      this.closingSessions.has(sessionId) ||
+      this.deletingSessions.has(sessionId) ||
+      this.configMutationQueues.has(sessionId)
+    ) {
+      return
+    }
+    const validation = this.sessionValidations.get(sessionId)
+    if (validation) {
+      void validation.then(() => this.cleanupSessionAdmissionState(sessionId))
+      return
+    }
+    this.loadGenerations.delete(sessionId)
+    this.loadArrivals.delete(sessionId)
+    this.validLoadArrivals.delete(sessionId)
+    this.closeAdmissionGenerations.delete(sessionId)
   }
 
   private isPromptCancelled(sessionId: string, cancellationEpoch: number, signal?: AbortSignal): boolean {
@@ -344,7 +375,19 @@ export class PiAcpAgent {
     }
   }
 
-  private trackPrompt(sessionId: string, operation: () => Promise<PromptResponse>): Promise<PromptResponse> {
+  /**
+   * Track an admitted request so close/delete drain it before acknowledging.
+   * `chainedRemoval` folds the bookkeeping into the returned promise (loads,
+   * resumes); prompts keep it as a side chain so the caller settles first.
+   * `cleanupEpoch` drops the session's cancellation epoch once nothing
+   * tracked remains (prompts and loads only).
+   */
+  private track<T>(
+    map: Map<string, Set<Promise<void>>>,
+    sessionId: string,
+    operation: () => Promise<T>,
+    opts: { cleanupEpoch: boolean; chainedRemoval: boolean }
+  ): Promise<T> {
     // Defer operation startup by one microtask so registration is complete
     // before restore or adapter-side command execution reaches an async boundary.
     const result = Promise.resolve().then(operation)
@@ -353,89 +396,40 @@ export class PiAcpAgent {
       () => undefined
     )
 
-    let active = this.activePrompts.get(sessionId)
+    let active = map.get(sessionId)
     if (!active) {
       active = new Set()
-      this.activePrompts.set(sessionId, active)
+      map.set(sessionId, active)
     }
     active.add(tracked)
 
-    void tracked.then(() => {
+    const release = () => {
       active.delete(tracked)
-      if (active.size === 0 && this.activePrompts.get(sessionId) === active) {
-        this.activePrompts.delete(sessionId)
-      }
-      this.cleanupCancellationEpoch(sessionId)
-    })
-
+      if (active.size === 0 && map.get(sessionId) === active) map.delete(sessionId)
+      if (opts.cleanupEpoch) this.cleanupCancellationEpoch(sessionId)
+    }
+    if (opts.chainedRemoval) return result.finally(release)
+    void tracked.then(release)
     return result
   }
 
+  private trackPrompt(sessionId: string, operation: () => Promise<PromptResponse>): Promise<PromptResponse> {
+    return this.track(this.activePrompts, sessionId, operation, { cleanupEpoch: true, chainedRemoval: false })
+  }
+
   private trackLoad<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
-    const result = Promise.resolve().then(operation)
-    const tracked = result.then(
-      () => undefined,
-      () => undefined
-    )
-
-    let active = this.activeLoads.get(sessionId)
-    if (!active) {
-      active = new Set()
-      this.activeLoads.set(sessionId, active)
-    }
-    active.add(tracked)
-
-    return result.finally(() => {
-      active.delete(tracked)
-      if (active.size === 0 && this.activeLoads.get(sessionId) === active) {
-        this.activeLoads.delete(sessionId)
-      }
-      this.cleanupCancellationEpoch(sessionId)
-    })
+    return this.track(this.activeLoads, sessionId, operation, { cleanupEpoch: true, chainedRemoval: true })
   }
 
   /** Tracks a whole resume operation from synchronous admission so close/delete drain it before their final sweep. */
   private trackResume<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
-    const result = Promise.resolve().then(operation)
-    const tracked = result.then(
-      () => undefined,
-      () => undefined
-    )
-
-    let active = this.activeResumes.get(sessionId)
-    if (!active) {
-      active = new Set()
-      this.activeResumes.set(sessionId, active)
-    }
-    active.add(tracked)
-
-    return result.finally(() => {
-      active.delete(tracked)
-      if (active.size === 0 && this.activeResumes.get(sessionId) === active) {
-        this.activeResumes.delete(sessionId)
-      }
-    })
+    return this.track(this.activeResumes, sessionId, operation, { cleanupEpoch: false, chainedRemoval: true })
   }
 
-  private async waitForActivePrompts(sessionId: string): Promise<void> {
+  /** Wait for every tracked request of one map to settle (new arrivals included). */
+  private async waitForActive(map: Map<string, Set<Promise<void>>>, sessionId: string): Promise<void> {
     while (true) {
-      const active = this.activePrompts.get(sessionId)
-      if (!active?.size) return
-      await Promise.all([...active])
-    }
-  }
-
-  private async waitForActiveLoads(sessionId: string): Promise<void> {
-    while (true) {
-      const active = this.activeLoads.get(sessionId)
-      if (!active?.size) return
-      await Promise.all([...active])
-    }
-  }
-
-  private async waitForActiveResumes(sessionId: string): Promise<void> {
-    while (true) {
-      const active = this.activeResumes.get(sessionId)
+      const active = map.get(sessionId)
       if (!active?.size) return
       await Promise.all([...active])
     }
@@ -503,8 +497,8 @@ export class PiAcpAgent {
         // the final sweep: waiting for them earlier would deadlock behind the
         // same teardown, skipping them would acknowledge a close around a
         // resume that still spawns its child.
-        await this.waitForActiveResumes(sessionId)
-        await this.waitForActiveLoads(sessionId)
+        await this.waitForActive(this.activeResumes, sessionId)
+        await this.waitForActive(this.activeLoads, sessionId)
         // Config mutations are tracked as neither prompts nor loads; their
         // queue tail is the only record of pending writes, so drain it before
         // the final sweep: a write admitted before the close must not publish
@@ -517,6 +511,7 @@ export class PiAcpAgent {
           this.closingSessions.delete(sessionId)
         }
         this.cleanupCancellationEpoch(sessionId)
+        this.cleanupSessionAdmissionState(sessionId)
       })
     this.closingSessions.set(sessionId, closing)
     return closing
@@ -548,7 +543,7 @@ export class PiAcpAgent {
       await shutdown
     }
 
-    await this.waitForActivePrompts(sessionId)
+    await this.waitForActive(this.activePrompts, sessionId)
   }
 
   /**
@@ -610,7 +605,7 @@ export class PiAcpAgent {
         // never wait here (they would wait on their own tracking): they own
         // generation-guarded teardown of whatever survives their fencing.
         if (!opts?.loadOwned && this.activeLoads.has(sessionId)) {
-          await this.waitForActiveLoads(sessionId)
+          await this.waitForActive(this.activeLoads, sessionId)
           continue
         }
         // Retire the differently configured child through the normal teardown
@@ -726,20 +721,12 @@ export class PiAcpAgent {
 
     // Spawned through the session manager so the child is owned (and waited
     // for at shutdown) even if this restore disposes it below.
-    let proc: PiRpcProcess
-    try {
-      proc = await this.sessions.spawnOwned({
-        cwd,
-        sessionPath: stored.sessionFile,
-        piCommand: process.env.PI_ACP_PI_COMMAND,
-        ...(additionalDirectories.length ? { additionalDirectories } : {})
-      })
-    } catch (e: unknown) {
-      if (e instanceof Error && e.name === 'PiRpcSpawnError') {
-        throw RequestError.internalError({ code: (e as Error & { code?: string }).code }, e.message)
-      }
-      throw e
-    }
+    const proc = await this.sessions.spawnOwned({
+      cwd,
+      sessionPath: stored.sessionFile,
+      piCommand: process.env.PI_ACP_PI_COMMAND,
+      ...(additionalDirectories.length ? { additionalDirectories } : {})
+    })
 
     // The connection may have been torn down while the spawn was in flight;
     // a disposed agent must never register (and thereby leak) this process.
@@ -829,7 +816,7 @@ export class PiAcpAgent {
   private async restoreSessionAwaitingLoads(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
     while (true) {
       this.assertCloseAdmissionCurrent(sessionId, opts?.closeAdmission)
-      await this.waitForActiveLoads(sessionId)
+      await this.waitForActive(this.activeLoads, sessionId)
       // The load wait above can straddle a close admission.
       this.assertCloseAdmissionCurrent(sessionId, opts?.closeAdmission)
       // Root-less restores re-read surviving state each retry (per-iteration
@@ -854,18 +841,15 @@ export class PiAcpAgent {
         }
         // An older load is still settling: wait and retry so these newer
         // roots replace its surviving child.
-        await this.waitForActiveLoads(sessionId)
+        await this.waitForActive(this.activeLoads, sessionId)
         continue
       }
-      await this.waitForActiveLoads(sessionId)
+      await this.waitForActive(this.activeLoads, sessionId)
     }
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     // We currently only support stable ACP protocol version 1.
-    const supportedVersion = PROTOCOL_VERSION
-    const requested = params.protocolVersion
-
     const clientCapabilities = params.clientCapabilities as
       | {
           auth?: { terminal?: unknown } | null
@@ -889,7 +873,7 @@ export class PiAcpAgent {
     this.advertisedAuthMethodIds = new Set(this.authMethods.map(method => method.id))
 
     return {
-      protocolVersion: requested === supportedVersion ? requested : supportedVersion,
+      protocolVersion: PROTOCOL_VERSION,
       agentInfo: {
         name: 'pi-acp',
         title: 'pi ACP adapter',
@@ -900,9 +884,10 @@ export class PiAcpAgent {
       // `createPiAcpAgentApp` (src/acp/app.ts): omitted capability = unsupported.
       agentCapabilities: {
         loadSession: true,
-        // pi has no MCP support; non-empty mcpServers are rejected explicitly
-        // in session/new, session/load, and session/resume (see README
-        // limitations), and no MCP transport capability is advertised.
+        // Client mcpServers are not bridged into pi's own MCP configuration
+        // (pi-side mcp.json and extensions stay usable); non-empty mcpServers
+        // are rejected explicitly in session/new, session/load, and
+        // session/resume, and no MCP transport capability is advertised.
         mcpCapabilities: { http: false, sse: false },
         promptCapabilities: {
           image: true,
@@ -1071,10 +1056,6 @@ export class PiAcpAgent {
     })
   }
 
-  private async usageFor(session: PiAcpSession) {
-    return typeof session.publishUsageAndGet === 'function' ? session.publishUsageAndGet() : undefined
-  }
-
   private async runPrompt(
     params: PromptRequest,
     cancellationEpoch: number,
@@ -1123,7 +1104,7 @@ export class PiAcpAgent {
           const completed = await session.runCommand(
             async ctx => ({
               response: await runBuiltinCommand(session, cmd, args, ctx, argsString),
-              usage: await this.usageFor(session)
+              usage: await session.publishUsageAndGet()
             }),
             requestOwner
           )
@@ -1139,7 +1120,7 @@ export class PiAcpAgent {
         message,
         images,
         async () => {
-          usage = await this.usageFor(session)
+          usage = await session.publishUsageAndGet()
         },
         requestOwner
       )
@@ -1149,16 +1130,6 @@ export class PiAcpAgent {
     }
   }
 
-  /**
-   * Adapter-handled builtin slash commands (headless-friendly subset). Always
-   * invoked through `session.runCommand`, so it is already serialized with the
-   * session's prompt FIFO and settles as cancelled on `session/cancel`.
-   *
-   * Every publication goes through `ctx.sendSessionUpdate`, which drops
-   * updates once the command is cancelled: cancellation quarantines the pi
-   * channel, so an in-flight RPC rejects with an induced error that must never
-   * surface as a command failure (or a late success).
-   */
   async cancel(params: CancelNotification): Promise<void> {
     const session = this.sessions.maybeGet(params.sessionId)
     const observable =
@@ -1221,7 +1192,7 @@ export class PiAcpAgent {
     }
 
     // No cursor (or a legacy numeric offset) discovers current sessions again.
-    const filtered = await this.sessionRepository().list(params.cwd ?? undefined)
+    const filtered = await this.repository.list(params.cwd ?? undefined)
     const sessions: SessionInfo[] = filtered.map(s => ({
       sessionId: s.sessionId,
       cwd: s.cwd,
@@ -1267,7 +1238,19 @@ export class PiAcpAgent {
     this.assertLoadActive(session.sessionId, generation)
   }
 
-  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+  async loadSession(
+    params: LoadSessionRequest,
+    opts?: {
+      /**
+       * Internal (v2 replay): invoked once this load has passed validation,
+       * superseded any previous load through its replacement teardown, and is
+       * about to replay its own history — the moment the previous load's
+       * buffered replay state must be dropped (see
+       * V2ClientConnection.supersedeReplayBuffers).
+       */
+      onSupersedingReplay?: () => void
+    }
+  ): Promise<LoadSessionResponse> {
     assertValidSessionCwd(params.cwd)
     assertNoMcpServers(params.mcpServers)
     const additionalDirectories = normalizeAdditionalDirectories(params.cwd, params.additionalDirectories)
@@ -1352,6 +1335,8 @@ export class PiAcpAgent {
       try {
         this.assertLoadActive(params.sessionId, generation)
         const proc = session.proc
+
+        opts?.onSupersedingReplay?.()
 
         await replaySessionHistory({
           session,
@@ -1484,7 +1469,7 @@ export class PiAcpAgent {
         )
 
         try {
-          await this.sessionRepository().delete(sessionId)
+          await this.repository.delete(sessionId)
         } catch (error) {
           throw RequestError.internalError(
             { code: (error as NodeJS.ErrnoException).code },
@@ -1497,6 +1482,7 @@ export class PiAcpAgent {
           this.deletingSessions.delete(sessionId)
         }
         this.cleanupCancellationEpoch(sessionId)
+        this.cleanupSessionAdmissionState(sessionId)
       })
     this.deletingSessions.set(sessionId, deleting)
     return deleting
@@ -1509,25 +1495,23 @@ export class PiAcpAgent {
     return {}
   }
 
-  /**
-   * Send `available_commands_update` after the current request's response has
-   * been delivered. Some clients ignore notifications for a
-   * sessionId they have not yet confirmed.
-   */
   // Test seam: deferred scheduling for post-response notifications. Tests
   // replace this locally instead of monkey-patching the global setTimeout.
   private scheduleDeferred: (task: () => void) => void = task => {
     setTimeout(task, 0)
   }
 
+  /**
+   * Send `available_commands_update` (and usage) after the current request's
+   * response has been delivered. Some clients ignore notifications for a
+   * sessionId they have not yet confirmed.
+   */
   private advertiseCommandsSoon(session: PiAcpSession): void {
     this.scheduleDeferred(() => {
       void this.advertiseCommands(session)
-      if (typeof session.publishUsageAndGet === 'function') {
-        void session.publishUsageAndGet({
-          isStale: () => this.sessions.maybeGet(session.sessionId) !== session
-        })
-      }
+      void session.publishUsageAndGet({
+        isStale: () => this.sessions.maybeGet(session.sessionId) !== session
+      })
     })
   }
 
@@ -1537,7 +1521,7 @@ export class PiAcpAgent {
     let availableCommands: AvailableCommand[]
     try {
       const pi = await session.proc.getCommands()
-      const { commands } = toAvailableCommandsFromPiGetCommands(pi)
+      const commands = toAvailableCommandsFromPiGetCommands(pi)
       availableCommands = mergeCommands(builtinAvailableCommands(), commands)
     } catch {
       availableCommands = builtinAvailableCommands()
@@ -1614,14 +1598,10 @@ export class PiAcpAgent {
       }
       session.beginConfigurationMutation()
       try {
-        if (configId === MODEL_CONFIG_ID) {
-          const state = await applySessionModel(session.proc, value)
-          const options = await emitConfigOptionsUpdate(session, session.sessionId, session.proc, { state })
-          session.seedSessionConfiguration(options)
-          return options
-        }
-
-        const state = await applyThinkingLevel(session.proc, value as ThinkingLevel)
+        const state =
+          configId === MODEL_CONFIG_ID
+            ? await applySessionModel(session.proc, value)
+            : await applyThinkingLevel(session.proc, value as ThinkingLevel)
         // Publish through the session queue: an event-driven sync may already
         // have a stale update in flight, and only shared ordering guarantees
         // this mutation's state is the last one on the wire.
@@ -1636,28 +1616,12 @@ export class PiAcpAgent {
   }
 }
 
-/** Normalize request cancellation after its owned prompt work and updates settle. */
-export async function runPromptWithCancellation(
-  agent: Pick<PiAcpAgent, 'prompt'>,
-  params: PromptRequest,
-  signal: AbortSignal
-): Promise<PromptResponse> {
-  try {
-    const response = await agent.prompt(params, signal)
-    return signal.aborted ? { ...response, stopReason: 'cancelled' } : response
-  } catch (error) {
-    if (signal.aborted) return { stopReason: 'cancelled' }
-    throw error
-  }
-}
-
 function readNearestPackageJson(metaUrl: string): {
   version?: string
 } {
   try {
     let dir = dirname(fileURLToPath(metaUrl))
 
-    // Walk upwards a few levels to find the nearest package.json
     for (let i = 0; i < 6; i++) {
       const p = join(dir, 'package.json')
       if (existsSync(p)) {

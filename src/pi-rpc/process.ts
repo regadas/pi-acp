@@ -1,14 +1,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync, statSync, unlinkSync } from 'node:fs'
-import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { buildPiInvocation, getPiCommand } from './command.js'
-import { killProcessTree, type TreeKillResult } from './process-tree.js'
+import { killProcessTree, killPosixProcessGroup, type TreeKillResult } from './process-tree.js'
+import { appendPathSegments } from './raw-path.js'
 import { WORKSPACE_ROOTS_ENV } from './workspace-instructions.js'
 import { LfLineDecoder } from './line-decoder.js'
 import { assertSupportedPiVersion, PiVersionError } from './version.js'
 import {
+  decodeLifecycleWidget,
   decodePiRecord,
+  type LifecycleWidgetState,
   type PiRpcCommand,
   type PiRpcEvent,
   type PiRpcResponse,
@@ -91,11 +93,22 @@ type PiRpcProcessOptions = {
   closeFallbackMs?: number
   maxStdoutRecordBytes?: number
   /**
-   * Test seam overriding the tree-kill primitive ({@link killProcessTree}).
-   * Production sets it for cmd.exe wrapper children only; its presence gates
-   * termination on tree confirmation in dispose.
+   * Tree-kill primitive for launches whose real pi is a descendant: Windows
+   * cmd.exe wrappers ({@link killProcessTree}) and POSIX process groups
+   * ({@link killPosixProcessGroup}). Its presence gates termination on tree
+   * confirmation in dispose. Also a test seam overriding the primitive.
    */
   killTree?: (pid: number, timeoutMs: number) => Promise<TreeKillResult>
+  /**
+   * The tree-kill primitive addresses the root pid, which the OS may reuse
+   * once the root is reaped (Windows taskkill): disposal of a root that
+   * already exited must fail closed instead of risking an unrelated process.
+   * A POSIX process-group kill opts out — a group id cannot be reused while
+   * any member lives, and an empty group's ESRCH confirms the kill — so it
+   * still runs on a root-exited child. Defaults to true: a bare killTree
+   * seam is pid-addressed.
+   */
+  killTreeTargetsRootPid?: boolean
 }
 
 type PiExtensionUiResponse =
@@ -149,6 +162,7 @@ export class PiRpcProcess {
   private exitFallbackTimer: NodeJS.Timeout | undefined
   private nativeUnsettled = false
   private readonly killTree?: (pid: number, timeoutMs: number) => Promise<TreeKillResult>
+  private readonly killTreeTargetsRootPid: boolean
   private treeKillConfirmed = false
   /** Observed root exit: the OS may have reused its pid, so it must never be signaled by pid. */
   private rootExitObserved = false
@@ -164,6 +178,7 @@ export class PiRpcProcess {
     this.killGraceMs = opts?.killGraceMs ?? KILL_GRACE_MS
     this.closeFallbackMs = opts?.closeFallbackMs ?? CLOSE_FALLBACK_MS
     this.killTree = opts?.killTree
+    this.killTreeTargetsRootPid = opts?.killTreeTargetsRootPid ?? true
 
     // Write callbacks do not consume the stream's asynchronous error event.
     child.stdin.on('error', () => this.dispose({ expected: false }))
@@ -206,13 +221,10 @@ export class PiRpcProcess {
     })
     child.on('exit', (code, signal) => {
       this.rootExitObserved = true
-      // Settle on 'close' so buffered stdout drains to handlers first; the
-      // fallback timer bounds stdio that never closes. A tree-gated dispose
-      // defers settlement to the kill result.
-      if (this.treeSettlementGated()) {
-        this.pendingTreeExit = { code, signal }
-        return
-      }
+      // Recorded even when ungated: a POSIX group kill confirmed after a
+      // root-exited dispose settles through this record in onTreeKillSettled.
+      this.pendingTreeExit = { code, signal }
+      if (this.treeSettlementGated()) return
       const timer = setTimeout(() => {
         if (!this.treeSettlementGated()) this.settleTermination({ reason: 'exit', code, signal })
       }, this.closeFallbackMs)
@@ -282,9 +294,13 @@ export class PiRpcProcess {
   }
 
   private dispatchEvent(ev: PiRpcEvent): void {
-    for (const handler of [...this.eventHandlers]) {
+    // Fixed length: a handler added mid-dispatch must not receive this event
+    // (and removal reassigns the field, never mutates the captured array).
+    const handlers = this.eventHandlers
+    const count = handlers.length
+    for (let i = 0; i < count; i++) {
       try {
-        handler(ev)
+        handlers[i](ev)
       } catch {
         // One subscriber must not break sibling handlers or the stdout reader.
       }
@@ -404,7 +420,7 @@ export class PiRpcProcess {
       // Pi only persists its default new-session path after an assistant
       // message; an explicit empty file keeps identity across preflight cancel.
       mkdirSync(params.sessionDirectory, { recursive: true, mode: 0o700 })
-      emptySessionPath = join(
+      emptySessionPath = appendPathSegments(
         params.sessionDirectory,
         `${new Date().toISOString().replace(/[:.]/g, '-')}_${crypto.randomUUID()}.jsonl`
       )
@@ -441,14 +457,26 @@ export class PiRpcProcess {
       stdio: 'pipe',
       env,
       shell: false,
+      // The child owns a dedicated POSIX process group: disposal terminates
+      // the whole group (see killPosixProcessGroup) so a wrapper's pi
+      // descendant cannot survive it and later double-open the session file.
+      detached: process.platform !== 'win32',
       windowsVerbatimArguments: invocation.windowsVerbatimArguments
     })
     // Listeners attach immediately because a child can exit directly after its
     // `spawn` event. A cmd.exe wrapper child must terminate its whole process
-    // tree on disposal, not just the wrapper root.
+    // tree on disposal, not just the wrapper root; a POSIX child terminates
+    // its whole process group for the same reason.
     const proc = new PiRpcProcess(
       child,
-      invocation.windowsScriptWrapper === true ? { killTree: killProcessTree } : undefined
+      invocation.windowsScriptWrapper === true
+        ? { killTree: killProcessTree }
+        : process.platform !== 'win32'
+          ? {
+              killTree: (pid, timeoutMs) => killPosixProcessGroup(pid, timeoutMs, timeoutMs),
+              killTreeTargetsRootPid: false
+            }
+          : undefined
     )
     void proc.whenTerminated().then(cleanupEmptySession)
 
@@ -576,11 +604,6 @@ export class PiRpcProcess {
     }
   }
 
-  /** Bounded tail of the child's stderr output (for diagnostics). */
-  stderrTail(): string {
-    return this.stderrTailBuf
-  }
-
   /**
    * Whether a request is still awaiting its correlated pi response. pi has no
    * command that cancels in-flight RPC work (`abort` only stops an agent run,
@@ -608,9 +631,10 @@ export class PiRpcProcess {
   private backgroundDisposal = false
 
   /**
-   * Wrapper children release termination only after the whole tree is
-   * confirmed dead: the root exiting alone leaves the real pi grandchild
-   * alive and writing the session through its pipes.
+   * Tree-killed children — Windows script wrappers and POSIX process groups
+   * — release termination only after the whole tree is confirmed dead: the
+   * root exiting alone leaves the real pi grandchild alive and writing the
+   * session through its pipes.
    */
   private treeSettlementGated(): boolean {
     return this.killTree !== undefined && !this.treeKillConfirmed && this.disposeRequested
@@ -672,17 +696,16 @@ export class PiRpcProcess {
     const pid = this.child.pid
     if (this.killTree !== undefined && pid !== undefined) {
       // Kill the whole tree as a unit: the real pi grandchild holds the session
-      // and pipes, and signaling only the root would strand it past taskkill's
-      // /T reach. A root that already exited can never be tree-killed — its pid
-      // may have been reused — so the barrier fails closed instead of risking
-      // an unrelated process.
-      if (this.rootExitObserved) {
+      // and pipes, and signaling only the root would strand it past the
+      // tree-kill primitives' reach (taskkill /T on Windows, the process
+      // group on POSIX).
+      if (this.rootExitObserved && this.killTreeTargetsRootPid) {
         if (this.exitFallbackTimer) {
           clearTimeout(this.exitFallbackTimer)
           this.exitFallbackTimer = undefined
         }
         console.error(
-          'pi-acp: pi wrapper root exited before disposal; its process tree cannot be ' +
+          'pi-acp: Windows pi wrapper root exited before disposal; its process tree cannot be ' +
             'terminated safely (pid reuse); holding the session until shutdown'
         )
         // The barrier can never release: an unexpected quarantine settles
@@ -816,34 +839,23 @@ export class PiRpcProcess {
     deadline?: number,
     admission = false
   ): Promise<boolean> {
-    let acknowledgement: { state?: unknown; error?: unknown } | undefined
+    let acknowledgement: LifecycleWidgetState | undefined
     const unsubscribe = this.onEvent(event => {
+      if (event.type !== 'extension_ui_request' || event.method !== 'setWidget') return
+      const state = decodeLifecycleWidget(event)
       if (
-        event.type !== 'extension_ui_request' ||
-        event.method !== 'setWidget' ||
-        event.widgetKey !== 'pi-acp-lifecycle'
+        state &&
+        state.owner === owner &&
+        (operation === 'begin'
+          ? ['ready', 'waiting', 'rejected', 'error']
+          : operation === 'withdraw'
+            ? ['withdrawn', 'error']
+            : operation === 'cancel'
+              ? ['stopping', 'error']
+              : ['pending', 'cancelled', 'error']
+        ).includes(state.state)
       )
-        return
-      try {
-        const lines = event.widgetLines
-        if (!Array.isArray(lines) || lines.length !== 1 || typeof lines[0] !== 'string') return
-        const state = JSON.parse(lines[0]) as { version?: unknown; owner?: unknown; state?: unknown; error?: unknown }
-        if (
-          state.version === 1 &&
-          state.owner === owner &&
-          (operation === 'begin'
-            ? ['ready', 'waiting', 'rejected', 'error']
-            : operation === 'withdraw'
-              ? ['withdrawn', 'error']
-              : operation === 'cancel'
-                ? ['stopping', 'error']
-                : ['pending', 'cancelled', 'error']
-          ).includes(String(state.state))
-        )
-          acknowledgement = state
-      } catch {
-        /* Ignore malformed widget payloads. */
-      }
+        acknowledgement = state
     })
     try {
       const response = await this.request(

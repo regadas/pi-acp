@@ -25,9 +25,8 @@ async function makeHarness(t: TestContext, clientCapabilities: InitializeRequest
   const sessions = new SessionManager(store)
   const originalSpawn = PiRpcProcess.spawn
 
-  const agent = new PiAcpAgent(asAgentConn(conn))
+  const agent = new PiAcpAgent(asAgentConn(conn), store)
   const agentRecord = agent as unknown as Record<string, unknown>
-  agentRecord.store = store
   agentRecord.sessions = sessions
   ;(PiRpcProcess as unknown as { spawn: unknown }).spawn = async (options: { sessionPath?: string }) => {
     const proc = new FakePiRpcProcess()

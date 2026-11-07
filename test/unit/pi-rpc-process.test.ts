@@ -1,6 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { EventEmitter } from 'node:events'
@@ -496,6 +506,34 @@ test('PiRpcProcess: confirmed tree kill settles a pre-confirmation exit through 
   assert.equal(settled, true, 'confirmation arms the bounded close fallback for the already-exited root')
 })
 
+test('PiRpcProcess: a root-exited POSIX group child still settles through a confirmed group kill', async () => {
+  const mock = Object.assign(new MockChild(), { pid: 9001 })
+  const { calls, killTree, confirm } = deferredTreeKill()
+  const proc = PiRpcProcess.fromChild(asChild(mock), {
+    killGraceMs: 250,
+    closeFallbackMs: 20,
+    killTree,
+    killTreeTargetsRootPid: false
+  })
+  let settled = false
+  void proc.whenTerminated().then(() => {
+    settled = true
+  })
+
+  // The root exits before disposal — the exit->close window an EPIPE-driven
+  // dispose can land in. A POSIX group id cannot be reused while any member
+  // lives, so the group kill still runs instead of failing closed, and the
+  // recorded exit settles through the confirmation path.
+  mock.emit('exit', 0, null)
+  await tick()
+  proc.dispose()
+  assert.deepEqual(calls, [{ pid: 9001, timeoutMs: 250 }], 'the group id stays signalable after the root exited')
+
+  confirm({ confirmed: true })
+  await sleep(60)
+  assert.equal(settled, true, 'confirmation settles the root-exited child and releases the session')
+})
+
 test('PiRpcProcess: disposal after a wrapper root exit never targets the reaped pid', async () => {
   const mock = Object.assign(new MockChild(), { pid: 777 })
   const { calls, killTree } = deferredTreeKill()
@@ -773,6 +811,91 @@ test(
   }
 )
 
+test(
+  'PiRpcProcess: a POSIX shell wrapper dispose terminates the wrapper and its pi descendant before settling',
+  { skip: isWindows ? 'POSIX-only: exercises process groups' : false },
+  async t => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-posix-tree-'))
+    const pidFile = join(dir, 'tree-pids.txt')
+    const grandchildFixture = fileURLToPath(new URL('../fixtures/fake-pi-cmd-grandchild.mjs', import.meta.url))
+    // A non-exec wrapper: the real pi is a descendant the wrapper merely
+    // relays to, so only a whole-group kill reaches it.
+    writeFileSync(join(dir, 'pi-fixture.sh'), `#!/bin/sh\n"${process.execPath}" "${grandchildFixture}" "$@"\n`)
+    chmodSync(join(dir, 'pi-fixture.sh'), 0o755)
+
+    const previousPidFile = process.env.PI_ACP_TEST_TREE_PID_FILE
+    process.env.PI_ACP_TEST_TREE_PID_FILE = pidFile
+    let wrapperPid = 0
+    let grandchildPid = 0
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let proc: PiRpcProcess | undefined
+    t.after(() => {
+      // Cleanup must not leak processes even when an assertion fails first.
+      for (const pid of [wrapperPid, grandchildPid]) {
+        if (pid > 0 && alive(pid)) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {
+            /* raced natural exit */
+          }
+        }
+      }
+      proc?.dispose()
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* best-effort temp cleanup */
+      }
+    })
+
+    try {
+      proc = await PiRpcProcess.spawn({ cwd: dir, piCommand: join(dir, 'pi-fixture.sh') })
+      const readPidPair = (): [number, number] | null => {
+        try {
+          const tokens = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
+          if (tokens.length === 2 && tokens.every(pid => Number.isInteger(pid) && pid > 0)) {
+            return [tokens[0]!, tokens[1]!]
+          }
+        } catch {
+          /* Both pids are not readable yet. */
+        }
+        return null
+      }
+      const deadline = Date.now() + 10_000
+      let pids = readPidPair()
+      while (Date.now() < deadline && !pids) {
+        await sleep(25)
+        pids = readPidPair()
+      }
+      ;[grandchildPid, wrapperPid] = pids!
+      assert.ok(grandchildPid > 0 && wrapperPid > 0, 'the pi descendant must report its own and the wrapper pid')
+      assert.ok(alive(wrapperPid) && alive(grandchildPid), 'wrapper and pi descendant must be alive before dispose')
+
+      const terminated = proc.whenTerminated()
+      proc.dispose()
+      await withTimeout(terminated, 10_000, 'POSIX process-group termination')
+
+      // Both the wrapper and its pi descendant must be dead once termination
+      // settled: the barrier gates replacement writers of the session file.
+      const settleDeadline = Date.now() + 5_000
+      while (Date.now() < settleDeadline && (alive(wrapperPid) || alive(grandchildPid))) await sleep(25)
+      assert.equal(alive(wrapperPid), false, 'the shell wrapper must be dead when termination settles')
+      assert.equal(alive(grandchildPid), false, 'the pi descendant must be dead when termination settles')
+    } finally {
+      if (previousPidFile === undefined) delete process.env.PI_ACP_TEST_TREE_PID_FILE
+      else process.env.PI_ACP_TEST_TREE_PID_FILE = previousPidFile
+    }
+  }
+)
+
 test('PiRpcProcess: a failed stdin write quarantines the channel as an unexpected fault', async () => {
   for (const mode of ['callback', 'throw'] as const) {
     const mock = new MockChild()
@@ -883,13 +1006,17 @@ test('PiRpcProcess: a failed fire-and-forget stdin write rejects and quarantines
 test('PiRpcProcess: stderr retention is bounded to a tail buffer', async () => {
   const mock = new MockChild()
   const proc = PiRpcProcess.fromChild(asChild(mock))
+  const termination = new Promise<PiRpcTermination>(resolve => proc.onTermination(resolve))
 
   mock.stderr.write('x'.repeat(64 * 1024))
   mock.stderr.write('TAIL-END')
   await tick()
+  mock.emit('exit', 0, null)
+  mock.emit('close', 0, null)
+  const settled = await termination
 
-  assert.ok(proc.stderrTail().length <= 8 * 1024, `stderr tail must be capped, got ${proc.stderrTail().length}`)
-  assert.ok(proc.stderrTail().endsWith('TAIL-END'))
+  assert.ok(settled.stderrTail.length <= 8 * 1024, `stderr tail must be capped, got ${settled.stderrTail.length}`)
+  assert.ok(settled.stderrTail.endsWith('TAIL-END'))
 })
 
 test('PiRpcProcess: buffered stdout events are dispatched before termination settles (real child)', async t => {
@@ -1018,13 +1145,13 @@ for (const behavior of ['split-writes', 'garbage-then-event', 'stderr-flood', 'l
       await assert.rejects(proc.getState(), PiRpcClosedError)
     } else if (behavior === 'stderr-flood') {
       await proc.getState()
-      assert.ok(proc.stderrTail().length <= 8192)
-      // stdout and stderr are independent OS pipes; wait for the observed tail.
-      const deadline = Date.now() + 2_000
-      while (!proc.stderrTail().endsWith('TAIL-END\n')) {
-        assert.ok(Date.now() < deadline, 'stderr tail deadline')
-        await tick()
-      }
+      // stdout and stderr are independent OS pipes; the observed tail is
+      // carried by the termination record once the flood has drained.
+      await tick()
+      proc.dispose()
+      const settled = await withTimeout(termination, 2_000, behavior)
+      assert.ok(settled.stderrTail.length <= 8192)
+      assert.ok(settled.stderrTail.endsWith('TAIL-END\n'))
     } else {
       const event = await withTimeout(new Promise<PiRpcEvent>(resolve => proc.onEvent(resolve)), 2_000, behavior)
       assert.equal(event.type, 'session_info_changed')
@@ -1567,6 +1694,41 @@ test('PiRpcProcess: owner cancel control releases an awaited settlement boundary
   assert.deepEqual(phases.slice(0, 3), ['clear_queue', 'cancel', 'abort'])
   assert.equal(phases.at(-1), 'check')
 })
+
+test(
+  'PiRpcProcess.spawn creates the empty session file in the physical symlink/.. directory',
+  { skip: isWindows },
+  async () => {
+    clearPiVersionCacheForTests()
+    const root = mkdtempSync(join(tmpdir(), 'pi-acp-session-dir-link-'))
+    const physical = join(root, 'physical')
+    const lexical = join(root, 'lexical')
+    mkdirSync(join(physical, 'nested'), { recursive: true })
+    mkdirSync(lexical)
+    // link -> physical/nested, so `link/..` physically resolves to `physical`,
+    // while a lexical `join` collapse names `lexical` — the wrong directory.
+    symlinkSync(join(physical, 'nested'), join(lexical, 'link'))
+    const stub = join(root, 'pi-parked')
+    writeFileSync(
+      stub,
+      '#!/bin/sh\n' + 'if [ "$1" = "--version" ]; then printf "1.3.0\\n"; exit 0; fi\n' + 'while :; do sleep 1; done\n'
+    )
+    chmodSync(stub, 0o755)
+
+    let proc: PiRpcProcess | undefined
+    try {
+      proc = await PiRpcProcess.spawn({ cwd: root, piCommand: stub, sessionDirectory: `${join(lexical, 'link')}/..` })
+      const created = readdirSync(physical).filter(name => name.endsWith('.jsonl'))
+      assert.equal(created.length, 1, 'the empty session file is created in the physical directory')
+      assert.equal(statSync(join(physical, created[0]!)).size, 0)
+      assert.deepEqual(readdirSync(lexical), ['link'], 'no session file leaks into the lexically collapsed directory')
+    } finally {
+      proc?.dispose()
+      await proc?.whenTerminated()
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+)
 
 test('PiRpcProcess.spawn passes additional workspace roots to the child env only', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()

@@ -66,9 +66,8 @@ test('PiAcpAgent: newSession returns AUTH_REQUIRED when pi reports an auth error
   const sessions = new FakeSessions(session)
   const store = new SessionStore(sessionMapPath)
   store.upsert({ sessionId: 's-auth', cwd: process.cwd(), sessionFile })
-  const agent = new PiAcpAgent(asAgentConn(conn))
+  const agent = new PiAcpAgent(asAgentConn(conn), store)
   ;(agent as any).sessions = sessions as any
-  ;(agent as any).store = store as any
 
   await assert.rejects(
     () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),
@@ -169,9 +168,8 @@ test('PiAcpAgent: newSession waits for writer exit before deleting a failed sess
   const sessions = new FakeSessions(session, retirementGate)
   const store = new SessionStore(join(root, 'map.json'))
   store.upsert({ sessionId: 's-barrier', cwd: process.cwd(), sessionFile })
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), store)
   ;(agent as any).sessions = sessions
-  ;(agent as any).store = store
 
   const creating = agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any)
   await new Promise(resolve => setTimeout(resolve, 0))
@@ -210,9 +208,8 @@ test('PiAcpAgent: post-create configuration failure rolls back the session', asy
   const sessions = new FakeSessions(session)
   const store = new SessionStore(join(root, 'map.json'))
   store.upsert({ sessionId: 's-config', cwd: process.cwd(), sessionFile })
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), store)
   ;(agent as any).sessions = sessions
-  ;(agent as any).store = store
 
   await assert.rejects(
     () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),
@@ -281,9 +278,8 @@ test('PiAcpAgent: failed-session cleanup unlinks only the trusted store path, ne
   const sessions = new FakeSessions(session)
   const store = new SessionStore(sessionMapPath)
   store.upsert({ sessionId: 's-cleanup', cwd: process.cwd(), sessionFile: trustedSessionFile })
-  const agent = new PiAcpAgent(asAgentConn(conn))
+  const agent = new PiAcpAgent(asAgentConn(conn), store)
   ;(agent as any).sessions = sessions as any
-  ;(agent as any).store = store as any
 
   await assert.rejects(
     () => agent.newSession({ cwd: process.cwd(), mcpServers: [] } as any),

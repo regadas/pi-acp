@@ -19,10 +19,8 @@ test('PiAcpSession: emits agent_message_chunk for text_delta', async () => {
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -47,10 +45,8 @@ test('PiAcpSession: emits visible custom messages in-turn and omits hidden custo
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const prompt = session.prompt('test prompt')
@@ -104,10 +100,8 @@ test('PiAcpSession: buffers out-of-turn custom messages until the next prompt ex
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
   const agentMessageTexts = () =>
     conn.updates
@@ -156,10 +150,8 @@ test('PiAcpSession: emits agent_thought_chunk for thinking_delta', async () => {
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -189,10 +181,8 @@ test('PiAcpSession: synchronizes session info and thinking configuration events 
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'session_info_changed', name: 'Project session' })
@@ -252,10 +242,8 @@ test('PiAcpSession: coalesces thinking events produced by ACP configuration muta
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'thinking_level_changed', level: 'high' })
@@ -292,10 +280,8 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: [],
     // This test locks in the negotiated terminal_output extension.
     supportsTerminalOutputMeta: true
   })
@@ -355,10 +341,8 @@ test('PiAcpSession: synthesizes starts before prompt-owned completion-only tool 
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     supportsTerminalOutputMeta: true
   })
 
@@ -432,10 +416,8 @@ test('PiAcpSession: synthesizes starts for progress-only tool events and keeps s
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     supportsTerminalOutputMeta: true
   })
 
@@ -531,10 +513,8 @@ test('PiAcpSession: a duplicate tool_execution_end does not resurrect a complete
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const prompt = session.prompt('run tools')
@@ -577,10 +557,8 @@ test('PiAcpSession: bash output falls back to standard content without terminal_
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'bash', args: { command: 'ls' } })
@@ -628,10 +606,8 @@ test('PiAcpSession: suppresses cumulative subagent progress snapshots but preser
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const args = { agent: 'worker', task: 'Implement the fix' }
@@ -666,7 +642,6 @@ test('PiAcpSession: suppresses cumulative subagent progress snapshots but preser
     title: 'subagent',
     kind: 'other',
     status: 'in_progress',
-    locations: undefined,
     rawInput: args
   })
   assert.deepEqual(conn.updates[1]!.update, {
@@ -685,10 +660,8 @@ test('PiAcpSession: suppresses streamed subagent argument deltas but preserves b
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const toolCallId = 'subagent-stream'
@@ -748,10 +721,8 @@ test('PiAcpSession: preserves tool-result image content in live tool_call_update
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'screenshot', args: {} })
@@ -785,10 +756,8 @@ test('PiAcpSession: preserves interleaved and image-only tool-result order in li
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 't-mixed', toolName: 'screenshot', args: {} })
@@ -837,10 +806,8 @@ test('PiAcpSession: emits custom-message image blocks in order during an active 
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const prompt = session.prompt('test prompt')
@@ -876,10 +843,8 @@ test('PiAcpSession: flushes idle custom-message image blocks in order on the nex
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -922,10 +887,8 @@ test('PiAcpSession: retains bash tool-result image blocks for generic clients', 
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 'b1', toolName: 'bash', args: { command: 'render' } })
@@ -958,10 +921,8 @@ test('PiAcpSession: retains bash tool-result image blocks alongside negotiated t
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: [],
     supportsTerminalOutputMeta: true
   })
 
@@ -1002,10 +963,8 @@ test('PiAcpSession: emits existing file locations for built-in and custom tools'
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 'read', toolName: 'read', args })
@@ -1027,10 +986,8 @@ test('PiAcpSession: omits directory tool locations', async () => {
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'ctx_index', args: { path: cwd } })
@@ -1049,10 +1006,8 @@ test('PiAcpSession: omits missing locations for non-write tools', async () => {
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1090,10 +1045,8 @@ test(
     new PiAcpSession({
       sessionId: 's1',
       cwd,
-      mcpServers: [],
       proc: proc as any,
-      conn: asAgentConn(conn),
-      fileCommands: []
+      conn: asAgentConn(conn)
     })
 
     proc.emit({ type: 'tool_execution_start', toolCallId: 'file', toolName: 'read', args: { path: fileLink } })
@@ -1127,10 +1080,8 @@ test('PiAcpSession: handles extension select via ACP permission request', async 
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1169,10 +1120,8 @@ test('PiAcpSession: handles extension confirm via ACP permission request', async
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1201,10 +1150,8 @@ test('PiAcpSession: sends cancelled response when ACP confirm is cancelled', asy
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'extension_ui_request', id: 'ui-5', method: 'confirm', title: 'Continue?' })
@@ -1221,10 +1168,8 @@ test('PiAcpSession: cancels input and editor silently when elicitation was not n
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'extension_ui_request', id: 'ui-3', method: 'input', title: 'Enter name' })
@@ -1246,10 +1191,8 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_start with attempt/
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'auto_retry_start', attempt: 2, maxAttempts: 5, delayMs: 2400 })
@@ -1270,10 +1213,8 @@ test('PiAcpSession: formats a positive sub-second auto_retry_start delay as wait
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 1 })
@@ -1294,10 +1235,8 @@ test('PiAcpSession: falls back to a generic retry message when auto_retry_start 
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'auto_retry_start', attempt: 'oops', maxAttempts: null, delayMs: 'bad' } as any)
@@ -1318,10 +1257,8 @@ test('PiAcpSession: omits raw errorMessage content from surfaced auto_retry_star
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1347,10 +1284,8 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'auto_retry_end' } as any)
@@ -1364,57 +1299,6 @@ test('PiAcpSession: emits agent_message_chunk for auto_retry_end', async () => {
   })
 })
 
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_start', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-
-  new PiAcpSession({
-    sessionId: 's1',
-    cwd: TEST_CWD,
-    mcpServers: [],
-    proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
-  })
-
-  proc.emit({ type: 'auto_compaction_start' } as any)
-
-  await new Promise(r => setTimeout(r, 0))
-
-  assert.equal(conn.updates.length, 1)
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: { type: 'text', text: 'Context nearing limit, running automatic compaction...' }
-  })
-})
-
-test('PiAcpSession: emits agent_message_chunk for auto_compaction_end', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-
-  new PiAcpSession({
-    sessionId: 's1',
-    cwd: TEST_CWD,
-    mcpServers: [],
-    proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
-  })
-
-  proc.emit({ type: 'auto_compaction_end' } as any)
-
-  await new Promise(r => setTimeout(r, 0))
-
-  assert.equal(conn.updates.length, 1)
-  assert.deepEqual(conn.updates[0]!.update, {
-    sessionUpdate: 'agent_message_chunk',
-    content: {
-      type: 'text',
-      text: 'Automatic compaction finished; context was summarized to continue the session.'
-    }
-  })
-})
-
 test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with text_delta events', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -1422,10 +1306,8 @@ test('PiAcpSession: preserves ordering when auto_retry_start is interleaved with
   new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'before ' } })
@@ -1461,10 +1343,8 @@ test('PiAcpSession: emits missing write locations at stream boundaries but not d
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1504,10 +1384,8 @@ test('PiAcpSession: emits edit tool line when oldText matches uniquely', async (
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1536,10 +1414,8 @@ test('PiAcpSession: emits edit tool line from edits array when oldText matches u
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1568,10 +1444,8 @@ test('PiAcpSession: emits edit tool line from stringified edits array', async ()
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1600,10 +1474,8 @@ test('PiAcpSession: omits edit tool line when oldText matches multiple times', a
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   proc.emit({
@@ -1627,10 +1499,8 @@ test('PiAcpSession: prompt resolves end_turn only at agent_settled, not agent_en
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const p = session.prompt('hello')
@@ -1713,10 +1583,8 @@ test('PiAcpSession: cancel flips stopReason to cancelled', async () => {
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const p = session.prompt('hello')
@@ -1738,10 +1606,8 @@ test('PiAcpSession: queues concurrent prompt and starts it only after agent_sett
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const first = session.prompt('one')
@@ -1782,10 +1648,8 @@ test('PiAcpSession: cancel clears queued prompts', async () => {
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   const first = session.prompt('one')
@@ -1813,17 +1677,8 @@ test('PiAcpSession: forwards non-adapter slash commands to pi unchanged', async 
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: [
-      {
-        name: 'hello',
-        description: 'test',
-        content: 'Say hello to $1',
-        source: '(project)'
-      }
-    ]
+    conn: asAgentConn(conn)
   })
 
   const p = session.prompt('/hello world')

@@ -99,7 +99,7 @@ test('owned completion failure fails the prompt at settlement without disposing 
   await tick()
   assert.equal(settled, false, 'Pi still owns the run until its native settlement')
   // A later successful provider completion cannot erase the barrier failure.
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
   proc.emit({ type: 'agent_settled' })
   await assert.rejects(prompt, /Background harness/)
   await assert.rejects(queued)

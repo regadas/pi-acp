@@ -21,10 +21,8 @@ function makeSession(
   return new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
     conn: asAgentConn(conn),
-    fileCommands: [],
     ...(opts?.deferredAdmissionTimeoutMs !== undefined
       ? { deferredAdmissionTimeoutMs: opts.deferredAdmissionTimeoutMs }
       : {})
@@ -49,7 +47,7 @@ function agentMessageTexts(conn: FakeAgentSideConnection): string[] {
 function emitForeignTurnBoundEvents(proc: FakePiRpcProcess): void {
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'foreign text' } })
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'foreign thought' } })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'length' } })
   proc.emit({ type: 'tool_execution_start', toolCallId: 'foreign-tool', toolName: 'read', args: { path: 'x' } })
   proc.emit({
     type: 'tool_execution_end',
@@ -192,7 +190,7 @@ test('PiAcpSession: a foreign run buffered before prompt acceptance stays unowne
     message: { role: 'user', content: [{ type: 'text', text: 'expanded:hello' }] }
   })
   proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'owned response' } })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
   proc.emit({ type: 'agent_end' })
   proc.emit({ type: 'agent_settled' })
 

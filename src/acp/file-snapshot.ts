@@ -15,7 +15,7 @@ export function fileSnapshot(path: string): string | null | undefined {
     const opened = fstatSync(fd)
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > MAX_SNAPSHOT_BYTES)
       return undefined
-    const buffer = Buffer.allocUnsafe(MAX_SNAPSHOT_BYTES + 1)
+    const buffer = Buffer.allocUnsafe(Math.min(opened.size, MAX_SNAPSHOT_BYTES) + 1)
     let length = 0
     while (length < buffer.length) {
       const count = readSync(fd, buffer, length, buffer.length - length, length)

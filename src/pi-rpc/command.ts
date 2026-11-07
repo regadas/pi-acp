@@ -113,6 +113,35 @@ export function isBunRunnableEntry(path: string): boolean {
 }
 
 /**
+ * Whether an entry may be a script forwarding to another pi depending on the
+ * cwd (a shebang line, or a JavaScript extension): such a launcher can report
+ * a different version per workspace. A shebang-less non-JavaScript executable
+ * is treated as the concrete entry.
+ */
+export function isWrapperCapableScript(path: string): boolean {
+  return isJavaScriptEntry(path) || readShebangLine(path) !== null
+}
+
+/**
+ * Whether a resolved entry is the concrete pi itself — a non-script
+ * executable, or a direct-JS install buildPiInvocation recognizes (an
+ * npm-style symlink to a Node/Bun-shebang entry) — rather than a launcher
+ * script that may forward to a different pi per cwd. A `..` segment can make
+ * any resolution-dependent classification disagree with the entry that
+ * actually launches (see bunRuntimeInvocation), so such entries are never
+ * concrete.
+ */
+export function isConcretePiEntry(path: string): boolean {
+  if (path.split('/').includes('..')) return false
+  if (!isWrapperCapableScript(path)) return true
+  try {
+    return isBunRunnableEntry(realpathSync.native(path))
+  } catch {
+    return false
+  }
+}
+
+/**
  * Default direct-JavaScript Pi installs (npm symlink to a .js entry) launch
  * under Bun when available: same RPC behavior, faster startup. Shell
  * launchers, standalone binaries and anything unresolvable keep their own

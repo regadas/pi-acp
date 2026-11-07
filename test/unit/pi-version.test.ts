@@ -6,7 +6,6 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   MIN_PI_VERSION,
-  PI_FEATURE_MIN_VERSION,
   PiVersionError,
   assertSupportedPiVersion,
   clearPiVersionCacheForTests,
@@ -19,12 +18,6 @@ import { PiRpcProcess, PiRpcSpawnError } from '../../src/pi-rpc/process.js'
 const isWindows = process.platform === 'win32'
 const hostBun = isWindows ? null : findExecutableOnPath('bun')
 const bunDir = hostBun ? dirname(hostBun) : ''
-
-test('supported Pi floor is 1.2.0 and covers every historical feature floor', () => {
-  assert.equal(MIN_PI_VERSION, '1.2.0')
-  for (const [feature, version] of Object.entries(PI_FEATURE_MIN_VERSION))
-    assert.ok(comparePiVersions(version, MIN_PI_VERSION) <= 0, `${feature} must exist at the supported floor`)
-})
 
 function makePiStubIn(dir: string, name: string, versionOutput: string, versionExitCode = 0): string {
   const stub = join(dir, name)
@@ -360,6 +353,190 @@ test(
   }
 )
 
+test(
+  'assertSupportedPiVersion: a hanging POSIX wrapper version probe abort kills the whole group',
+  { skip: isWindows ? 'POSIX-only: exercises real process groups' : false },
+  async t => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-posix-tree-'))
+    const pidFile = join(dir, 'version-pids.txt')
+    const grandchildFixture = fileURLToPath(new URL('../fixtures/fake-pi-cmd-grandchild.mjs', import.meta.url))
+    // A non-exec shell wrapper whose pi grandchild hangs on --version and
+    // holds the inherited stdio pipes: only a whole-group kill can settle
+    // the aborted probe (the probe settles on close, never on a root kill).
+    const wrapper = join(dir, 'pi-fixture.sh')
+    writeFileSync(wrapper, `#!/bin/sh\n"${process.execPath}" "${grandchildFixture}" "$@"\n`)
+    chmodSync(wrapper, 0o755)
+    const previousPidFile = process.env.PI_ACP_TEST_TREE_PID_FILE
+    const previousHang = process.env.PI_ACP_TEST_HANG_VERSION
+    process.env.PI_ACP_TEST_TREE_PID_FILE = pidFile
+    process.env.PI_ACP_TEST_HANG_VERSION = '1'
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let wrapperPid = 0
+    let grandchildPid = 0
+    t.after(() => {
+      if (previousPidFile === undefined) delete process.env.PI_ACP_TEST_TREE_PID_FILE
+      else process.env.PI_ACP_TEST_TREE_PID_FILE = previousPidFile
+      if (previousHang === undefined) delete process.env.PI_ACP_TEST_HANG_VERSION
+      else process.env.PI_ACP_TEST_HANG_VERSION = previousHang
+      // Cleanup must not leak processes even when an assertion fails first.
+      for (const pid of [wrapperPid, grandchildPid]) {
+        if (pid > 0 && alive(pid)) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {
+            /* raced natural exit */
+          }
+        }
+      }
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* best-effort temp cleanup */
+      }
+    })
+
+    const controller = new AbortController()
+    const checking = assertSupportedPiVersion(wrapper, dir, controller.signal)
+    const readPidPair = (): [number, number] | null => {
+      try {
+        const tokens = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
+        if (tokens.length === 2 && tokens.every(pid => Number.isInteger(pid) && pid > 0)) {
+          return [tokens[0]!, tokens[1]!]
+        }
+      } catch {
+        /* Both pids are not readable yet. */
+      }
+      return null
+    }
+    const reportDeadline = Date.now() + 10_000
+    let pids = readPidPair()
+    while (Date.now() < reportDeadline && !pids) {
+      await new Promise(r => setTimeout(r, 25))
+      pids = readPidPair()
+    }
+    ;[grandchildPid, wrapperPid] = pids!
+    assert.ok(grandchildPid > 0 && wrapperPid > 0, 'the hanging grandchild must report both pids')
+    assert.ok(alive(wrapperPid) && alive(grandchildPid), 'wrapper and grandchild must be alive before abort')
+
+    controller.abort()
+    await assert.rejects(
+      checking,
+      (error: unknown) => error instanceof Error && error.name === 'AbortError',
+      'the aborted probe must settle through group termination, not the 15s timeout'
+    )
+    // The probe rejects only on close, which the pipe-holding grandchild
+    // releases when the whole group dies: the settled rejection proves it.
+    assert.equal(alive(grandchildPid), false, 'the hanging pi grandchild must be dead after probe abort')
+    assert.equal(alive(wrapperPid), false, 'the shell wrapper must be dead after probe abort')
+  }
+)
+
+test(
+  'assertSupportedPiVersion: a root-exited POSIX wrapper probe still group-kills on abort',
+  { skip: isWindows ? 'POSIX-only: exercises real process groups' : false },
+  async t => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-posix-root-exit-'))
+    const pidFile = join(dir, 'version-pids.txt')
+    const grandchildFixture = fileURLToPath(new URL('../fixtures/fake-pi-cmd-grandchild.mjs', import.meta.url))
+    // The launcher starts the pipe-holding grandchild, waits until it has
+    // reported both pids, then exits: the probe root is gone while the
+    // grandchild keeps the stdio pipes open.
+    const wrapper = join(dir, 'pi-fixture.sh')
+    writeFileSync(
+      wrapper,
+      `#!/bin/sh\n` +
+        `"${process.execPath}" "${grandchildFixture}" "$@" &\n` +
+        `while [ ! -f ${JSON.stringify(pidFile)} ]; do sleep 0.05; done\n` +
+        `exit 0\n`,
+      'utf-8'
+    )
+    chmodSync(wrapper, 0o755)
+    const previousPidFile = process.env.PI_ACP_TEST_TREE_PID_FILE
+    const previousHang = process.env.PI_ACP_TEST_HANG_VERSION
+    process.env.PI_ACP_TEST_TREE_PID_FILE = pidFile
+    process.env.PI_ACP_TEST_HANG_VERSION = '1'
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let wrapperPid = 0
+    let grandchildPid = 0
+    t.after(() => {
+      if (previousPidFile === undefined) delete process.env.PI_ACP_TEST_TREE_PID_FILE
+      else process.env.PI_ACP_TEST_TREE_PID_FILE = previousPidFile
+      if (previousHang === undefined) delete process.env.PI_ACP_TEST_HANG_VERSION
+      else process.env.PI_ACP_TEST_HANG_VERSION = previousHang
+      // Cleanup must not leak processes even when an assertion fails first.
+      for (const pid of [wrapperPid, grandchildPid]) {
+        if (pid > 0 && alive(pid)) {
+          try {
+            process.kill(pid, 'SIGKILL')
+          } catch {
+            /* raced natural exit */
+          }
+        }
+      }
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* best-effort temp cleanup */
+      }
+    })
+
+    const controller = new AbortController()
+    const checking = assertSupportedPiVersion(wrapper, dir, controller.signal)
+    const readPidPair = (): [number, number] | null => {
+      try {
+        const tokens = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number)
+        if (tokens.length === 2 && tokens.every(pid => Number.isInteger(pid) && pid > 0)) {
+          return [tokens[0]!, tokens[1]!]
+        }
+      } catch {
+        /* Both pids are not readable yet. */
+      }
+      return null
+    }
+    const reportDeadline = Date.now() + 10_000
+    let pids = readPidPair()
+    while (Date.now() < reportDeadline && !pids) {
+      await new Promise(r => setTimeout(r, 25))
+      pids = readPidPair()
+    }
+    ;[grandchildPid, wrapperPid] = pids!
+    assert.ok(grandchildPid > 0 && wrapperPid > 0, 'the hanging grandchild must report both pids')
+    // The launcher exits once the pid file exists; wait for the reaped root
+    // so the abort exercises the root-exited ordering, plus one tick for the
+    // probe's exit event.
+    while (Date.now() < reportDeadline && alive(wrapperPid)) {
+      await new Promise(r => setTimeout(r, 25))
+    }
+    assert.equal(alive(wrapperPid), false, 'the launcher must exit while the grandchild holds the pipes')
+    assert.equal(alive(grandchildPid), true, 'the pipe-holding grandchild must survive the root exit')
+    await new Promise(r => setTimeout(r, 50))
+
+    controller.abort()
+    await assert.rejects(
+      checking,
+      (error: unknown) => error instanceof Error && error.name === 'AbortError',
+      'the aborted probe must settle through group termination, not the 15s timeout'
+    )
+    assert.equal(alive(grandchildPid), false, 'the pipe-holding grandchild must be dead after probe abort')
+  }
+)
+
 test('one version caller abort does not kill a probe used by another caller', { skip: isWindows }, async () => {
   clearPiVersionCacheForTests()
   const counter = join(mkdtempSync(join(tmpdir(), 'pi-acp-version-count-')), 'count')
@@ -555,6 +732,23 @@ function makeJsPiStub(dir: string, bunVersion: string, nodeVersion: string): voi
   symlinkSync(cli, join(dir, 'pi'))
 }
 
+/** npm-style PATH entry: `pi-shared` is a symlink to a direct-JS entry, so PATH resolution lands on the concrete pi. */
+function makeDelayedCountingJsPiStub(counter: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-shared-js-'))
+  const cli = join(dir, 'cli.mjs')
+  writeFileSync(
+    cli,
+    `#!/usr/bin/env node\n` +
+      `import { appendFileSync } from 'node:fs'\n` +
+      `appendFileSync(${JSON.stringify(counter)}, 'x')\n` +
+      `setTimeout(() => console.log(${JSON.stringify(MIN_PI_VERSION)}), 100)\n`,
+    'utf-8'
+  )
+  chmodSync(cli, 0o755)
+  symlinkSync(cli, join(dir, 'pi-shared'))
+  return join(dir, 'pi-shared')
+}
+
 /**
  * A PATH entry holding only `node` (as a symlink), so shebang-based probes
  * stay hermetic even when the host keeps Node and Bun in one bin directory.
@@ -574,6 +768,129 @@ function withPath<T>(entries: readonly string[], run: () => Promise<T>): Promise
     clearPiVersionCacheForTests()
   })
 }
+
+test("an absolute cwd-sensitive wrapper cannot reuse another workspace's version", { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-wrapper-'))
+  const counter = join(dir, 'count')
+  const wrapper = join(dir, 'pi-wrapper')
+  const workspaceA = mkdtempSync(join(tmpdir(), 'pi-acp-version-wrapper-a-'))
+  const workspaceB = mkdtempSync(join(tmpdir(), 'pi-acp-version-wrapper-b-'))
+  // The same absolute launcher forwards to each workspace's local pi, so
+  // the version it reports depends on the cwd it runs in.
+  writeFileSync(
+    wrapper,
+    `#!/bin/sh\n` +
+      `printf 'x' >> ${JSON.stringify(counter)}\n` +
+      `if [ -f './this-is-workspace-a' ]; then printf '1.2.1\\n'; else printf '1.0.4\\n'; fi\n`,
+    'utf-8'
+  )
+  chmodSync(wrapper, 0o755)
+  writeFileSync(join(workspaceA, 'this-is-workspace-a'), '', 'utf-8')
+
+  assert.equal(await assertSupportedPiVersion(wrapper, workspaceA), '1.2.1')
+  await assert.rejects(
+    assertSupportedPiVersion(wrapper, workspaceB),
+    (err: unknown) => err instanceof PiVersionError && err.message.includes('1.0.4'),
+    "workspace B must probe its own pi instead of reusing workspace A's supported result"
+  )
+  assert.equal(readFileSync(counter, 'utf8'), 'xx', 'both workspaces ran their own probe')
+})
+
+test("a PATH-resolved wrapper command cannot reuse another workspace's version", { skip: isWindows }, async () => {
+  clearPiVersionCacheForTests()
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-path-wrapper-'))
+  const counter = join(dir, 'count')
+  const wrapper = join(dir, 'pi')
+  const workspaceA = mkdtempSync(join(tmpdir(), 'pi-acp-version-path-wrapper-a-'))
+  const workspaceB = mkdtempSync(join(tmpdir(), 'pi-acp-version-path-wrapper-b-'))
+  // The same PATH launcher forwards to each workspace's local pi, so the
+  // version it reports depends on the cwd it runs in.
+  writeFileSync(
+    wrapper,
+    `#!/bin/sh\n` +
+      `printf 'x' >> ${JSON.stringify(counter)}\n` +
+      `if [ -f './this-is-workspace-a' ]; then printf '1.2.1\\n'; else printf '1.0.4\\n'; fi\n`,
+    'utf-8'
+  )
+  chmodSync(wrapper, 0o755)
+  writeFileSync(join(workspaceA, 'this-is-workspace-a'), '', 'utf-8')
+
+  await withPath([dir, makeNodeOnlyPath()], async () => {
+    assert.equal(await assertSupportedPiVersion('pi', workspaceA), '1.2.1')
+    await assert.rejects(
+      assertSupportedPiVersion('pi', workspaceB),
+      (err: unknown) => err instanceof PiVersionError && err.message.includes('1.0.4'),
+      "workspace B must probe its own pi instead of reusing workspace A's supported result"
+    )
+    assert.equal(readFileSync(counter, 'utf8'), 'xx', 'both workspaces ran their own probe')
+  })
+})
+
+test(
+  "a bare JS-shebang forwarding override cannot reuse another workspace's version",
+  { skip: isWindows },
+  async () => {
+    clearPiVersionCacheForTests()
+    const dir = mkdtempSync(join(tmpdir(), 'pi-acp-version-js-fwd-'))
+    const counter = join(dir, 'count')
+    const launcher = join(dir, 'pi-fwd.mjs')
+    const workspaceA = mkdtempSync(join(tmpdir(), 'pi-acp-version-js-fwd-a-'))
+    const workspaceB = mkdtempSync(join(tmpdir(), 'pi-acp-version-js-fwd-b-'))
+    // The launcher is shape-identical to a concrete direct-JS pi entry (a
+    // JavaScript extension plus a bare Node shebang) but forwards to each
+    // workspace's local pi, so an explicit override must probe per cwd.
+    writeFileSync(
+      launcher,
+      '#!/usr/bin/env node\n' +
+        `import { appendFileSync, readFileSync } from 'node:fs'\n` +
+        `appendFileSync(${JSON.stringify(counter)}, 'x')\n` +
+        `process.stdout.write(readFileSync('./pi-version', 'utf8'))\n`,
+      'utf-8'
+    )
+    chmodSync(launcher, 0o755)
+    writeFileSync(join(workspaceA, 'pi-version'), '1.2.1\n', 'utf-8')
+    writeFileSync(join(workspaceB, 'pi-version'), '1.0.4\n', 'utf-8')
+
+    await withPath([dir, makeNodeOnlyPath()], async () => {
+      assert.equal(await assertSupportedPiVersion('pi-fwd.mjs', workspaceA), '1.2.1')
+      await assert.rejects(
+        assertSupportedPiVersion('pi-fwd.mjs', workspaceB),
+        (err: unknown) => err instanceof PiVersionError && err.message.includes('1.0.4'),
+        "workspace B must probe its own pi instead of reusing workspace A's supported result"
+      )
+      assert.equal(readFileSync(counter, 'utf8'), 'xx', 'both workspaces ran their own probe')
+    })
+  }
+)
+
+test(
+  'assertSupportedPiVersion shares one probe for a PATH-resolved direct-JS entry across cwds',
+  { skip: isWindows },
+  async () => {
+    clearPiVersionCacheForTests()
+    const counter = join(mkdtempSync(join(tmpdir(), 'pi-acp-version-path-share-')), 'count')
+    const stub = makeDelayedCountingJsPiStub(counter)
+    const firstDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-path-cwd1-'))
+    const secondDir = mkdtempSync(join(tmpdir(), 'pi-acp-version-path-cwd2-'))
+
+    await withPath([dirname(stub), makeNodeOnlyPath()], async () => {
+      // Default discovery without Bun on PATH: the invocation stays verbatim,
+      // so sharing must come from the resolved entry itself being concrete.
+      const [first, second] = await Promise.all([
+        assertSupportedPiVersion('pi-shared', firstDir, undefined, true),
+        assertSupportedPiVersion('pi-shared', secondDir, undefined, true)
+      ])
+      assert.equal(first, MIN_PI_VERSION)
+      assert.equal(second, MIN_PI_VERSION)
+      assert.equal(
+        readFileSync(counter, 'utf8'),
+        'x',
+        'two cwds resolving the same concrete entry: one probe, not one per workspace'
+      )
+    })
+  }
+)
 
 test('assertSupportedPiVersion probes a default JavaScript Pi install through Bun', { skip: !hostBun }, async () => {
   clearPiVersionCacheForTests()

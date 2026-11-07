@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { getGlobalPiSettings, getMergedPiSettings } from '../../src/acp/pi-settings.js'
@@ -48,3 +48,25 @@ test('pi settings reuse supplied global settings without mutation and preserve f
   writeFileSync(projectPath, '[]')
   assert.deepEqual(getMergedPiSettings(root), {})
 })
+
+test(
+  'project settings resolve a symlink/.. cwd into the physical project',
+  { skip: process.platform === 'win32' },
+  t => {
+    const root = mkdtempSync(join(tmpdir(), 'pi-acp-pi-settings-link-'))
+    const physical = join(root, 'physical')
+    const lexical = join(root, 'lexical')
+    mkdirSync(join(physical, '.pi'), { recursive: true })
+    mkdirSync(join(lexical, '.pi'), { recursive: true })
+    // link -> physical/nested, so `link/..` physically resolves to `physical`,
+    // while a lexical collapse names `lexical` — a different project.
+    mkdirSync(join(physical, 'nested'))
+    symlinkSync(join(physical, 'nested'), join(lexical, 'link'))
+    writeFileSync(join(physical, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'physical-project' }))
+    writeFileSync(join(lexical, '.pi', 'settings.json'), JSON.stringify({ sessionDir: 'lexical-collapse' }))
+    t.after(() => rmSync(root, { recursive: true, force: true }))
+
+    const merged = getMergedPiSettings(`${join(lexical, 'link')}/..`)
+    assert.equal(merged.sessionDir, 'physical-project')
+  }
+)

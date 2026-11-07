@@ -14,8 +14,7 @@ test('PiAcpSession forwards non-adapter slash commands unchanged for pi trust-aw
     sessionId: 's1',
     cwd: '/tmp',
     proc: proc as any,
-    conn: asAgentConn(new FakeAgentSideConnection()),
-    fileCommands: [{ name: 'hello', content: 'unsafe adapter expansion' }]
+    conn: asAgentConn(new FakeAgentSideConnection())
   })
   const prompt = session.prompt('/hello world')
   proc.emit({ type: 'agent_settled' })

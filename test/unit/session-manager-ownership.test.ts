@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
 function withEnv<T>(vars: Record<string, string>, run: () => Promise<T>): Promise<T> {
@@ -247,8 +248,7 @@ test('PiAcpAgent: a restore spawn finishing after dispose() is disposed, never r
         return proc
       },
       async () => {
-        const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
-        ;(agent as any).store = {
+        const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), {
           get: () => ({
             sessionId: 'sess-restore',
             cwd: process.cwd(),
@@ -257,7 +257,7 @@ test('PiAcpAgent: a restore spawn finishing after dispose() is disposed, never r
           }),
           upsert: () => {},
           delete: () => {}
-        }
+        } as unknown as SessionStore)
         const manager = (agent as any).sessions as SessionManager
 
         const prompt = agent.prompt({
@@ -281,8 +281,7 @@ test('PiAcpAgent: a restore spawn finishing after dispose() is disposed, never r
 })
 
 function makeRestoreAgent(root: string, sessionFile: string) {
-  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()))
-  ;(agent as any).store = {
+  const agent = new PiAcpAgent(asAgentConn(new FakeAgentSideConnection()), {
     get: () => ({
       sessionId: 'sess-restore',
       cwd: process.cwd(),
@@ -291,7 +290,7 @@ function makeRestoreAgent(root: string, sessionFile: string) {
     }),
     upsert: () => {},
     delete: () => {}
-  }
+  } as unknown as SessionStore)
   void root
   const manager = (agent as any).sessions as SessionManager
   const restore = () => (agent as any).restoreSession('sess-restore') as Promise<unknown>

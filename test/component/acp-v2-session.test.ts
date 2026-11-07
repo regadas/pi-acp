@@ -10,6 +10,7 @@ import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakePiRpcProcess, acpStreamPair } from '../helpers/fakes.js'
 import { createPiAcpProtocolRouter } from '../../src/acp/app.js'
 import type { PiAcpAgent } from '../../src/acp/agent.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 
 type Update = v2.UpdateSessionNotification
 
@@ -73,10 +74,10 @@ function patchSpawn(state: Record<string, unknown>): FakePiRpcProcess & { restor
  * The production path end to end: a v2 client over a real (in-memory) wire,
  * routed by the protocol router into the v2 chain.
  */
-function connectV2(onAgent?: (agent: PiAcpAgent | null) => void) {
+function connectV2(onAgent?: (agent: PiAcpAgent | null) => void, store?: SessionStore) {
   const updates: Update[] = []
   const [agentSide, clientSide] = acpStreamPair()
-  createPiAcpProtocolRouter({ onAgent }).connect(agentSide as unknown as WireStream)
+  createPiAcpProtocolRouter({ onAgent, store }).connect(agentSide as unknown as WireStream)
   const conn = v2
     .client({ name: 'pi-acp-v2-tests' })
     .onNotification(v2.methods.client.session.update, ctx => {
@@ -96,7 +97,7 @@ function connectV2(onAgent?: (agent: PiAcpAgent | null) => void) {
  * client→agent direction keeps carrying requests. `attempted` records every
  * attempted write's session-update kind (or 'other') in wire order.
  */
-function connectV2Gated(onAgent?: (agent: PiAcpAgent | null) => void) {
+function connectV2Gated(onAgent?: (agent: PiAcpAgent | null) => void, store?: SessionStore) {
   const updates: Update[] = []
   const attempted: string[] = []
   let blocked = false
@@ -121,7 +122,7 @@ function connectV2Gated(onAgent?: (agent: PiAcpAgent | null) => void) {
     }
   })
   const clientToAgent = new TransformStream<Uint8Array, Uint8Array>()
-  createPiAcpProtocolRouter({ onAgent }).connect(
+  createPiAcpProtocolRouter({ onAgent, store }).connect(
     ndJsonStream(agentToClient.writable, clientToAgent.readable) as unknown as WireStream
   )
   const conn = v2
@@ -499,24 +500,19 @@ test('v2 resume with replayFrom start replays history through the v2 shapes', as
     leafId: 'e2'
   }
 
-  let activeAgent: PiAcpAgent | null = null
-  const { conn, updates, received } = connectV2(agent => {
-    activeAgent = agent
-  })
+  // The store mapping the restore resolves through (the v1 component tests
+  // inject the same seam).
+  const { conn, updates, received } = connectV2(undefined, {
+    get: () => ({
+      sessionId: 's1',
+      cwd: TEST_CWD,
+      sessionFile: SESSION_FILE,
+      updatedAt: new Date().toISOString()
+    }),
+    upsert() {}
+  } as unknown as SessionStore)
   try {
     await initialize(conn)
-    // The store mapping the restore resolves through (the v1 component tests
-    // replace the same seam).
-    assert.ok(activeAgent)
-    ;(activeAgent as unknown as { store: unknown }).store = {
-      get: () => ({
-        sessionId: 's1',
-        cwd: TEST_CWD,
-        sessionFile: SESSION_FILE,
-        updatedAt: new Date().toISOString()
-      }),
-      upsert() {}
-    }
 
     const resumed = await withTimeout(
       conn.agent.request(v2.methods.agent.session.resume, {
@@ -549,6 +545,89 @@ test('v2 resume with replayFrom start replays history through the v2 shapes', as
     const idle = received('state_update').find(update => (update.update as { state: string }).state === 'idle')
     assert.ok(idle, 'idle snapshot after resume')
     assert.ok(updates.indexOf(idle!) > updates.indexOf(agentMessages[0]!))
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test("v2: a rejected overlapping resume preserves the active replay's buffered final entry", async () => {
+  const proc = patchSpawn(fakeState('s1'))
+  // pi history snapshot: one user and one assistant message on the active branch.
+  proc.entrySnapshot = {
+    entries: [
+      { id: 'e1', parentId: null, timestamp: '', type: 'message', message: { role: 'user', content: 'Hello' } },
+      {
+        id: 'e2',
+        parentId: 'e1',
+        timestamp: '',
+        type: 'message',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Hi there' }] }
+      }
+    ],
+    leafId: 'e2'
+  }
+  // Park the winning load between its replay and its completion: its
+  // post-replay configuration RPC stays pending, the exact window a racing
+  // resume can land in.
+  let releaseModels: (() => void) | undefined
+  ;(proc as unknown as { getAvailableModels: () => Promise<unknown> }).getAvailableModels = () =>
+    new Promise(resolve => {
+      releaseModels = () => resolve({ models: [] })
+    })
+
+  const { conn, received } = connectV2(undefined, {
+    get: () => ({
+      sessionId: 's1',
+      cwd: TEST_CWD,
+      sessionFile: SESSION_FILE,
+      updatedAt: new Date().toISOString()
+    }),
+    upsert() {}
+  } as unknown as SessionStore)
+  try {
+    await initialize(conn)
+
+    const first = withTimeout(
+      conn.agent.request(v2.methods.agent.session.resume, {
+        sessionId: 's1',
+        cwd: TEST_CWD,
+        replayFrom: { type: 'start' }
+      }),
+      'winning resume'
+    )
+    // The buffered final entry is the assistant message; the user message
+    // upsert proves the replay ran and flushed the first entry.
+    await waitFor(() => received('user_message').length === 1, 'first replay to flush its first entry')
+
+    // An overlapping resume with a wrong (but existing) cwd fails validation
+    // and rejects without ever superseding the parked load.
+    const wrongCwd = mkdtempSync(join(tmpdir(), 'pi-acp-v2-wrong-cwd-'))
+    await assert.rejects(
+      withTimeout(
+        conn.agent.request(v2.methods.agent.session.resume, {
+          sessionId: 's1',
+          cwd: wrongCwd,
+          replayFrom: { type: 'start' }
+        }),
+        'rejected resume'
+      ),
+      (err: unknown) => {
+        const error = err as { code?: number; message?: string }
+        assert.equal(error.code, -32602)
+        assert.match(String(error.message), /cwd does not match/)
+        return true
+      }
+    )
+
+    releaseModels!()
+    await first
+
+    const agentMessages = received('agent_message')
+    assert.equal(agentMessages.length, 1, 'the buffered final entry survived the rejected resume')
+    const flush = agentMessages[0]!.update as { messageId?: string; content?: Array<{ type: string; text: string }> }
+    assert.equal(flush.messageId, 'replay:e2')
+    assert.deepEqual(flush.content, [{ type: 'text', text: 'Hi there' }])
   } finally {
     conn.close()
     proc.restore()
@@ -698,22 +777,17 @@ test('v2 close fence is transient: close, then resume and prompt work again', as
 test('v2 close fence is transient: a never-opened session id does not stay poisoned', async () => {
   const proc = patchSpawn(fakeState('never-opened'))
   proc.terminateOnDispose = true
-  let activeAgent: PiAcpAgent | null = null
-  const { conn } = connectV2(agent => {
-    activeAgent = agent
-  })
+  const { conn } = connectV2(undefined, {
+    get: () => ({
+      sessionId: 'never-opened',
+      cwd: TEST_CWD,
+      sessionFile: SESSION_FILE,
+      updatedAt: new Date().toISOString()
+    }),
+    upsert() {}
+  } as unknown as SessionStore)
   try {
     await initialize(conn)
-    assert.ok(activeAgent)
-    ;(activeAgent as unknown as { store: unknown }).store = {
-      get: () => ({
-        sessionId: 'never-opened',
-        cwd: TEST_CWD,
-        sessionFile: SESSION_FILE,
-        updatedAt: new Date().toISOString()
-      }),
-      upsert() {}
-    }
 
     // Closing an id this connection never opened succeeds silently; the
     // fence it sets must not outlive the close.
@@ -1008,10 +1082,15 @@ test('v2 replay: one message per retained entry, deterministic ids, and repeat r
     leafId: 'e3'
   }
 
-  let activeAgent: PiAcpAgent | null = null
-  const { conn, updates } = connectV2(agent => {
-    activeAgent = agent
-  })
+  const { conn, updates } = connectV2(undefined, {
+    get: () => ({
+      sessionId: 's1',
+      cwd: TEST_CWD,
+      sessionFile: SESSION_FILE,
+      updatedAt: new Date().toISOString()
+    }),
+    upsert() {}
+  } as unknown as SessionStore)
   // Message upserts captured per replay window, waiting for each window's
   // messages to arrive so notification delivery lag cannot mix the windows.
   const isUpsert = (update: Update) =>
@@ -1029,16 +1108,6 @@ test('v2 replay: one message per retained entry, deterministic ids, and repeat r
   }
   try {
     await initialize(conn)
-    assert.ok(activeAgent)
-    ;(activeAgent as unknown as { store: unknown }).store = {
-      get: () => ({
-        sessionId: 's1',
-        cwd: TEST_CWD,
-        sessionFile: SESSION_FILE,
-        updatedAt: new Date().toISOString()
-      }),
-      upsert() {}
-    }
 
     const replay = () =>
       conn.agent.request(v2.methods.agent.session.resume, {
@@ -1098,17 +1167,17 @@ test('v2 replay: overlapping resume windows keep the replay translation until th
     leafId: 'e2'
   }
 
-  let activeAgent: PiAcpAgent | null = null
-  const { conn, updates } = connectV2(agent => {
-    activeAgent = agent
-  })
+  const { conn, updates } = connectV2(undefined, {
+    get: () => ({
+      sessionId: 's1',
+      cwd: TEST_CWD,
+      sessionFile: SESSION_FILE,
+      updatedAt: new Date().toISOString()
+    }),
+    upsert() {}
+  } as unknown as SessionStore)
   try {
     await initialize(conn)
-    assert.ok(activeAgent)
-    ;(activeAgent as unknown as { store: unknown }).store = {
-      get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: SESSION_FILE, updatedAt: new Date().toISOString() }),
-      upsert() {}
-    }
 
     // Two concurrent resume-with-replay requests: the engine admits one
     // load and supersedes the other, but both replay windows are open while
@@ -1191,17 +1260,12 @@ test('v2 replay: a window opened while an older window finalizes still emits its
     return originalModels()
   }
 
-  let activeAgent: PiAcpAgent | null = null
-  const { conn, updates, received, gate } = connectV2Gated(agent => {
-    activeAgent = agent
-  })
+  const { conn, updates, received, gate } = connectV2Gated(undefined, {
+    get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: SESSION_FILE, updatedAt: new Date().toISOString() }),
+    upsert() {}
+  } as unknown as SessionStore)
   try {
     await initialize(conn)
-    assert.ok(activeAgent)
-    ;(activeAgent as unknown as { store: unknown }).store = {
-      get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: SESSION_FILE, updatedAt: new Date().toISOString() }),
-      upsert() {}
-    }
 
     const resume = () =>
       conn.agent.request(v2.methods.agent.session.resume, {
@@ -1572,17 +1636,17 @@ test('v2 replay of an interleaved entry: one message re-emitting ALL its text ac
     leafId: 'e2'
   }
 
-  let activeAgent: PiAcpAgent | null = null
-  const { conn, updates } = connectV2(agent => {
-    activeAgent = agent
-  })
+  const { conn, updates } = connectV2(undefined, {
+    get: () => ({
+      sessionId: 's1',
+      cwd: TEST_CWD,
+      sessionFile: SESSION_FILE,
+      updatedAt: new Date().toISOString()
+    }),
+    upsert() {}
+  } as unknown as SessionStore)
   try {
     await initialize(conn)
-    assert.ok(activeAgent)
-    ;(activeAgent as unknown as { store: unknown }).store = {
-      get: () => ({ sessionId: 's1', cwd: TEST_CWD, sessionFile: SESSION_FILE, updatedAt: new Date().toISOString() }),
-      upsert() {}
-    }
 
     await withTimeout(
       conn.agent.request(v2.methods.agent.session.resume, {

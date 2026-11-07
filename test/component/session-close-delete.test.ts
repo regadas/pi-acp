@@ -48,10 +48,8 @@ test('PiAcpAgent: closeSession cancels in-flight work, flushes updates, and free
 
   const session = manager.getOrCreate('s-close', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 
   const inFlight = session.prompt('long running work')
@@ -103,10 +101,8 @@ test('PiAcpAgent: closeSession rejects prompt admission while abort is in flight
   const manager = (agent as any).sessions as SessionManager
   const session = manager.getOrCreate('s-close-race', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 
   const active = session.prompt('active work')
@@ -138,10 +134,8 @@ test('PiAcpAgent: close waits for adapter commands, cancels them, and closes adm
   const manager = (agent as any).sessions as SessionManager
   manager.getOrCreate('s-compact-close', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 
   const compactStarted = deferred<void>()
@@ -211,10 +205,8 @@ test('PiAcpAgent: visible custom messages during adapter commands stay in that p
   const manager = (agent as any).sessions as SessionManager
   manager.getOrCreate('s-compact-custom', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 
   const compactStarted = deferred<void>()
@@ -275,10 +267,8 @@ test('PiAcpSession: cancel flushes queue-cleared updates before queued responses
   const session = new PiAcpSession({
     sessionId: 's-cancel-order',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
   const updateStarted = deferred<void>()
   const releaseUpdate = deferred<void>()
@@ -325,10 +315,8 @@ test('PiAcpAgent: close flushes active updates before queued responses', async (
   const manager = (agent as any).sessions as SessionManager
   const session = manager.getOrCreate('s-close-order', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
   const updateStarted = deferred<void>()
   const releaseUpdate = deferred<void>()
@@ -376,10 +364,14 @@ test('PiAcpAgent: public close invalidates a load during its private replacement
   const conn = new FakeAgentSideConnection()
   const oldProc = new FakePiRpcProcess()
   const replacementProc = new FakePiRpcProcess()
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  const manager = (agent as any).sessions as SessionManager
   const sessionId = 's-load-close-teardown'
   const cwd = process.cwd()
+  const agent = new PiAcpAgent(asAgentConn(conn), {
+    get: () => ({ sessionId, cwd, sessionFile: '/tmp/session.jsonl' }),
+    upsert: () => {},
+    delete: () => {}
+  } as unknown as SessionStore)
+  const manager = (agent as any).sessions as SessionManager
   // Restore validation requires pi to report the requested session.
   replacementProc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
   // The retired child exits on SIGTERM, so the later load clears the
@@ -388,16 +380,9 @@ test('PiAcpAgent: public close invalidates a load during its private replacement
 
   manager.getOrCreate(sessionId, {
     cwd,
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: oldProc as any,
-    fileCommands: []
+    proc: oldProc as any
   })
-  ;(agent as any).store = {
-    get: () => ({ sessionId, cwd, sessionFile: '/tmp/session.jsonl' }),
-    upsert: () => {},
-    delete: () => {}
-  }
 
   const abortStarted = deferred<void>()
   const releaseAbort = deferred<void>()
@@ -441,17 +426,16 @@ test('PiAcpAgent: public close invalidates a load during its private replacement
 test('PiAcpAgent: close waits for deferred load updates and leaves no restored process', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  const manager = (agent as any).sessions as SessionManager
   const sessionId = 's-load-close-replay'
   const cwd = process.cwd()
-  // Restore validation requires pi to report the requested session.
-  proc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
-  ;(agent as any).store = {
+  const agent = new PiAcpAgent(asAgentConn(conn), {
     get: () => ({ sessionId, cwd, sessionFile: '/tmp/session.jsonl' }),
     upsert: () => {},
     delete: () => {}
-  }
+  } as unknown as SessionStore)
+  const manager = (agent as any).sessions as SessionManager
+  // Restore validation requires pi to report the requested session.
+  proc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
   proc.entrySnapshot = {
     entries: [
       {
@@ -511,21 +495,20 @@ test('PiAcpAgent: close waits for deferred load updates and leaves no restored p
 test('PiAcpAgent: restore persistence failure cannot leak its registered process', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  const manager = (agent as any).sessions as SessionManager
   const sessionId = 's-restore-store-failure'
   const cwd = process.cwd()
-  // Restore validation requires pi to report the requested session.
-  proc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
   let close: Promise<unknown> | undefined
-  ;(agent as any).store = {
+  const agent = new PiAcpAgent(asAgentConn(conn), {
     get: () => ({ sessionId, cwd, sessionFile: '/tmp/session.jsonl' }),
     upsert: () => {
       close = agent.closeSession({ sessionId })
       throw new Error('store write failed')
     },
     delete: () => {}
-  }
+  } as unknown as SessionStore)
+  const manager = (agent as any).sessions as SessionManager
+  // Restore validation requires pi to report the requested session.
+  proc.state = { isStreaming: false, sessionId, sessionFile: '/tmp/session.jsonl' }
 
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = async () => proc
@@ -678,10 +661,8 @@ test('PiAcpAgent: deleteSession closes an active session before removing persist
 
     const session = manager.getOrCreate('sess-active', {
       cwd: '/p',
-      mcpServers: [],
       conn: asAgentConn(conn),
-      proc: proc as any,
-      fileCommands: []
+      proc: proc as any
     })
 
     const inFlight = session.prompt('work')

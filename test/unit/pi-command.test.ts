@@ -16,7 +16,12 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { buildPiInvocation, findExecutableOnPath, resolveWindowsScriptCommand } from '../../src/pi-rpc/command.js'
+import {
+  buildPiInvocation,
+  findExecutableOnPath,
+  isConcretePiEntry,
+  resolveWindowsScriptCommand
+} from '../../src/pi-rpc/command.js'
 
 const isWindows = process.platform === 'win32'
 const hostBun = isWindows ? null : findExecutableOnPath('bun')
@@ -308,6 +313,18 @@ test('buildPiInvocation keeps the original command when the PATH to pi contains 
   })
 
   assert.deepEqual(invocation, { executable: 'pi', args: ['--mode', 'rpc'] })
+})
+
+test('isConcretePiEntry never classifies a ..-containing entry as concrete', { skip: isWindows }, t => {
+  const { dir, binDir, writeExecutable } = withCleanedFixture(t)
+  const cli = linkDefaultPi(binDir, writeExecutable)
+  assert.equal(isConcretePiEntry(join(binDir, 'pi')), true, 'an unambiguous direct-JS entry is concrete')
+  assert.equal(
+    isConcretePiEntry(`${dir}/link/../bin/pi`),
+    false,
+    'a .. candidate cannot be classified by realpath (see bunRuntimeInvocation)'
+  )
+  assert.equal(isConcretePiEntry(cli), true, 'the entry behind the symlink is concrete itself')
 })
 
 test(

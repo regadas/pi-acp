@@ -2,9 +2,10 @@ import { createReadStream, existsSync, type Stats } from 'node:fs'
 import { open, readdir, stat, unlink } from 'node:fs/promises'
 import { join, isAbsolute, resolve } from 'node:path'
 import { homedir } from 'node:os'
+import { appendPathSegments } from '../pi-rpc/raw-path.js'
 import { getAgentDir, getGlobalPiSettings, getMergedPiSettings } from './pi-settings.js'
 import { directoriesAlias, directoryKey, type DirectoryKey } from './session-cwd.js'
-import { SessionStore, type StoredSession } from './session-store.js'
+import { SessionStore, boundedAll, type StoredSession } from './session-store.js'
 
 export type SessionRecord = {
   sessionId: string
@@ -23,6 +24,9 @@ const METADATA_RECORD_LIMIT = 1024 * 1024
 const METADATA_FILE_LIMIT = 8 * 1024 * 1024
 const TITLE_LIMIT = 80
 const LOOKUP_CONCURRENCY = 16
+// Insertion-order bound: long-running adapters must not retain scan metadata
+// for every session file they ever listed.
+const MAX_METADATA_SCANS = 256
 const RESOURCE_EXHAUSTION_CODES = new Set(['EMFILE', 'ENFILE', 'ENOMEM'])
 
 function rethrowResourceExhaustion(error: unknown): void {
@@ -285,7 +289,7 @@ async function jsonlFiles(root: string, skipArtifacts = false): Promise<string[]
       continue
     }
     for (const entry of entries) {
-      const path = join(dir, entry.name)
+      const path = appendPathSegments(dir, entry.name)
       if (entry.isDirectory()) {
         if (!skipArtifacts || entry.name !== 'subagent-artifacts') pending.push(path)
       } else if (entry.isFile() && entry.name.endsWith('.jsonl')) files.push(path)
@@ -319,7 +323,11 @@ export class SessionRepository {
     const scan = await scanMetadata(path)
     // Only successful scans are memoized: a transient read failure must be
     // retried on the next call instead of pinning null until the file changes.
-    if (scan) this.metadataScans.set(path, { size: identity.size, mtimeMs: identity.mtimeMs, scan })
+    if (scan) {
+      this.metadataScans.set(path, { size: identity.size, mtimeMs: identity.mtimeMs, scan })
+      while (this.metadataScans.size > MAX_METADATA_SCANS)
+        this.metadataScans.delete(this.metadataScans.keys().next().value!)
+    }
     return scan
   }
 
@@ -353,13 +361,10 @@ export class SessionRepository {
 
     const files = [...paths]
     const records: SessionRecord[] = []
-    for (let offset = 0; offset < files.length; offset += LOOKUP_CONCURRENCY) {
-      const candidates = await Promise.all(
-        files
-          .slice(offset, offset + LOOKUP_CONCURRENCY)
-          .map(path => project(path, sessionId, undefined, strictRead, this.scanMetadataCached))
-      )
-      for (const candidate of candidates) if (candidate) records.push(candidate)
+    for (const candidate of await boundedAll(files, LOOKUP_CONCURRENCY, path =>
+      project(path, sessionId, undefined, strictRead, this.scanMetadataCached)
+    )) {
+      if (candidate) records.push(candidate)
     }
     return records
   }
@@ -441,30 +446,48 @@ export class SessionRepository {
     }
     // Filter identities, not records: a mapped foreign duplicate (or the newest
     // foreign duplicate without a mapping) must not expose an older local copy.
+    // Header validation and projection run in bounded-concurrent batches; the
+    // result maps are then filled in the original order so every later
+    // sequential decision sees the exact state the sequential loop produced.
+    const pathList = [...paths]
+    const validatedHeaders = await boundedAll(pathList, LOOKUP_CONCURRENCY, path => validatedHeader(path))
     const headers = new Map<string, { sessionId: string; cwd: string }>()
     const scopedIds = new Set<string>()
-    for (const path of paths) {
-      const header = await validatedHeader(path)
+    for (const [index, path] of pathList.entries()) {
+      const header = validatedHeaders[index]!
       if (!header) continue
       headers.set(path, header)
       if (inScope(header.cwd)) scopedIds.add(header.sessionId)
     }
     const byId = new Map<string, SessionRecord>()
     const attemptedMappedPaths = new Set<string>()
-    for (const [sessionId, stored] of mappedSessions) {
+    const mappedList = [...mappedSessions]
+    const mappedOutcomes = await boundedAll(mappedList, LOOKUP_CONCURRENCY, async ([sessionId, stored]) => {
       const path = stored.sessionFile
       const header = headers.get(path)
-      if (!header || header.sessionId !== sessionId || !scopedIds.has(sessionId)) continue
-      attemptedMappedPaths.add(path)
-      const record = await project(path, undefined, header, false, this.scanMetadataCached)
-      if (record) byId.set(sessionId, record)
+      if (!header || header.sessionId !== sessionId || !scopedIds.has(sessionId)) return null
+      return project(path, undefined, header, false, this.scanMetadataCached).then(record => ({
+        sessionId,
+        path,
+        record
+      }))
+    })
+    for (const outcome of mappedOutcomes) {
+      if (!outcome) continue
+      attemptedMappedPaths.add(outcome.path)
+      if (outcome.record) byId.set(outcome.sessionId, outcome.record)
     }
-    for (const [path, header] of headers) {
-      if (!scopedIds.has(header.sessionId) || attemptedMappedPaths.has(path)) continue
+    const headerList = [...headers]
+    const candidates = await boundedAll(headerList, LOOKUP_CONCURRENCY, async ([path, header]) => {
+      if (!scopedIds.has(header.sessionId) || attemptedMappedPaths.has(path)) return null
       const previous = byId.get(header.sessionId)
-      if (previous && previous.sessionFile === mappedSessions.get(header.sessionId)?.sessionFile) continue
-      const record = await project(path, undefined, header, false, this.scanMetadataCached)
-      if (record && (!previous || isNewer(record, previous))) byId.set(record.sessionId, record)
+      if (previous && previous.sessionFile === mappedSessions.get(header.sessionId)?.sessionFile) return null
+      return project(path, undefined, header, false, this.scanMetadataCached)
+    })
+    for (const record of candidates) {
+      if (!record) continue
+      const previous = byId.get(record.sessionId)
+      if (!previous || isNewer(record, previous)) byId.set(record.sessionId, record)
     }
     for (const [sessionId, record] of byId) {
       let selected = record

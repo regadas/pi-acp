@@ -8,10 +8,8 @@ import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpe
 
 const makeSessionParams = (conn: FakeAgentSideConnection, proc: FakePiRpcProcess) => ({
   cwd: process.cwd(),
-  mcpServers: [],
   conn: asAgentConn(conn),
-  proc: proc as any,
-  fileCommands: []
+  proc: proc as any
 })
 
 test('PiAcpAgent: an adapter command timeout evicts the quarantined session', async () => {
@@ -27,10 +25,8 @@ test('PiAcpAgent: an adapter command timeout evicts the quarantined session', as
   const sessionId = 's-compact-timeout'
   const session = manager.getOrCreate(sessionId, {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 
   await assert.rejects(

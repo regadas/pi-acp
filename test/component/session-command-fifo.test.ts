@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { PiAcpAgent, runPromptWithCancellation } from '../../src/acp/agent.js'
+import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { runBuiltinCommand } from '../../src/acp/builtin-commands.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
@@ -62,10 +62,8 @@ function makeAgent(proc: FakePiRpcProcess, conn: FakeAgentSideConnection = new F
   const session = new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as never,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
   const agent = new PiAcpAgent(asAgentConn(conn))
   const sessions = new FakeSessions(session)
@@ -130,7 +128,7 @@ test('PiAcpAgent: an adapter command queues behind the active prompt instead of 
 
 for (const activeKind of ['prompt', 'command']) {
   for (const queuedKind of ['prompt', 'command']) {
-    test(`runPromptWithCancellation: cancelling queued ${queuedKind} preserves active ${activeKind} and remaining FIFO`, async t => {
+    test(`PiAcpAgent.prompt: cancelling queued ${queuedKind} preserves active ${activeKind} and remaining FIFO`, async t => {
       const proc = new FakePiRpcProcess()
       const commandStarted = deferred<void>()
       const commandResult = deferred<unknown>()
@@ -154,8 +152,7 @@ for (const activeKind of ['prompt', 'command']) {
       else await tick()
 
       const controller = new AbortController()
-      const cancelled = runPromptWithCancellation(
-        agent,
+      const cancelled = agent.prompt(
         { sessionId: 's1', prompt: [{ type: 'text', text: queuedKind === 'prompt' ? 'never' : '/name Never' }] },
         controller.signal
       )
@@ -301,8 +298,7 @@ for (const cancellation of ['session', 'request']) {
     })
     const { agent, conn, session, sessions } = makeAgent(proc)
     const controller = new AbortController()
-    const compacting = runPromptWithCancellation(
-      agent,
+    const compacting = agent.prompt(
       { sessionId: 's1', prompt: [{ type: 'text', text: '/compact' }] },
       controller.signal
     )

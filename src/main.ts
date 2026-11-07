@@ -50,11 +50,50 @@ const input = new WritableStream<Uint8Array>({
   }
 })
 
+let detachStdinBridge: (() => void) | undefined
+
 const output = new ReadableStream<Uint8Array>({
   start(controller) {
-    process.stdin.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)))
-    process.stdin.on('end', () => controller.close())
-    process.stdin.on('error', err => controller.error(err))
+    const detach = () => {
+      detachStdinBridge = undefined
+      process.stdin.off('data', onData)
+      process.stdin.off('end', onEnd)
+    }
+    const onData = (chunk: Buffer) => {
+      try {
+        controller.enqueue(new Uint8Array(chunk))
+      } catch {
+        // The controller closed underneath the bridge (SDK-side cancellation):
+        // stop enqueueing instead of crashing the adapter.
+        detach()
+      }
+    }
+    const onEnd = () => {
+      detach()
+      controller.close()
+    }
+    // Permanent: detach() stops forwarding data/end but never removes this
+    // sink — it is the only stdin error listener, so removing it would leave
+    // a late input error unhandled mid-teardown.
+    const onError = (err: Error) => {
+      detach()
+      try {
+        controller.error(err)
+      } catch {
+        // The controller already closed (SDK-side cancellation); only the
+        // shutdown routing still matters.
+      }
+      shutdown()
+    }
+    process.stdin.on('data', onData)
+    process.stdin.on('end', onEnd)
+    process.stdin.on('error', onError)
+    detachStdinBridge = detach
+  },
+  cancel() {
+    // The SDK cancelled its input: detach; teardown runs via connection.closed.
+    detachStdinBridge?.()
+    process.stdin.pause()
   }
 })
 
@@ -78,9 +117,16 @@ const coordinator = createShutdownCoordinator<PiAcpAgent>({
   }
 })
 
-createPiAcpProtocolRouter({ onAgent: agent => coordinator.trackAgent(agent) }).connect(stream)
+const connection = createPiAcpProtocolRouter({ onAgent: agent => coordinator.trackAgent(agent) }).connect(stream)
 
 const shutdown = () => coordinator.shutdown()
+
+// The routed connection ends on every SDK-side teardown — a rejected
+// initialize, a routing failure, the client leaving — even while stdin stays
+// open, so final shutdown runs here too instead of idling on a dead
+// connection (idempotent with the stdin/SIGINT/SIGTERM/stdout-error
+// triggers below).
+void connection.closed.then(shutdown)
 
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)

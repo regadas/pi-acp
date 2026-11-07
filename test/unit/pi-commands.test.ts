@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { toAvailableCommandsFromPiGetCommands } from '../../src/acp/pi-commands.js'
 
 test('toAvailableCommandsFromPiGetCommands preserves pi-authoritative commands including extensions and skills', () => {
-  const { commands } = toAvailableCommandsFromPiGetCommands({
+  const commands = toAvailableCommandsFromPiGetCommands({
     commands: [
       { name: 'x', description: 'X', source: 'extension' },
       { name: 'pi-acp-control', description: 'internal', source: 'extension' },
@@ -19,5 +19,5 @@ test('toAvailableCommandsFromPiGetCommands preserves pi-authoritative commands i
 })
 
 test('toAvailableCommandsFromPiGetCommands ignores malformed names', () => {
-  assert.deepEqual(toAvailableCommandsFromPiGetCommands({ commands: [{ name: '' }, {}] }).commands, [])
+  assert.deepEqual(toAvailableCommandsFromPiGetCommands({ commands: [{ name: '' }, {}] }), [])
 })

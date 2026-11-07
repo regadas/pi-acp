@@ -190,8 +190,7 @@ function truncationRecord(value: unknown): { coords: BashOutputCoordinates; wind
  * native coordinates. Records whose truncation metadata disagrees with the
  * observed text are treated as plain text.
  */
-export function bashOutputSnapshot(result: unknown): BashOutputSnapshot {
-  const text = bashResultText(result)
+export function bashOutputSnapshot(result: unknown, text: string = bashResultText(result)): BashOutputSnapshot {
   const record = result as { truncation?: unknown; details?: { truncation?: unknown } | null } | null | undefined
   const truncation = truncationRecord(record?.truncation) ?? truncationRecord(record?.details?.truncation)
   if (!truncation || !text.startsWith(truncation.window)) return { text }
@@ -201,9 +200,14 @@ export function bashOutputSnapshot(result: unknown): BashOutputSnapshot {
 /** Line count with pi's counting semantics: a trailing newline ends a line. */
 function countOutputLines(text: string): number {
   if (!text) return 0
-  const lines = text.split('\n')
-  if (text.endsWith('\n')) lines.pop()
-  return lines.length
+  let lines = 0
+  let newline = text.indexOf('\n')
+  while (newline !== -1) {
+    lines++
+    newline = text.indexOf('\n', newline + 1)
+  }
+  // Without a trailing terminator the final line still counts as a line.
+  return text.endsWith('\n') ? lines : lines + 1
 }
 
 /** Coordinates a complete (non-truncated) snapshot implies about the stream. */
@@ -326,16 +330,26 @@ export function bashOutputDelta(previous: BashOutputSnapshot | undefined, next: 
     return bytePartialTail(next, newBytes, suffix)
   }
 
-  const windowLines = next.window.split('\n')
-  if (windowLines.length !== next.coords.outputLines) return textFallback(previous, prevWindow, next)
   // Lines of the window that were already shown: the window starts at
   // totalLines - outputLines + 1 and everything up to the previous total was
   // visible before. A window that begins past the previous total is entirely
   // new (the burst of lines between updates was never in any window).
   const windowFirstLine = next.coords.totalLines - next.coords.outputLines + 1
   const alreadyShown = Math.max(0, prevCoords.totalLines - windowFirstLine + 1)
-  const fresh = windowLines.slice(alreadyShown)
-  if (fresh.length === 0) {
+
+  // Extract only the fresh lines: splitting the whole (pi-capped, ~2000-line)
+  // window would allocate every line on each streaming update.
+  const windowText = next.window
+  let windowNewlines = 0
+  let grownStart = alreadyShown <= 1 ? 0 : -1
+  let freshStart = alreadyShown === 0 ? 0 : -1
+  for (let newline = windowText.indexOf('\n'); newline !== -1; newline = windowText.indexOf('\n', newline + 1)) {
+    windowNewlines++
+    if (windowNewlines === alreadyShown - 1) grownStart = newline + 1
+    else if (windowNewlines === alreadyShown) freshStart = newline + 1
+  }
+  if (windowNewlines + 1 !== next.coords.outputLines) return textFallback(previous, prevWindow, next)
+  if (freshStart === -1) {
     next.endsAtLineBoundary = carriedAtLineEnd(previous, prevWindow)
     return suffix
   }
@@ -352,14 +366,14 @@ export function bashOutputDelta(previous: BashOutputSnapshot | undefined, next: 
     // that line extends what was shown: continue the line instead of
     // starting a new one (its terminator follows the extension).
     const shownLastLine = prevWindow.slice(prevWindow.lastIndexOf('\n') + 1)
-    const grown = windowLines[alreadyShown - 1] ?? ''
+    const grown = windowText.slice(grownStart, freshStart - 1)
     if (grown.startsWith(shownLastLine)) prefix = `${grown.slice(shownLastLine.length)}\n`
   }
   // The last fresh line's terminator stays owed even when that line is
   // empty and the delta carries no visible text: it lands as the separator
   // of the next update, never as a duplicate.
   next.endsAtLineBoundary = false
-  return prefix + fresh.join('\n') + suffix
+  return prefix + windowText.slice(freshStart) + suffix
 }
 
 export function bashTerminalContent(toolCallId: string): ToolCallContent[] {

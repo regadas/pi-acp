@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { PiAcpSession } from '../../src/acp/session.js'
-import { PiRpcProcess } from '../../src/pi-rpc/process.js'
+import { PiRpcProcess, type PiRpcEvent } from '../../src/pi-rpc/process.js'
 import acpExtension from '../../src/pi-rpc/acp-extension.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 
@@ -34,8 +34,8 @@ function harness(options: { restoredChild?: boolean; foreignQueueRace?: boolean;
   type Context = Parameters<Hook>[1]
   const hooks = new Map<string, Hook>()
   let companionCommand: Parameters<Pi['registerCommand']>[1]['handler'] | undefined
-  const emit = (event: Parameters<Hook>[0] & { type: string; [key: string]: unknown }) => {
-    hooks.get(event.type)?.(event, ctx)
+  const emit = (event: PiRpcEvent) => {
+    hooks.get(event.type)?.(event as Parameters<Hook>[0], ctx)
     child.stdout.write(JSON.stringify(event) + '\n')
   }
   const ctx: Context = {
@@ -252,7 +252,7 @@ test('native admission: ready-to-prompt race re-admits without inserting native 
   await tick()
   assert.equal(h.commands.filter(command => command.message === 'ordinary question').length, 1)
   h.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'autonomous progress' } })
-  h.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length' } })
+  h.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'length' } })
   h.settle()
   await tick()
   assert.equal(h.accepted, 1, 'only one prompt enters a model run')
@@ -312,7 +312,7 @@ test('native admission: foreign queue updates from a rejected attempt cannot cla
   h.emit({ type: 'message_start', message: { role: 'user', content: 'foreign question' } })
   h.emit({ type: 'message_start', message: { role: 'user', content: 'foreign question' } })
   h.emit({ type: 'queue_update', steering: [], followUp: [] })
-  h.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length' } })
+  h.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'length' } })
   h.settle()
   await tick()
   assert.equal(h.accepted, 1, 'exactly one raw prompt is accepted despite the rejected preflight')

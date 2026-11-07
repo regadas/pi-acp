@@ -31,10 +31,8 @@ function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess): PiA
   return new PiAcpSession({
     sessionId: 's1',
     cwd: TEST_CWD,
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 }
 
@@ -419,8 +417,8 @@ for (const boundary of ['handled', 'agent-settled', 'failed-agent-settled', 'com
           proc.emit({ type: 'agent_start' })
           if (boundary === 'failed-agent-settled')
             proc.emit({
-              type: 'message_update',
-              assistantMessageEvent: { type: 'error', error: { errorMessage: 'run failed' } }
+              type: 'message_end',
+              message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'run failed' }
             })
           proc.emit({ type: 'agent_settled' })
         }
@@ -672,11 +670,8 @@ for (const boundary of ['prompt', 'failed-prompt', 'compact']) {
           proc.emit({ type: 'agent_start' })
           if (boundary === 'failed-prompt')
             proc.emit({
-              type: 'message_update',
-              assistantMessageEvent: {
-                type: 'error',
-                error: { errorMessage: 'run failed' }
-              }
+              type: 'message_end',
+              message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'run failed' }
             })
           switchModel()
           proc.emit({ type: 'agent_settled' })

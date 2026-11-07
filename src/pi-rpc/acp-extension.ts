@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { ACP_LIFECYCLE_WIDGET } from './protocol.js'
 import {
   WORKSPACE_INSTRUCTIONS_SECTION,
   WORKSPACE_ROOTS_ENV,
@@ -62,7 +63,6 @@ type Pi = {
   }): void
 }
 
-export const ACP_LIFECYCLE_WIDGET = 'pi-acp-lifecycle'
 const REGISTRY = Symbol.for('@agegr/pi-web/session-liveness/v1')
 const WORKSPACE_ROOTS_REGISTRY = Symbol.for('@regadas/pi-acp/workspace-roots/v1')
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
@@ -478,7 +478,6 @@ export default function acpExtension(pi: Pi): void {
         if (owner !== id) {
           release()
           foregroundRun = false
-          expectedInput = undefined
           deliverySeq = providerSeq = 0
           lastProbeAt = -Infinity
           clock = { spent: 0 }
@@ -489,8 +488,7 @@ export default function acpExtension(pi: Pi): void {
         cancelling = false
         interrupted.clear()
         cancellationDiagnostic = undefined
-        const staged = admission ?? { id }
-        admission = staged.id === id ? staged : { id }
+        admission = admission?.id === id ? admission : { id }
         if (!modelActive && ctx.isIdle()) {
           foregroundRun = true
           emit('ready', undefined, id)
@@ -606,7 +604,7 @@ export default function acpExtension(pi: Pi): void {
                 terminal = false
                 return
               }
-              if (['complete', 'failed', 'partial', 'paused', 'stopped', 'rejected'].includes(String(run.state))) return
+              if (TERMINAL.has(String(run.state))) return
               terminal = false
               if (run.state !== 'queued' && run.state !== 'running')
                 throw new Error(`Invalid pi-subagents state for ${id}`)

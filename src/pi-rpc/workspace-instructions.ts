@@ -1,5 +1,5 @@
 import { readFileSync, statSync } from 'node:fs'
-import { sep } from 'node:path'
+import { appendPathSegments } from './raw-path.js'
 
 /**
  * Workspace-root context for the pi child. The adapter passes the validated
@@ -16,20 +16,6 @@ export const WORKSPACE_INSTRUCTIONS_SECTION = 'acp_workspace_instructions'
 // Ancestors of additional roots are never walked — pi already loads the
 // cwd's own ancestor chain natively.
 const INSTRUCTION_FILE_CANDIDATES = ['AGENTS.override.md', 'AGENTS.md', 'AGENTS.MD', 'CLAUDE.md', 'CLAUDE.MD'] as const
-
-/**
- * Append a candidate file name without lexical normalization. A lexical
- * `join` collapses a trailing `..` before the OS resolves symlinks, so a root
- * like `/work/link/..` (which validation accepted as the physical directory
- * it resolves to) would read instructions from the wrong directory; keeping
- * the raw segments lets stat/read resolve the same physical file. The
- * separator itself is the native one so supported Windows paths spell like a
- * plain `join`.
- */
-function rootEntryPath(root: string, name: string): string {
-  const trailing = process.platform === 'win32' ? /[\\/]$/ : /\/$/
-  return trailing.test(root) ? root + name : root + sep + name
-}
 
 export type WorkspaceInstructionEntry = {
   root: string
@@ -52,7 +38,7 @@ function readError(error: unknown): string {
 export function readWorkspaceInstructions(roots: readonly string[]): WorkspaceInstructionEntry[] {
   return roots.map(root => {
     for (const name of INSTRUCTION_FILE_CANDIDATES) {
-      const file = rootEntryPath(root, name)
+      const file = appendPathSegments(root, name)
       let isFile: boolean
       try {
         isFile = statSync(file).isFile()

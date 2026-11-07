@@ -140,17 +140,14 @@ export class V2ClientConnection implements AcpClient {
    * Runs `restore`, which replays the history of `sessionId`, inside a replay
    * window: replayed entries become deterministic message upserts. Windows
    * may overlap while a superseded restore settles; the depth keeps the
-   * inner window's end from closing the outer one's. Each new window drops
-   * the session's buffered replay state first: the newer load wins (the
-   * engine supersedes the older one), so a superseded window's partial entry
-   * cannot merge duplicate blocks into the winner's message. Residual: an
-   * inner window that fails validation before replaying still drops the
-   * outer winner's unflushed partial (contrived: two racing resumes).
+   * inner window's end from closing the outer one's. Buffered replay state
+   * survives the window open and drops only once the new load actually
+   * supersedes the previous one (see {@link supersedeReplayBuffers}): a load
+   * that fails before that — e.g. a resume rejected on validation — must not
+   * erase the active replay's buffered final entry.
    */
   async replaying<T>(sessionId: string, restore: () => Promise<T>): Promise<T> {
     this.replayDepth.set(sessionId, (this.replayDepth.get(sessionId) ?? 0) + 1)
-    this.replayContent.delete(sessionId)
-    this.currentReplayKey.delete(sessionId)
     this.currentMessage.delete(sessionId)
     try {
       return await restore()
@@ -174,6 +171,21 @@ export class V2ClientConnection implements AcpClient {
       }
       this.currentMessage.delete(sessionId)
     }
+  }
+
+  /**
+   * Drop the session's buffered replay state for a load that has passed
+   * validation, superseded the previous load — its replacement teardown
+   * settled, so no superseded update can still arrive — and is about to replay
+   * its own history. The newer load wins: a superseded window's partial entry
+   * must not merge duplicate blocks into the winner's message, so the buffers
+   * reset exactly here, after the previous load's in-flight deliveries have
+   * drained and before this load's first replayed update is sent.
+   */
+  supersedeReplayBuffers(sessionId: string): void {
+    this.replayContent.delete(sessionId)
+    this.currentReplayKey.delete(sessionId)
+    this.currentMessage.delete(sessionId)
   }
 
   /**

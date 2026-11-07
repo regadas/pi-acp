@@ -14,7 +14,7 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { findExecutableOnPath } from '../../src/pi-rpc/command.js'
 
 const isWindows = process.platform === 'win32'
@@ -241,6 +241,166 @@ test(
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
       rmSync(dir, { recursive: true, force: true })
+    }
+  }
+)
+
+test(
+  'a rejected initialize followed by EOF and more input shuts down cleanly',
+  { skip: isWindows, timeout: 60_000 },
+  async () => {
+    const child = spawn(process.execPath, ['--import', 'tsx', entry], {
+      cwd: repoRoot,
+      env: freshLaunchEnv(),
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+    const adapter = driveAdapter(child)
+    // The adapter may exit on the rejected connection before these bytes are
+    // read; a write into its gone stdin must not crash the test process.
+    child.stdin.on('error', () => {})
+    try {
+      adapter.send(1, 'initialize', { protocolVersion: 0, clientCapabilities: {} })
+      const rejected = await adapter.waitFor(1, 'initialize')
+      assert.ok(rejected.error, 'protocolVersion 0 must be rejected by the protocol router')
+
+      // The SDK cancelled its input stream on the rejection: further input and
+      // EOF must not crash the stdin bridge (enqueue into a closed controller)
+      // and the adapter must exit through the shutdown coordinator.
+      child.stdin.write('{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}\n')
+      child.stdin.end()
+      const exit = await adapter.closed
+      assert.equal(exit.code, 0, `clean exit expected; stderr: ${adapter.stderr}`)
+      assert.doesNotMatch(adapter.stderr, /TypeError|ERR_STREAM/, 'no enqueue-after-close crash on the stdin bridge')
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    }
+  }
+)
+
+/** Bound every wait on a spawned adapter: a hung child must fail the test, not the runner. */
+function boundedExit(
+  child: ChildProcessWithoutNullStreams,
+  ms: number
+): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  let timer: NodeJS.Timeout | undefined
+  return Promise.race([
+    new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(resolve => {
+      child.once('close', (code, signal) => resolve({ code, signal }))
+    }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`adapter did not exit within ${ms}ms`)), ms)
+    })
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
+/**
+ * A stub pi whose RPC side answers the session/new preflight and whose
+ * SIGTERM is trapped without exiting: disposal escalates to SIGKILL, so a
+ * shutdown holding this child observably stays pending for its grace.
+ */
+function withTrappedPi(): { dir: string; sessionsDir: string; pidFile: string; path: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-acp-entry-trapped-'))
+  const sessionsDir = join(dir, 'sessions')
+  const pidFile = join(dir, 'pid')
+  const stub = join(dir, 'pi')
+  writeFileSync(
+    stub,
+    `#!/usr/bin/env node\n` +
+      `const fs = require('node:fs')\n` +
+      `fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid))\n` +
+      `if (process.argv.includes('--version')) { process.stdout.write('1.2.0\\n'); process.exit(0) }\n` +
+      `const replies = {\n` +
+      `  get_state: { sessionId: 'trapped-session', sessionFile: ${JSON.stringify(join(sessionsDir, 'trapped-session.jsonl'))}, model: { provider: 'stub', id: 'stub-model' }, thinkingLevel: 'off' },\n` +
+      `  get_available_models: { models: [{ provider: 'stub', id: 'stub-model', name: 'Stub Model' }] },\n` +
+      `  get_available_thinking_levels: { levels: ['off'] }\n` +
+      `}\n` +
+      `let buffer = ''\n` +
+      `process.stdin.setEncoding('utf8').on('data', chunk => {\n` +
+      `  buffer += chunk\n` +
+      `  let index\n` +
+      `  while ((index = buffer.indexOf('\\n')) >= 0) {\n` +
+      `    const line = buffer.slice(0, index)\n` +
+      `    buffer = buffer.slice(index + 1)\n` +
+      `    let msg = null\n` +
+      `    try { msg = JSON.parse(line) } catch {}\n` +
+      `    if (msg && typeof msg.id === 'string' && typeof msg.type === 'string') {\n` +
+      `      process.stdout.write(JSON.stringify({\n` +
+      `        type: 'response', id: msg.id, command: msg.type,\n` +
+      `        success: Object.prototype.hasOwnProperty.call(replies, msg.type),\n` +
+      `        data: replies[msg.type] ?? null\n` +
+      `      }) + '\\n')\n` +
+      `    }\n` +
+      `  }\n` +
+      `})\n` +
+      `process.on('SIGTERM', () => {})\n`,
+    'utf-8'
+  )
+  chmodSync(stub, 0o755)
+  return { dir, sessionsDir, pidFile, path: stub }
+}
+
+test(
+  'a stdin error after cancellation is handled while teardown is pending',
+  { skip: isWindows, timeout: 60_000 },
+  async () => {
+    const stub = withTrappedPi()
+    // main.ts runs inside a wrapper that raises a stdin error 50ms after the
+    // SDK's cancellation pauses stdin — the bridge has detached by then, and
+    // the trapped pi child keeps the shutdown barrier pending, so the error
+    // lands mid-teardown. The permanent error listener must route it through
+    // shutdown instead of crashing the adapter and orphaning the child.
+    const wrapper =
+      'const stdin = process.stdin\n' +
+      'const originalPause = stdin.pause.bind(stdin)\n' +
+      'let cancelled = false\n' +
+      'stdin.pause = function () {\n' +
+      '  const paused = originalPause()\n' +
+      "  if (!cancelled) { cancelled = true; setTimeout(() => stdin.emit('error', new Error('late stdin error after cancellation')), 50) }\n" +
+      '  return paused\n' +
+      '}\n' +
+      `void import(${JSON.stringify(pathToFileURL(join(repoRoot, 'src/main.ts')).href)})\n`
+    const child = spawn(process.execPath, ['--import', 'tsx', '-e', wrapper], {
+      cwd: repoRoot,
+      env: freshLaunchEnv({
+        PI_ACP_PI_COMMAND: stub.path,
+        PI_ACP_DIR: join(stub.dir, 'pi-acp-store'),
+        PI_CODING_AGENT_SESSION_DIR: stub.sessionsDir
+      }),
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+    const adapter = driveAdapter(child)
+    try {
+      adapter.send(1, 'initialize', { protocolVersion: 1, clientCapabilities: {} })
+      assert.ok((await adapter.waitFor(1, 'initialize')).result, `stderr: ${adapter.stderr}`)
+      adapter.send(2, 'session/new', { cwd: repoRoot, mcpServers: [] })
+      assert.ok((await adapter.waitFor(2, 'session/new')).result, `stderr: ${adapter.stderr}`)
+
+      // A message beyond the SDK's 32 MiB line limit breaks its input loop:
+      // the SDK cancels the adapter's stdin bridge while the trapped child
+      // holds the shutdown barrier, so the late error below is mid-teardown.
+      // The unread remainder of the write fails with EPIPE once the adapter
+      // exits; that is the test's own pipe, not the adapter under test.
+      child.stdin.on('error', () => {})
+      child.stdin.write('x'.repeat(33 * 1024 * 1024) + '\n')
+      const exit = await boundedExit(child, 15_000)
+      assert.equal(exit.code, 0, `the late stdin error must route through shutdown; stderr: ${adapter.stderr}`)
+      assert.doesNotMatch(
+        adapter.stderr,
+        /late stdin error after cancellation/,
+        'the stdin error must not surface as an unhandled stream error'
+      )
+    } finally {
+      // An adapter crash (the pre-fix behavior) orphans the trapped stub.
+      try {
+        const pid = Number.parseInt(readFileSync(stub.pidFile, 'utf8').trim(), 10)
+        if (Number.isInteger(pid) && pid > 0) process.kill(pid, 'SIGKILL')
+      } catch {
+        /* Already gone. */
+      }
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      rmSync(stub.dir, { recursive: true, force: true })
     }
   }
 )

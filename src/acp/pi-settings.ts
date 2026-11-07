@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { appendPathSegments } from '../pi-rpc/raw-path.js'
 
 function isObject(x: unknown): x is Record<string, unknown> {
   return Boolean(x) && typeof x === 'object' && !Array.isArray(x)
@@ -35,7 +36,7 @@ export function getMergedPiSettings(
   cwd: string,
   globalSettings: Record<string, unknown> = getGlobalPiSettings()
 ): Record<string, unknown> {
-  const project = readJsonFile(resolve(cwd, '.pi', 'settings.json'))
+  const project = readJsonFile(appendPathSegments(cwd, '.pi', 'settings.json'))
   return deepMerge(globalSettings, project)
 }
 

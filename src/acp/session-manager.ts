@@ -12,7 +12,6 @@ import { PiAcpSession } from './session.js'
 import { toRequestError } from './session-errors.js'
 
 type SessionCreateParams = {
-  [key: string]: unknown
   cwd: string
   conn: AcpClient
   piCommand?: string
@@ -161,6 +160,10 @@ export class SessionManager {
       ...params,
       signal: controller.signal,
       onProcess: proc => this.own(proc)
+    }).catch((e: unknown) => {
+      // One mapping for every caller: a spawn failure reaches ACP as internalError.
+      if (e instanceof PiRpcSpawnError) throw RequestError.internalError({ code: e.code }, e.message)
+      throw e
     })
 
     // Ownership is also taken on resolution: a spawn seam that never calls the
@@ -315,7 +318,7 @@ export class SessionManager {
 
   /**
    * Dispose a session's underlying pi process and remove it from the manager.
-   * Used when clients explicitly reload a session and we want a fresh pi subprocess.
+   * Used for every teardown: eviction, failed new-session cleanup, and close.
    */
   close(sessionId: string): void {
     const session = this.sessions.get(sessionId)
@@ -329,20 +332,12 @@ export class SessionManager {
 
     // Let pi manage session persistence in its default location (~/.pi/agent/sessions/...)
     // so sessions are visible to the regular `pi` CLI.
-    let proc: PiRpcProcess
-    try {
-      proc = await this.spawnOwned({
-        cwd: params.cwd,
-        sessionDirectory: resolveSessionDirectory(params.cwd).path,
-        piCommand: params.piCommand,
-        ...(params.additionalDirectories?.length ? { additionalDirectories: params.additionalDirectories } : {})
-      })
-    } catch (e) {
-      if (e instanceof PiRpcSpawnError) {
-        throw RequestError.internalError({ code: e.code }, e.message)
-      }
-      throw e
-    }
+    const proc = await this.spawnOwned({
+      cwd: params.cwd,
+      sessionDirectory: resolveSessionDirectory(params.cwd).path,
+      piCommand: params.piCommand,
+      ...(params.additionalDirectories?.length ? { additionalDirectories: params.additionalDirectories } : {})
+    })
     this.assertNotDisposed(proc)
 
     // The ACP sessionId must be pi's authoritative persisted session identity;
@@ -404,17 +399,7 @@ export class SessionManager {
 
     let session: PiAcpSession
     try {
-      session = new PiAcpSession({
-        sessionId,
-        cwd: params.cwd,
-        proc,
-        conn: params.conn,
-        supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
-        supportsSubagentUpdates: params.supportsSubagentUpdates,
-        authMethods: params.authMethods,
-        supportsElicitationForm: params.supportsElicitationForm,
-        additionalDirectories: params.additionalDirectories
-      })
+      session = this.buildSession(sessionId, params, proc)
     } catch (error) {
       // The store mapping already exists, so a later session/load can target
       // this file: retire through the barrier instead of a bare dispose.
@@ -458,17 +443,7 @@ export class SessionManager {
 
     let session: PiAcpSession
     try {
-      session = new PiAcpSession({
-        sessionId,
-        cwd: params.cwd,
-        proc: params.proc,
-        conn: params.conn,
-        supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
-        supportsSubagentUpdates: params.supportsSubagentUpdates,
-        authMethods: params.authMethods,
-        supportsElicitationForm: params.supportsElicitationForm,
-        additionalDirectories: params.additionalDirectories
-      })
+      session = this.buildSession(sessionId, params, params.proc)
     } catch (error) {
       this.retireProcess(sessionId, params.proc)
       throw error
@@ -476,5 +451,20 @@ export class SessionManager {
 
     this.sessions.set(sessionId, session)
     return session
+  }
+
+  /** One construction path so new and loaded sessions cannot diverge in capabilities. */
+  private buildSession(sessionId: string, params: SessionCreateParams, proc: PiRpcProcess): PiAcpSession {
+    return new PiAcpSession({
+      sessionId,
+      cwd: params.cwd,
+      proc,
+      conn: params.conn,
+      supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
+      supportsSubagentUpdates: params.supportsSubagentUpdates,
+      authMethods: params.authMethods,
+      supportsElicitationForm: params.supportsElicitationForm,
+      additionalDirectories: params.additionalDirectories
+    })
   }
 }

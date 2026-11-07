@@ -22,10 +22,8 @@ test('PiAcpAgent: the thought_level config option rejects unknown levels for act
   const manager = (agent as any).sessions as SessionManager
   manager.getOrCreate('active', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 
   await assert.rejects(

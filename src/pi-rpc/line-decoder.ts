@@ -53,9 +53,18 @@ export class LfLineDecoder {
     const lines: string[] = []
     let start = 0
     let newline: number
+    // A line wholly inside this chunk needs no assembly or byte accounting:
+    // UTF-8 never encodes a code unit as more than three bytes, so a chunk
+    // this short cannot hold an over-limit line (and empty parts always
+    // means zero pending bytes).
+    const wholeChunkSafe = 3 * text.length <= this.maxBufferedBytes
     while ((newline = text.indexOf('\n', start)) !== -1) {
-      this.append(text.slice(start, newline))
-      lines.push(this.take())
+      if (wholeChunkSafe && this.parts.length === 0) {
+        lines.push(text.slice(start, newline))
+      } else {
+        this.append(text.slice(start, newline))
+        lines.push(this.take())
+      }
       start = newline + 1
     }
     this.append(text.slice(start))

@@ -14,10 +14,8 @@ function createSession(cwd: string) {
   new PiAcpSession({
     sessionId: 's1',
     cwd,
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 
   return { conn, proc }

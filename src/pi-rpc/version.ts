@@ -1,26 +1,12 @@
 import { spawn } from 'node:child_process'
-import { buildPiInvocation } from './command.js'
-import { killProcessTree } from './process-tree.js'
+import { isAbsolute } from 'node:path'
+import { buildPiInvocation, findExecutableOnPath, isConcretePiEntry, type PiInvocation } from './command.js'
+import { killProcessTree, killPosixProcessGroup } from './process-tree.js'
 
 /** Owned ACP completion needs awaited agent_before_settle boundaries and delivered, retained system-prompt sections on extension-triggered runs. */
 export const MIN_PI_VERSION = '1.2.0'
 const MIN_PI_REASON =
   'awaited `agent_before_settle` boundaries and system-prompt section delivery on extension-triggered runs'
-
-export const PI_FEATURE_MIN_VERSION = {
-  agentSettled: '0.80.4',
-  prompt: '0.80.4',
-  abort: '0.80.4',
-  stateAndModels: '0.80.4',
-  modelAndThinkingMutation: '0.80.4',
-  queueModes: '0.80.4',
-  compaction: '0.80.4',
-  sessionStatsAndExport: '0.80.4',
-  getEntries: '0.80.4',
-  getCommands: '0.80.4',
-  extensionUi: '0.80.4',
-  getAvailableThinkingLevels: '0.81.0'
-} as const
 
 export class PiVersionError extends Error {
   constructor(message: string) {
@@ -108,11 +94,10 @@ function abortReason(signal: AbortSignal): unknown {
   return error
 }
 
-function startVersionProbe(piCommand: string, cwd: string, defaultCommand = false): VersionProbe {
+function startVersionProbe(piCommand: string, cwd: string, invocation: PiInvocation | null): VersionProbe {
   const controller = new AbortController()
   const signal = controller.signal
   const promise = new Promise<string | null>((resolve, reject) => {
-    const invocation = buildPiInvocation(piCommand, ['--version'], { cwd, defaultCommand })
     if (!invocation) return resolve(null)
 
     let stdout = ''
@@ -124,27 +109,35 @@ function startVersionProbe(piCommand: string, cwd: string, defaultCommand = fals
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       shell: false,
+      // The probe child owns a dedicated POSIX process group, so a wrapper's
+      // pi grandchild holding the stdio pipes can be group-killed on abort.
+      detached: process.platform !== 'win32',
       windowsVerbatimArguments: invocation.windowsVerbatimArguments
     })
-    // A reaped root pid may have been reused by the OS, so it must never be
-    // targeted by a tree kill; the probe then relies on its bounded settle.
+    // Windows tree kill is pid-addressed: never after exit (see killTreeTargetsRootPid).
     let exited = false
     child.once('exit', () => {
       exited = true
     })
     const killProbeTree = () => {
-      if (invocation.windowsScriptWrapper === true && child.pid !== undefined && !exited) {
-        // The .cmd wrapper's real pi is a grandchild holding the stdio
-        // pipes; killing only the cmd.exe root would strand it.
-        void killProcessTree(child.pid, PROBE_TREE_KILL_TIMEOUT_MS).then(
-          result => {
-            if (!result.confirmed) console.error(`pi-acp: version probe tree kill unconfirmed (${result.reason})`)
-          },
-          () => {}
-        )
+      const kill =
+        child.pid === undefined
+          ? null
+          : process.platform !== 'win32'
+            ? killPosixProcessGroup(child.pid, 0, PROBE_TREE_KILL_TIMEOUT_MS)
+            : !exited && invocation.windowsScriptWrapper === true
+              ? killProcessTree(child.pid, PROBE_TREE_KILL_TIMEOUT_MS)
+              : null
+      if (!kill) {
+        child.kill('SIGKILL')
         return
       }
-      child.kill('SIGKILL')
+      void kill.then(
+        result => {
+          if (!result.confirmed) console.error(`pi-acp: version probe tree kill unconfirmed (${result.reason})`)
+        },
+        () => {}
+      )
     }
     const cleanup = () => {
       clearTimeout(timer)
@@ -287,6 +280,59 @@ function consumeVersionProbe(probe: VersionProbe, signal?: AbortSignal): Promise
   })
 }
 
+/**
+ * The probe cache key: what actually runs, not where the caller sits —
+ * except where the same command can behave differently per cwd. Only the
+ * default command's resolution is trusted as the concrete pi entry (a
+ * bun/node runtime with the direct-JS pi entry as its argument, or a PATH
+ * lookup landing on a concrete entry) and may share one probe across cwds;
+ * explicit overrides are always keyed per cwd, because a forwarding launcher
+ * script cannot be told from a concrete pi entry by shape. Relative
+ * commands, Windows lookups, wrapper scripts and unresolved commands keep
+ * the cwd in the key as well.
+ */
+function versionProbeCacheKey(
+  piCommand: string,
+  cwd: string,
+  defaultCommand: boolean,
+  invocation: PiInvocation | null
+): unknown[] {
+  if (!invocation) return ['unresolved', piCommand, cwd, defaultCommand]
+  if (invocation.windowsScriptWrapper === true) {
+    // The launcher script is embedded in the cmd.exe command line, but the
+    // script itself can forward to a cwd-dependent pi.
+    return [invocation.executable, invocation.args, cwd, defaultCommand]
+  }
+  if (invocation.executable !== piCommand) {
+    // Bun reroute (default discovery only): both the runtime and the pi entry
+    // are resolved absolute paths, so every cwd that resolves there shares
+    // one probe.
+    return [invocation.executable, invocation.args[0] ?? '', defaultCommand]
+  }
+  if (isAbsolute(piCommand)) {
+    // An explicit absolute override may be a launcher forwarding to a
+    // workspace-local pi; that cannot be told from a concrete pi entry by
+    // shape, so the probe stays keyed per cwd.
+    return [piCommand, cwd, defaultCommand]
+  }
+  if (process.platform === 'win32' || piCommand.includes('/') || piCommand.includes('\\')) {
+    // Relative commands and Windows PATH lookups resolve against the cwd.
+    return [piCommand, cwd, defaultCommand]
+  }
+  const resolved = findExecutableOnPath(piCommand, { cwd, env: process.env })
+  // An unresolved command never keeps its probe (see the null purge in
+  // assertSupportedPiVersion), so the key only separates it from resolved ones.
+  if (!resolved) return ['unresolved', piCommand, cwd, defaultCommand]
+  if (!defaultCommand) {
+    // A bare explicit override is as untrusted as an absolute one: it may be
+    // a forwarding launcher, so the probe stays keyed per cwd.
+    return [resolved, cwd, defaultCommand]
+  }
+  // Default-discovery PATH resolution is the adapter's trusted entry point:
+  // only a concrete entry shares its probe across cwds.
+  return isConcretePiEntry(resolved) ? [resolved, defaultCommand] : [resolved, cwd, defaultCommand]
+}
+
 export function assertSupportedPiVersion(
   piCommand: string,
   cwd = process.cwd(),
@@ -296,10 +342,11 @@ export function assertSupportedPiVersion(
   if (signal?.aborted) return Promise.reject(abortReason(signal))
   // defaultCommand is part of the cache identity: the same command resolves
   // to a different runtime (Bun-preferred default vs verbatim override).
-  const cacheKey = JSON.stringify([piCommand, cwd, defaultCommand])
+  const invocation = buildPiInvocation(piCommand, ['--version'], { cwd, defaultCommand })
+  const cacheKey = JSON.stringify(versionProbeCacheKey(piCommand, cwd, defaultCommand, invocation))
   let probe = versionCache.get(cacheKey)
   if (!probe || probe.aborting) {
-    probe = startVersionProbe(piCommand, cwd, defaultCommand)
+    probe = startVersionProbe(piCommand, cwd, invocation)
     versionCache.set(cacheKey, probe)
     void probe.promise.then(
       version => {

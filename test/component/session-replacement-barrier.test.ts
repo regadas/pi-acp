@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { PiAcpAgent } from '../../src/acp/agent.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
@@ -22,14 +23,13 @@ const settle = async () => {
 /** An agent whose store maps `sessionId` to SESSION_FILE, with no session registered. */
 function makeBareAgent(sessionId: string) {
   const conn = new FakeAgentSideConnection()
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  const manager = (agent as any).sessions as SessionManager
   const cwd = process.cwd()
-  ;(agent as any).store = {
+  const agent = new PiAcpAgent(asAgentConn(conn), {
     get: () => ({ sessionId, cwd, sessionFile: SESSION_FILE }),
     upsert: () => {},
     delete: () => {}
-  }
+  } as unknown as SessionStore)
+  const manager = (agent as any).sessions as SessionManager
   // Nothing needs the deferred available_commands_update here.
   ;(agent as any).scheduleDeferred = () => {}
 
@@ -44,10 +44,8 @@ function makeAgent(sessionId: string, oldProc: FakePiRpcProcess, replacementProc
 
   bare.manager.getOrCreate(sessionId, {
     cwd: bare.cwd,
-    mcpServers: [],
     conn: asAgentConn(bare.conn),
-    proc: oldProc as any,
-    fileCommands: []
+    proc: oldProc as any
   })
 
   return bare
@@ -56,10 +54,8 @@ function makeAgent(sessionId: string, oldProc: FakePiRpcProcess, replacementProc
 function registerProc(manager: SessionManager, sessionId: string, proc: FakePiRpcProcess) {
   return manager.getOrCreate(sessionId, {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(new FakeAgentSideConnection()),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 }
 
@@ -334,16 +330,15 @@ test('PiAcpAgent: an identity-mismatch retirement also gates a restore for the r
   const cwd = process.cwd()
 
   const conn = new FakeAgentSideConnection()
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  const manager = (agent as any).sessions as SessionManager
-  ;(agent as any).store = {
+  const agent = new PiAcpAgent(asAgentConn(conn), {
     get: (sessionId: string) =>
       sessionId === reportedId
         ? { sessionId, cwd, sessionFile: reportedFile }
         : { sessionId, cwd, sessionFile: SESSION_FILE },
     upsert: () => {},
     delete: () => {}
-  }
+  } as unknown as SessionStore)
+  const manager = (agent as any).sessions as SessionManager
   ;(agent as any).scheduleDeferred = () => {}
   ;(agent as any).replacementTerminationTimeoutMs = 1_000
 

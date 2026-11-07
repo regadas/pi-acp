@@ -9,36 +9,21 @@ function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess, auth
   return new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as any,
     conn: asAgentConn(conn),
-    fileCommands: [],
     authMethods
   })
 }
 
-test('PiAcpSession: done reason length maps to max_tokens at agent_settled', async () => {
+test('PiAcpSession: only the latest stop reason counts (length then stop is end_turn)', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const session = makeSession(conn, proc)
 
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length', message: {} } })
-  proc.emit({ type: 'agent_settled' })
-
-  assert.equal(await p, 'max_tokens')
-})
-
-test('PiAcpSession: only the latest done reason counts (length then stop is end_turn)', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-  const session = makeSession(conn, proc)
-
-  const p = session.prompt('hello')
-  proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length', message: {} } })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop', message: {} } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'length' } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
   proc.emit({ type: 'agent_settled' })
 
   assert.equal(await p, 'end_turn')
@@ -51,7 +36,7 @@ test("PiAcpSession: a fresh turn does not inherit the previous turn's length sto
 
   const first = session.prompt('one')
   proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'length', message: {} } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'length' } })
   proc.emit({ type: 'agent_settled' })
   assert.equal(await first, 'max_tokens')
 
@@ -61,7 +46,7 @@ test("PiAcpSession: a fresh turn does not inherit the previous turn's length sto
   assert.equal(await second, 'end_turn')
 })
 
-test('PiAcpSession: assistant error event fails the turn at agent_settled', async () => {
+test('PiAcpSession: assistant message_end error fails the turn at agent_settled', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const session = makeSession(conn, proc)
@@ -69,8 +54,8 @@ test('PiAcpSession: assistant error event fails the turn at agent_settled', asyn
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
   proc.emit({
-    type: 'message_update',
-    assistantMessageEvent: { type: 'error', reason: 'error', error: { errorMessage: '429 quota exceeded' } }
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '429 quota exceeded' }
   })
   proc.emit({ type: 'agent_settled' })
 
@@ -89,11 +74,12 @@ test('PiAcpSession: expired credentials mid-session reject the turn as auth-requ
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
   proc.emit({
-    type: 'message_update',
-    assistantMessageEvent: {
-      type: 'error',
-      reason: 'error',
-      error: { errorMessage: 'Your session has expired. Please reauthenticate.' }
+    type: 'message_end',
+    message: {
+      role: 'assistant',
+      content: [],
+      stopReason: 'error',
+      errorMessage: 'Your session has expired. Please reauthenticate.'
     }
   })
   proc.emit({ type: 'agent_settled' })
@@ -246,7 +232,7 @@ test('PiAcpSession: aborted error without a client cancellation fails the turn',
 
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'error', reason: 'aborted', error: {} } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'aborted' } })
   proc.emit({ type: 'agent_settled' })
 
   await assert.rejects(p, (e: any) => {
@@ -254,20 +240,6 @@ test('PiAcpSession: aborted error without a client cancellation fails the turn',
     assert.match(String(e?.message), /aborted the run unexpectedly/)
     return true
   })
-})
-
-test('PiAcpSession: aborted error after a client cancellation resolves cancelled', async () => {
-  const conn = new FakeAgentSideConnection()
-  const proc = new FakePiRpcProcess()
-  const session = makeSession(conn, proc)
-
-  const p = session.prompt('hello')
-  proc.emit({ type: 'agent_start' })
-  await session.cancel()
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'error', reason: 'aborted', error: {} } })
-  proc.emit({ type: 'agent_settled' })
-
-  assert.equal(await p, 'cancelled')
 })
 
 test('PiAcpSession: final retry failure replaces provisional errors and rejects at agent_settled', async () => {
@@ -278,13 +250,13 @@ test('PiAcpSession: final retry failure replaces provisional errors and rejects 
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
   proc.emit({
-    type: 'message_update',
-    assistantMessageEvent: { type: 'error', reason: 'error', error: { errorMessage: 'transient 529' } }
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'transient 529' }
   })
   proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 1, delayMs: 1 })
   proc.emit({
-    type: 'message_update',
-    assistantMessageEvent: { type: 'error', reason: 'error', error: { errorMessage: 'still overloaded' } }
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'still overloaded' }
   })
   proc.emit({ type: 'auto_retry_end', success: false, attempt: 1, finalError: '529 overloaded_error: Overloaded' })
   proc.emit({ type: 'agent_settled' })
@@ -311,12 +283,12 @@ test('PiAcpSession: recovered retry clears the provisional assistant error', asy
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
   proc.emit({
-    type: 'message_update',
-    assistantMessageEvent: { type: 'error', reason: 'error', error: { errorMessage: 'transient 529' } }
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'transient 529' }
   })
   proc.emit({ type: 'auto_retry_start', attempt: 1, maxAttempts: 3, delayMs: 1 })
   proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop', message: {} } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
   proc.emit({ type: 'auto_retry_end', success: true, attempt: 1 })
   proc.emit({ type: 'agent_settled' })
 
@@ -327,7 +299,7 @@ test('PiAcpSession: recovered retry clears the provisional assistant error', asy
   assert.ok(texts.includes('Retry finished, resuming.'))
 })
 
-test('PiAcpSession: an unknown future done reason does not erase a provisional failure', async () => {
+test('PiAcpSession: an unknown future stop reason does not erase a provisional failure', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
   const session = makeSession(conn, proc)
@@ -335,10 +307,10 @@ test('PiAcpSession: an unknown future done reason does not erase a provisional f
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
   proc.emit({
-    type: 'message_update',
-    assistantMessageEvent: { type: 'error', reason: 'error', error: { errorMessage: 'provider failed' } }
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'provider failed' }
   })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'future_reason', message: {} } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'future_reason' } })
   proc.emit({ type: 'agent_settled' })
 
   await assert.rejects(p, (error: any) => {
@@ -355,13 +327,13 @@ test('PiAcpSession: successful overflow compaction recovery clears the provision
   const p = session.prompt('hello')
   proc.emit({ type: 'agent_start' })
   proc.emit({
-    type: 'message_update',
-    assistantMessageEvent: { type: 'error', reason: 'error', error: { errorMessage: 'context overflow' } }
+    type: 'message_end',
+    message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'context overflow' }
   })
   proc.emit({ type: 'compaction_start', reason: 'overflow' })
   proc.emit({ type: 'compaction_end', aborted: false, willRetry: true })
   proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop', message: {} } })
+  proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
   proc.emit({ type: 'agent_settled' })
 
   assert.equal(await p, 'end_turn')
@@ -422,10 +394,8 @@ test('PiAcpSession: failed acceptance probe quarantines the process and suppress
   const freshProc = new FakePiRpcProcess()
   const restored = manager.getOrCreate(session.sessionId, {
     cwd: process.cwd(),
-    mcpServers: [],
     proc: freshProc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
   assert.notEqual(restored, session)
   assert.equal(restored.proc, freshProc)
@@ -480,12 +450,8 @@ for (const ending of ['success', 'error', 'cancel', 'exit'] as const) {
     })
     if (ending === 'error')
       proc.emit({
-        type: 'message_update',
-        assistantMessageEvent: {
-          type: 'error',
-          reason: 'error',
-          error: { errorMessage: 'broken stream' }
-        }
+        type: 'message_end',
+        message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: 'broken stream' }
       })
     if (ending === 'cancel') await session.cancel()
     if (ending === 'exit') proc.emitTermination({ expected: false })

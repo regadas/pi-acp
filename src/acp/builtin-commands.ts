@@ -79,15 +79,18 @@ export async function runBuiltinCommand(
   ctx: CommandContext,
   rawArgs: string
 ): Promise<PromptResponse> {
-  const guidance = GUIDANCE_ONLY_COMMANDS[cmd]
-  if (guidance) {
-    await ctx.sendSessionUpdate({
+  const say = (text: string) =>
+    ctx.sendSessionUpdate({
       sessionId: session.sessionId,
       update: {
         sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: guidance }
+        content: { type: 'text', text }
       }
     })
+
+  const guidance = GUIDANCE_ONLY_COMMANDS[cmd]
+  if (guidance) {
+    await say(guidance)
 
     return { stopReason: 'end_turn' }
   }
@@ -107,13 +110,7 @@ export async function runBuiltinCommand(
 
     const text = headerLines.join('\n') + (summary ? `\n\n${summary}` : '')
 
-    await ctx.sendSessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text }
-      }
-    })
+    await say(text)
 
     return { stopReason: 'end_turn' }
   }
@@ -143,13 +140,7 @@ export async function runBuiltinCommand(
     // Fallback if stats shape changes.
     const text = lines.length ? lines.join('\n') : `Session stats:\n${JSON.stringify(stats, null, 2)}`
 
-    await ctx.sendSessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text }
-      }
-    })
+    await say(text)
 
     return { stopReason: 'end_turn' }
   }
@@ -157,13 +148,7 @@ export async function runBuiltinCommand(
   if (cmd === 'name') {
     const name = rawArgs.trim()
     if (!name) {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: 'Usage: /name <name>' }
-        }
-      })
+      await say('Usage: /name <name>')
       return { stopReason: 'end_turn' }
     }
 
@@ -175,13 +160,7 @@ export async function runBuiltinCommand(
         ? ' This requires a newer pi version that supports `set_session_name` in RPC mode.'
         : ''
 
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: `Failed to set session name: ${msg}${hint}` }
-        }
-      })
+      await say(`Failed to set session name: ${msg}${hint}`)
       return { stopReason: 'end_turn' }
     }
 
@@ -192,119 +171,53 @@ export async function runBuiltinCommand(
     if (ctx.cancelled()) return { stopReason: 'end_turn' }
     await session.syncSessionInfo(name, ctx.cancelled)
 
-    await ctx.sendSessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: `Session name set: ${name}` }
-      }
-    })
+    await say(`Session name set: ${name}`)
 
     return { stopReason: 'end_turn' }
   }
 
-  if (cmd === 'steering') {
+  const modeCommand =
+    cmd === 'steering'
+      ? {
+          key: 'steeringMode',
+          label: 'Steering',
+          set: (mode: 'all' | 'one-at-a-time') => session.proc.setSteeringMode(mode)
+        }
+      : cmd === 'follow-up'
+        ? {
+            key: 'followUpMode',
+            label: 'Follow-up',
+            set: (mode: 'all' | 'one-at-a-time') => session.proc.setFollowUpMode(mode)
+          }
+        : undefined
+  if (modeCommand) {
     const modeRaw = String(args[0] ?? '').toLowerCase()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
     const state = (await session.proc.getState()) as any
-    const current = String(state?.steeringMode ?? '')
+    const current = String(state?.[modeCommand.key] ?? '')
 
-    // If no arg, just report current.
     if (!modeRaw) {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: `Steering mode: ${current || 'unknown'}`
-          }
-        }
-      })
+      await say(`${modeCommand.label} mode: ${current || 'unknown'}`)
       return { stopReason: 'end_turn' }
     }
 
     if (modeRaw !== 'all' && modeRaw !== 'one-at-a-time') {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Usage: /steering all | /steering one-at-a-time'
-          }
-        }
-      })
+      await say(`Usage: /${cmd} all | /${cmd} one-at-a-time`)
       return { stopReason: 'end_turn' }
     }
 
     // Cancellation landed while pi's state was being read: settle as
     // cancelled instead of applying a mutation nobody is waiting for.
     if (ctx.cancelled()) return { stopReason: 'end_turn' }
-    await session.proc.setSteeringMode(modeRaw as 'all' | 'one-at-a-time')
+    await modeCommand.set(modeRaw)
 
-    await ctx.sendSessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: `Steering mode set to: ${modeRaw}` }
-      }
-    })
-
-    return { stopReason: 'end_turn' }
-  }
-
-  if (cmd === 'follow-up') {
-    const modeRaw = String(args[0] ?? '').toLowerCase()
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const state = (await session.proc.getState()) as any
-    const current = String(state?.followUpMode ?? '')
-
-    // If no arg, just report current.
-    if (!modeRaw) {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: `Follow-up mode: ${current || 'unknown'}`
-          }
-        }
-      })
-      return { stopReason: 'end_turn' }
-    }
-
-    if (modeRaw !== 'all' && modeRaw !== 'one-at-a-time') {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Usage: /follow-up all | /follow-up one-at-a-time'
-          }
-        }
-      })
-      return { stopReason: 'end_turn' }
-    }
-
-    if (ctx.cancelled()) return { stopReason: 'end_turn' }
-    await session.proc.setFollowUpMode(modeRaw as 'all' | 'one-at-a-time')
-
-    await ctx.sendSessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: `Follow-up mode set to: ${modeRaw}` }
-      }
-    })
+    await say(`${modeCommand.label} mode set to: ${modeRaw}`)
 
     return { stopReason: 'end_turn' }
   }
 
   if (cmd === 'export') {
-    // For now we always export into the session cwd and do not accept a user-provided path.
+    // The export always lands in the session cwd; a user-provided path is not accepted.
     // IMPORTANT: pi's export_html reads the session JSONL file. If it doesn't exist yet
     // (no messages) or is empty, pi throws and RPC mode emits an uncorrelated parse error
     // (no id), which would otherwise hang our request. So we guard here.
@@ -314,16 +227,7 @@ export async function runBuiltinCommand(
     const messageCount = typeof state?.messageCount === 'number' ? state.messageCount : 0
 
     if (!sessionFile || messageCount === 0 || !(await hasExportableSessionFile(sessionFile))) {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Nothing to export yet (no session messages). Send a prompt first.'
-          }
-        }
-      })
+      await say('Nothing to export yet (no session messages). Send a prompt first.')
       return { stopReason: 'end_turn' }
     }
 
@@ -339,30 +243,12 @@ export async function runBuiltinCommand(
       const result = await session.proc.exportHtml(outputPath)
       resultPath = result.path
     } catch (e: unknown) {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: `Export failed: ${String(e instanceof Error ? e.message : e)}`
-          }
-        }
-      })
+      await say(`Export failed: ${String(e instanceof Error ? e.message : e)}`)
       return { stopReason: 'end_turn' }
     }
 
     if (!resultPath) {
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Export failed: no output path returned by pi.'
-          }
-        }
-      })
+      await say('Export failed: no output path returned by pi.')
       return { stopReason: 'end_turn' }
     }
 
@@ -370,16 +256,7 @@ export async function runBuiltinCommand(
 
     // Emit a short prefix + a resource link. Many clients concatenate chunks into a single
     // assistant message, so this avoids the "link + duplicate plain text" look.
-    await ctx.sendSessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: {
-          type: 'text',
-          text: 'Session exported: '
-        }
-      }
-    })
+    await say('Session exported: ')
 
     await ctx.sendSessionUpdate({
       sessionId: session.sessionId,
@@ -413,32 +290,14 @@ export async function runBuiltinCommand(
     } else {
       // An unrecognized argument is a typo, not a toggle: report usage
       // instead of silently flipping the setting.
-      await ctx.sendSessionUpdate({
-        sessionId: session.sessionId,
-        update: {
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: `Unknown argument: ${args[0]}. Usage: /autocompact on | off | toggle`
-          }
-        }
-      })
+      await say(`Unknown argument: ${args[0]}. Usage: /autocompact on | off | toggle`)
       return { stopReason: 'end_turn' }
     }
 
     if (ctx.cancelled()) return { stopReason: 'end_turn' }
     await session.proc.setAutoCompaction(enabled)
 
-    await ctx.sendSessionUpdate({
-      sessionId: session.sessionId,
-      update: {
-        sessionUpdate: 'agent_message_chunk',
-        content: {
-          type: 'text',
-          text: `Auto-compaction ${enabled ? 'enabled' : 'disabled'}.`
-        }
-      }
-    })
+    await say(`Auto-compaction ${enabled ? 'enabled' : 'disabled'}.`)
 
     return { stopReason: 'end_turn' }
   }

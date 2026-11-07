@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { PiAcpAgent, runPromptWithCancellation } from '../../src/acp/agent.js'
+import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -43,10 +43,8 @@ function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess): PiA
   return new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as never,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 }
 
@@ -88,7 +86,7 @@ function withDelayedPreflight(proc: FakePiRpcProcess) {
         isError: false,
         result: { content: [{ type: 'text', text: 'late tool output' }] }
       })
-      proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop' } })
+      proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
       proc.emit({ type: 'agent_settled' })
     }
   }
@@ -141,7 +139,7 @@ function withQueuedFollowUp(proc: FakePiRpcProcess) {
         isError: false,
         result: { content: [{ type: 'text', text: 'late tool output' }] }
       })
-      proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'done', reason: 'stop' } })
+      proc.emit({ type: 'message_end', message: { role: 'assistant', content: [], stopReason: 'stop' } })
       proc.emit({ type: 'agent_settled' })
     }
   }
@@ -214,11 +212,7 @@ for (const cancellation of ['session', 'request']) {
     const sessions = new FakeSessions(session)
     ;(agent as unknown as { sessions: FakeSessions }).sessions = sessions
     const controller = new AbortController()
-    const prompt = runPromptWithCancellation(
-      agent,
-      { sessionId: 's1', prompt: [{ type: 'text', text: 'hello' }] },
-      controller.signal
-    )
+    const prompt = agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: 'hello' }] }, controller.signal)
     await pi.written
 
     if (cancellation === 'request') controller.abort()
@@ -236,7 +230,7 @@ for (const cancellation of ['session', 'request']) {
 }
 
 for (const cancellation of ['queued', 'already aborted']) {
-  test(`runPromptWithCancellation: ${cancellation} request leaves another prompt's preflight intact`, async t => {
+  test(`PiAcpAgent.prompt: ${cancellation} request leaves another prompt's preflight intact`, async t => {
     const conn = new FakeAgentSideConnection()
     const proc = new FakePiRpcProcess()
     const session = makeSession(conn, proc)
@@ -250,11 +244,7 @@ for (const cancellation of ['queued', 'already aborted']) {
     await pi.written
     const controller = new AbortController()
     if (cancellation === 'already aborted') controller.abort()
-    const second = runPromptWithCancellation(
-      agent,
-      { sessionId: 's1', prompt: [{ type: 'text', text: 'never' }] },
-      controller.signal
-    )
+    const second = agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: 'never' }] }, controller.signal)
     await tick()
     controller.abort()
 

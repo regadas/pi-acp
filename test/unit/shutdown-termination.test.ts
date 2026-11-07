@@ -68,9 +68,7 @@ function countedSpawn() {
 function registerSession(manager: SessionManager, proc: FakePiRpcProcess, sessionId = 's1'): void {
   manager.getOrCreate(sessionId, {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(new FakeAgentSideConnection()),
-    fileCommands: [],
     proc: proc as unknown as PiRpcProcess
   })
 }

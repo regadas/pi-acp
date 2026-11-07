@@ -19,14 +19,8 @@ function describeFallback(c: PiRpcCommandInfo): string {
   return parts.length ? `(${parts.join(':')})` : '(command)'
 }
 
-export function toAvailableCommandsFromPiGetCommands(
-  data: unknown,
-  _legacyOptions?: { enableSkillCommands?: boolean; includeExtensionCommands?: boolean }
-): {
-  commands: AvailableCommand[]
-  raw: PiRpcCommandInfo[]
-} {
-  const root: any = data
+export function toAvailableCommandsFromPiGetCommands(data: unknown): AvailableCommand[] {
+  const root = data as { commands?: unknown; data?: { commands?: unknown } } | null | undefined
   const commandsRaw: PiRpcCommandInfo[] = Array.isArray(root?.commands)
     ? root.commands
     : Array.isArray(root?.data?.commands)
@@ -47,5 +41,5 @@ export function toAvailableCommandsFromPiGetCommands(
     })
   }
 
-  return { commands: out, raw: commandsRaw }
+  return out
 }

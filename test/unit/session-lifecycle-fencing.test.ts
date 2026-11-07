@@ -33,8 +33,7 @@ function makeHarness(
   const spawned: FakePiRpcProcess[] = []
   const originalSpawn = PiRpcProcess.spawn
 
-  const agent = new PiAcpAgent(asAgentConn(conn)) as unknown as Record<string, unknown>
-  agent.store = store
+  const agent = new PiAcpAgent(asAgentConn(conn), store) as unknown as Record<string, unknown>
   agent.sessions = sessions
   ;(PiRpcProcess as unknown as { spawn: unknown }).spawn = async () => {
     const proc = new FakePiRpcProcess()
@@ -76,6 +75,30 @@ const configUpdatesOf = (conn: FakeAgentSideConnection) =>
   conn.updates.filter(
     update => (update as { update?: { sessionUpdate?: string } }).update?.sessionUpdate === 'config_option_update'
   )
+
+test(
+  "PiAcpAgent: close and delete drop a settled session's admission bookkeeping",
+  { skip: isWindows, timeout: 10_000 },
+  async t => {
+    for (const action of ['close', 'delete'] as const) {
+      const { sessionId, cwd, agent } = seedHarness(t, `admission-cleanup-${action}`)
+      await agent.loadSession({ sessionId, cwd, mcpServers: [] })
+      const state = agent as unknown as Record<string, Map<string, unknown>>
+      for (const map of ['loadGenerations', 'loadArrivals', 'validLoadArrivals']) {
+        assert.ok(state[map]!.has(sessionId), `${map} is seeded by the load (${action})`)
+      }
+
+      if (action === 'close') await agent.closeSession({ sessionId })
+      else await agent.deleteSession({ sessionId })
+
+      // The close/delete seeded the admission fence itself; nothing tracked
+      // remains once it fully settles, so every map drops the session.
+      for (const map of ['loadGenerations', 'loadArrivals', 'validLoadArrivals', 'closeAdmissionGenerations']) {
+        assert.ok(!state[map]!.has(sessionId), `${map} is dropped once the ${action} fully settles`)
+      }
+    }
+  }
+)
 
 test(
   'PiAcpAgent: config writes queued behind an in-flight write never reopen a closing session',
@@ -417,7 +440,7 @@ test(
     // write the mapping: a wrong-cwd load arriving in that window must be
     // rejected against the authoritative header instead of cancelling it.
     const agentAny = harness.agent as unknown as Record<string, any>
-    const realRepository = agentAny.sessionRepository()
+    const realRepository = agentAny.repository
     let releaseFind!: () => void
     const findGate = new Promise<void>(resolve => {
       releaseFind = resolve
@@ -470,7 +493,7 @@ function parkedRepository(
   opts: { parkFindAt?: number[]; parkDelete?: boolean } = {}
 ) {
   const agentAny = harness.agent as unknown as Record<string, any>
-  const real = agentAny.sessionRepository()
+  const real = agentAny.repository
   const gate = () => {
     let release!: () => void
     let parked!: () => void
@@ -582,6 +605,42 @@ test(
 
     assert.equal(spawned.length, 0, 'no writer may cross the delete transaction retirement or unlink')
     assert.equal(sessions.maybeGet(sessionId), undefined, 'nothing is registered behind the delete')
+  }
+)
+
+test(
+  'PiAcpAgent: a load validating before close never restores after the close acknowledgement',
+  { skip: isWindows, timeout: 10_000 },
+  async t => {
+    const { sessionId, cwd, agent, sessions, spawned, store } = seedHarness(t, 'close-validated-load')
+    const gates = parkedRepository({ agent, store }, { parkFindAt: [1] })
+
+    const load = agent.loadSession({ sessionId, cwd, mcpServers: [] })
+    const outcome = load.then(
+      () => ({ status: 'fulfilled' as const }),
+      (error: unknown) => ({ status: 'rejected' as const, message: String((error as Error)?.message ?? '') })
+    )
+    await gates.findParked(1)
+
+    // The close settles and acknowledges while the load is still parked in
+    // validation: the admission cleanup must retain the close counter the
+    // load captured (a dropped key reads as the captured baseline again and
+    // would admit the load behind the acknowledged close).
+    await agent.closeSession({ sessionId })
+    assert.equal(sessions.maybeGet(sessionId), undefined, 'the close acknowledges with nothing registered')
+
+    gates.releaseFind(1)
+    const result = await outcome
+    assert.equal(result.status, 'rejected', 'the load fails closed instead of restoring behind the acknowledged close')
+    if (result.status === 'rejected') {
+      assert.match(result.message, /superseded by a concurrent load or close/)
+    }
+    assert.equal(spawned.length, 0, 'no child is spawned behind the acknowledged close')
+
+    // The retained counters are dropped once the span settles: nothing leaks.
+    const state = agent as unknown as Record<string, Map<string, unknown>>
+    await tick()
+    assert.ok(!state.closeAdmissionGenerations!.has(sessionId), 'cleanup retries once the validation settles')
   }
 )
 

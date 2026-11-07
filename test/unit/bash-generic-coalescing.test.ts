@@ -52,8 +52,8 @@ function updatesFor(conn: FakeAgentSideConnection, toolCallId: string): ToolCall
 
 const coalescingState = (session: PiAcpSession) =>
   session as unknown as {
-    genericBashEmittedMeasure: { size: number }
-    genericBashContent: { size: number }
+    genericBashEmittedMeasure: Map<string, { native: boolean; bytes: number }>
+    genericBashSnapshots: Map<string, unknown>
   }
 
 test('PiAcpSession: generic bash updates below the growth threshold coalesce', async () => {
@@ -86,7 +86,7 @@ test('PiAcpSession: generic bash updates below the growth threshold coalesce', a
   )
   const state = coalescingState(session)
   assert.equal(state.genericBashEmittedMeasure.size, 0, 'per-tool-call thresholds are cleaned up with the tool call')
-  assert.equal(state.genericBashContent.size, 0, 'retained content is cleaned up with the tool call')
+  assert.equal(state.genericBashSnapshots.size, 0, 'retained snapshots are cleaned up with the tool call')
 })
 
 test('PiAcpSession: generic bash updates flush mid-stream once growth passes the threshold', async () => {
@@ -222,6 +222,152 @@ const truncatedSnapshot = (
   details: { truncation: { truncated: true, truncatedBy: 'lines', ...coords, content: window } }
 })
 
+test('PiAcpSession: a coalesced native-measure snapshot never moves the emitted measure', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc, 64)
+
+  const prompt = session.prompt('run it')
+  proc.emit({ type: 'agent_start' })
+  startBash(proc, 'b1')
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: 'x'.repeat(10) }] })
+  emitSnapshot(proc, 'b1', truncatedSnapshot('y'.repeat(100), { totalLines: 3, totalBytes: 200, outputLines: 3 }))
+  emitSnapshot(proc, 'b1', truncatedSnapshot('y'.repeat(100), { totalLines: 3, totalBytes: 230, outputLines: 3 }))
+  emitSnapshot(proc, 'b1', truncatedSnapshot('z'.repeat(100), { totalLines: 4, totalBytes: 400, outputLines: 3 }))
+  endBash(proc, 'b1', { content: [{ type: 'text', text: 'done' }] })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await tick()
+
+  assert.deepEqual(
+    updatesFor(conn, 'b1').map(update => [update.status, update.content]),
+    [
+      ['in_progress', fenced('x'.repeat(10))],
+      ['in_progress', fenced('y'.repeat(100))],
+      ['in_progress', fenced('z'.repeat(100))],
+      ['completed', fenced('done')]
+    ],
+    'the rendered measure, the kind change, and the native flush emit; the sub-threshold native snapshot coalesces'
+  )
+  const state = coalescingState(session)
+  assert.equal(state.genericBashEmittedMeasure.size, 0, 'the measure is cleaned up with the tool call')
+})
+
+test('PiAcpSession: sub-threshold fallback updates measure escape-aware raw text before rendering', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc, 64)
+  // Backslashes double once JSON-escaped, so a raw byte count would halve the
+  // growth basis: the escape-aware count proves the measure was taken on the
+  // result text, before any rendering, without undercounting escapes.
+  const first = '\\'.repeat(40)
+  const suppressed = first + '\\'.repeat(10)
+  const flush = first + '\\'.repeat(80)
+
+  const prompt = session.prompt('run it')
+  proc.emit({ type: 'agent_start' })
+  startBash(proc, 'b1')
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: first }] })
+  const afterFirst = coalescingState(session).genericBashEmittedMeasure.get('b1')
+  assert.deepEqual(
+    afterFirst,
+    { native: false, bytes: 80 },
+    'the fallback measure is the escape-aware raw text size, not a rendered one'
+  )
+
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: suppressed }] })
+  assert.deepEqual(
+    coalescingState(session).genericBashEmittedMeasure.get('b1'),
+    afterFirst,
+    'a sub-threshold update neither emits nor moves the measure'
+  )
+
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: flush }] })
+  assert.deepEqual(
+    coalescingState(session).genericBashEmittedMeasure.get('b1'),
+    { native: false, bytes: 240 },
+    'a threshold flush re-baselines on the escape-aware raw text size'
+  )
+
+  endBash(proc, 'b1', { content: [{ type: 'text', text: 'done' }] })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await tick()
+
+  assert.deepEqual(
+    updatesFor(conn, 'b1').map(update => [update.status, update.content]),
+    [
+      ['in_progress', fenced(first)],
+      ['in_progress', fenced(flush)],
+      ['completed', fenced('done')]
+    ],
+    'only the first snapshot, the raw-growth flush, and the terminal update reach generic clients'
+  )
+})
+
+test('PiAcpSession: escape-heavy growth emits at the threshold the rendered basis emitted', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc, 64)
+  // Backslashes double once JSON-escaped: 32 more raw bytes are 64 escaped
+  // bytes, exactly the threshold the rendered-byte basis emitted on. A raw
+  // byte count (32) would suppress the update the old basis emitted.
+  const first = '\\'.repeat(40)
+  const second = '\\'.repeat(72)
+
+  const prompt = session.prompt('run it')
+  proc.emit({ type: 'agent_start' })
+  startBash(proc, 'b1')
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: first }] })
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: second }] })
+  endBash(proc, 'b1', { content: [{ type: 'text', text: 'done' }] })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await tick()
+
+  assert.deepEqual(
+    updatesFor(conn, 'b1').map(update => [update.status, update.content]),
+    [
+      ['in_progress', fenced(first)],
+      ['in_progress', fenced(second)],
+      ['completed', fenced('done')]
+    ],
+    'escape-heavy growth flushes on the escaped byte count, matching the old rendered-basis emission'
+  )
+})
+
+test('PiAcpSession: escape-heavy growth flushes at the production threshold arithmetic', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  // No seam override: the production 64 KiB threshold applies. Escaping
+  // doubles backslashes, so half a threshold of added backslashes — 32,768
+  // raw bytes, 65,536 escaped bytes — crosses the threshold exactly as the
+  // rendered-byte basis did; a raw byte count (32,768) would suppress it.
+  const session = makeSession(conn, proc)
+  const first = '\\'.repeat(32_768)
+  const second = first + '\\'.repeat(32_768)
+
+  const prompt = session.prompt('run it')
+  proc.emit({ type: 'agent_start' })
+  startBash(proc, 'b1')
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: first }] })
+  emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: second }] })
+  endBash(proc, 'b1', { content: [{ type: 'text', text: 'done' }] })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await tick()
+
+  assert.deepEqual(
+    updatesFor(conn, 'b1').map(update => [update.status, update.content]),
+    [
+      ['in_progress', fenced(first)],
+      ['in_progress', fenced(second)],
+      ['completed', fenced('done')]
+    ],
+    '32,768 added backslashes are 65,536 escaped bytes: the production threshold flushes'
+  )
+})
+
 test('PiAcpSession: capped windows flush on native totalBytes growth at the production threshold', async () => {
   const conn = new FakeAgentSideConnection()
   const proc = new FakePiRpcProcess()
@@ -305,6 +451,9 @@ test('PiAcpSession: a synthetic terminal failure carries the latest suppressed b
   startBash(proc, 'b1')
   emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: first }] })
   emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: latest }] })
+  // An empty update must not erase the suppressed snapshot: the synthetic
+  // failure still renders the last content-bearing output, not nothing.
+  emitSnapshot(proc, 'b1', {})
   proc.emitTermination({ expected: false })
   await outcome
   await tick()
@@ -314,6 +463,54 @@ test('PiAcpSession: a synthetic terminal failure carries the latest suppressed b
   assert.deepEqual(
     failed?.content,
     fenced(latest),
-    'the client keeps the latest known output, not the last emitted one'
+    'the client keeps the latest known output, not the last emitted one and not an erased one'
+  )
+})
+
+test('PiAcpSession: an image-only generic in_progress bash update emits immediately', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc, 64)
+  const image = { type: 'image', data: 'aGk=', mimeType: 'image/png' }
+
+  const prompt = session.prompt('run it')
+  proc.emit({ type: 'agent_start' })
+  startBash(proc, 'b1')
+  emitSnapshot(proc, 'b1', { content: [image] })
+  endBash(proc, 'b1', { content: [{ type: 'text', text: 'done' }] })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await prompt, 'end_turn')
+  await tick()
+
+  assert.deepEqual(
+    updatesFor(conn, 'b1').map(update => [update.status, update.content]),
+    [
+      ['in_progress', [{ type: 'content', content: image }]],
+      ['completed', fenced('done')]
+    ],
+    'an image-bearing update has no measurable text basis, so it bypasses text-growth coalescing'
+  )
+})
+
+test('PiAcpSession: a synthetic terminal failure renders a retained image-only snapshot', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess()
+  const session = makeSession(conn, proc, 64)
+  const image = { type: 'image', data: 'aGk=', mimeType: 'image/png' }
+
+  const outcome = assert.rejects(session.prompt('run it'), /pi process exited unexpectedly/)
+  proc.emit({ type: 'agent_start' })
+  startBash(proc, 'b1')
+  emitSnapshot(proc, 'b1', { content: [image] })
+  proc.emitTermination({ expected: false })
+  await outcome
+  await tick()
+
+  const failed = updatesFor(conn, 'b1').at(-1)
+  assert.equal(failed?.status, 'failed')
+  assert.deepEqual(
+    failed?.content,
+    [{ type: 'content', content: image }],
+    'an image-only snapshot is retained for the synthetic failure even with no text'
   )
 })

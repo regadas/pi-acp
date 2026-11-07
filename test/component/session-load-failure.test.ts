@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
@@ -91,9 +92,8 @@ function withMockSpawn<T>(procs: MockProc[], run: () => Promise<T>): Promise<T> 
 }
 
 function makeAgent(conn = new FakeAgentSideConnection()) {
-  const agent = new PiAcpAgent(asAgentConn(conn))
   const store = new FakeStore()
-  ;(agent as any).store = store
+  const agent = new PiAcpAgent(asAgentConn(conn), store as unknown as SessionStore)
   const manager = (agent as any).sessions as SessionManager
   return { agent, conn, store, manager }
 }

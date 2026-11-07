@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
@@ -120,8 +121,7 @@ function withMockSpawn<T>(procs: MockProc[], run: () => Promise<T>): Promise<T> 
 
 function makeAgent() {
   const conn = new FakeAgentSideConnection()
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  ;(agent as any).store = new FakeStore()
+  const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
   ;(agent as any).scheduleDeferred = () => {}
   const manager = (agent as any).sessions as SessionManager
   return { agent, conn, manager }
@@ -284,8 +284,7 @@ test('session/load replay and concurrent live updates share one delivery order',
     }
   })
 
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  ;(agent as any).store = new FakeStore()
+  const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
   ;(agent as any).scheduleDeferred = () => {}
 
   await withMockSpawn([proc], async () => {

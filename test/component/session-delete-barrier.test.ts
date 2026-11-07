@@ -63,7 +63,8 @@ function withPiDirs<T>(run: (sessionFile: string, projectDir: string) => Promise
 
 function makeAgent(proc: FakePiRpcProcess, timeoutMs: number, cwd = '/p') {
   const conn = new FakeAgentSideConnection()
-  const agent = new PiAcpAgent(asAgentConn(conn))
+  const store = new SessionStore(join(mkdtempSync(join(tmpdir(), 'pi-acp-delete-barrier-map-')), 'session-map.json'))
+  const agent = new PiAcpAgent(asAgentConn(conn), store)
   const manager = (agent as any).sessions as SessionManager
   ;(agent as any).replacementTerminationTimeoutMs = timeoutMs
   // Nothing here needs the deferred available_commands_update.
@@ -71,13 +72,11 @@ function makeAgent(proc: FakePiRpcProcess, timeoutMs: number, cwd = '/p') {
 
   manager.getOrCreate(SESSION_ID, {
     cwd,
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: proc as any,
-    fileCommands: []
+    proc: proc as any
   })
 
-  return { agent, manager }
+  return { agent, manager, store }
 }
 
 /** Count spawns so a test can prove no replacement child was ever created. */
@@ -119,8 +118,7 @@ test('PiAcpAgent: deleteSession waits for the retired child to exit before unlin
 test('PiAcpAgent: deleteSession fails closed and keeps the session file when the child will not exit', async () => {
   await withPiDirs(async sessionFile => {
     const proc = new FakePiRpcProcess()
-    const { agent } = makeAgent(proc, 25)
-    const store = (agent as any).store as SessionStore
+    const { agent, store } = makeAgent(proc, 25)
     store.upsert({ sessionId: SESSION_ID, cwd: '/p', sessionFile })
 
     await assert.rejects(agent.deleteSession({ sessionId: SESSION_ID }), (error: unknown) => {
@@ -163,8 +161,7 @@ for (const entry of [
   test(`PiAcpAgent: a concurrent session/${entry.name} cannot restore a session mid-delete`, async () => {
     await withPiDirs(async (sessionFile, projectDir) => {
       const proc = new FakePiRpcProcess()
-      const { agent, manager } = makeAgent(proc, 2_000, projectDir)
-      const store = (agent as any).store as SessionStore
+      const { agent, manager, store } = makeAgent(proc, 2_000, projectDir)
       store.upsert({ sessionId: SESSION_ID, cwd: projectDir, sessionFile })
       const spawn = countingSpawn()
 
@@ -211,8 +208,7 @@ for (const entry of [
 test('PiAcpAgent: a concurrent session/prompt cannot restore a session mid-delete', async () => {
   await withPiDirs(async (sessionFile, projectDir) => {
     const proc = new FakePiRpcProcess()
-    const { agent } = makeAgent(proc, 2_000, projectDir)
-    const store = (agent as any).store as SessionStore
+    const { agent, store } = makeAgent(proc, 2_000, projectDir)
     store.upsert({ sessionId: SESSION_ID, cwd: projectDir, sessionFile })
     const spawn = countingSpawn()
 
@@ -241,8 +237,7 @@ test('PiAcpAgent: a failed delete releases admission so the session stays usable
     const proc = new FakePiRpcProcess()
     const replacement = new FakePiRpcProcess()
     replacement.state = { isStreaming: false, sessionId: SESSION_ID, sessionFile }
-    const { agent } = makeAgent(proc, 25, projectDir)
-    const store = (agent as any).store as SessionStore
+    const { agent, store } = makeAgent(proc, 25, projectDir)
     store.upsert({ sessionId: SESSION_ID, cwd: projectDir, sessionFile })
 
     const original = PiRpcProcess.spawn

@@ -1,7 +1,7 @@
 {
   "formatVersion": 1,
   "name": "stop-reason-mapping",
-  "description": "done reason length maps to max_tokens at agent_settled; a fresh turn does not inherit the previous turn's length stop; only the latest done reason counts (length then stop is end_turn).",
+  "description": "message_end stopReason length maps to max_tokens at agent_settled; a fresh turn does not inherit the previous turn's length stop; only the latest stop reason counts (length then stop is end_turn).",
   "session": {
     "sessionId": "s1",
     "cwd": "/fixture/cwd",
@@ -13,8 +13,8 @@
     {
       "op": "pi_event",
       "event": {
-        "type": "message_update",
-        "assistantMessageEvent": { "type": "done", "reason": "length", "message": {} }
+        "type": "message_end",
+        "message": { "role": "assistant", "content": [], "stopReason": "length" }
       }
     },
     { "op": "pi_event", "event": { "type": "agent_settled" } },
@@ -26,15 +26,15 @@
     {
       "op": "pi_event",
       "event": {
-        "type": "message_update",
-        "assistantMessageEvent": { "type": "done", "reason": "length", "message": {} }
+        "type": "message_end",
+        "message": { "role": "assistant", "content": [], "stopReason": "length" }
       }
     },
     {
       "op": "pi_event",
       "event": {
-        "type": "message_update",
-        "assistantMessageEvent": { "type": "done", "reason": "stop", "message": {} }
+        "type": "message_end",
+        "message": { "role": "assistant", "content": [], "stopReason": "stop" }
       }
     },
     { "op": "pi_event", "event": { "type": "agent_settled" } }

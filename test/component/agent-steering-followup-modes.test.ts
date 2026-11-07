@@ -18,10 +18,8 @@ function makeSession(conn: FakeAgentSideConnection, proc: FakePiRpcProcess): PiA
   return new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as any,
-    conn: asAgentConn(conn),
-    fileCommands: []
+    conn: asAgentConn(conn)
   })
 }
 

@@ -11,6 +11,7 @@ import type {
 import type { AcpClient } from './client.js'
 import { fileSnapshot } from './file-snapshot.js'
 import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { createHash } from 'node:crypto'
 import {
   PiRpcProcess,
   PiRpcRequestTimeoutError,
@@ -18,7 +19,7 @@ import {
   type PiRpcEvent,
   type PiRpcTermination
 } from '../pi-rpc/process.js'
-import type { PiAssistantMessageEvent } from '../pi-rpc/protocol.js'
+import { ACP_LIFECYCLE_WIDGET, decodeLifecycleWidget, type PiAssistantMessageEvent } from '../pi-rpc/protocol.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { terminationError, toRequestError } from './session-errors.js'
 import {
@@ -27,6 +28,7 @@ import {
   bashOrderedContent,
   bashOutputDelta,
   bashOutputSnapshot,
+  bashResultText,
   bashTerminalContent,
   bashTerminalExitMeta,
   bashTerminalInfoMeta,
@@ -181,8 +183,6 @@ const PI_TURN_BOUND_EVENT_TYPES = new Set([
   'summarization_retry_scheduled',
   'summarization_retry_attempt_start',
   'summarization_retry_finished',
-  'auto_compaction_start',
-  'auto_compaction_end',
   'compaction_start',
   'compaction_end'
 ])
@@ -193,8 +193,35 @@ const DEFERRED_ADMISSION_TIMEOUT_MS = 10 * 60_000
 // Every generic-client flush resends the whole current (pi-capped) window, so
 // in_progress updates coalesce until this much new output has arrived.
 const GENERIC_BASH_COALESCE_BYTES = 64 * 1024
+
+/**
+ * Byte size the text occupies once JSON-escaped in the emitted payload:
+ * backslashes and double quotes double, control chars expand to their escape
+ * width. An approximation of the rendered payload, not exact parity — fence
+ * overhead, surrogate escapes and image bytes are excluded.
+ */
+function escapedTextByteLength(text: string): number {
+  let bytes = 0
+  for (const char of text) {
+    const code = char.charCodeAt(0)
+    bytes +=
+      code === 0x22 || code === 0x5c
+        ? 2
+        : code < 0x20
+          ? code === 0x08 || code === 0x09 || code === 0x0a || code === 0x0c || code === 0x0d
+            ? 2
+            : 6
+          : Buffer.byteLength(char)
+  }
+  return bytes
+}
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
+
+/** Image payloads are megabyte base64 strings; identity keys their digest, not their bytes. */
+function imageIdentity(data: string): string {
+  return createHash('sha256').update(data).digest('hex')
+}
 
 /**
  * Stable counted identity for a custom message across live events and
@@ -215,7 +242,9 @@ function customMessageIdentity(message: unknown, blocks: TranslatedUserBlock[]):
 
   return JSON.stringify([
     typeof record?.customType === 'string' ? record.customType : null,
-    blocks.map(block => (block.kind === 'text' ? ['text', block.text] : ['image', block.mimeType, block.data])),
+    blocks.map(block =>
+      block.kind === 'text' ? ['text', block.text] : ['image', block.mimeType, imageIdentity(block.data)]
+    ),
     detailsIdentity
   ])
 }
@@ -254,11 +283,8 @@ export class PiAcpSession {
   // errors raised from this session must advertise exactly these.
   private readonly authMethods: AuthMethod[]
 
-  // Used to map abort semantics to ACP stopReason.
-  // Applies to the currently running turn.
   private cancelRequested = false
 
-  // Current in-flight turn (if any). Additional prompts are queued.
   private pendingTurn: PendingTurn | null = null
   // Adapter-handled command currently holding the FIFO. A prompt turn and a
   // command are mutually exclusive: both are admitted through the same queue.
@@ -284,9 +310,9 @@ export class PiAcpSession {
   private agentRunObserved = false
 
   // Stop-reason tracking for the current turn. `lastDoneReason` records the
-  // most recent assistantMessageEvent `done` reason ('length' maps to ACP
-  // max_tokens); `turnFailure` records a run failure that must fail the ACP
-  // turn once pi settles (agent_settled stays the sole settlement boundary).
+  // most recent `message_end` stopReason ('length' maps to ACP max_tokens);
+  // `turnFailure` records a run failure that must fail the ACP turn once pi
+  // settles (agent_settled stays the sole settlement boundary).
   private lastDoneReason: string | null = null
   private turnFailure: Error | null = null
 
@@ -332,11 +358,14 @@ export class PiAcpSession {
   private subagentToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, BashOutputSnapshot>()
   // Last emitted in_progress measure per generic bash tool call, with its kind:
-  // native and rendered bytes are never compared, so a kind change always flushes.
+  // native totalBytes and escape-aware raw-text bytes are never compared, so
+  // a kind change always flushes.
   private genericBashEmittedMeasure = new Map<string, { native: boolean; bytes: number }>()
-  // Latest rendered content per generic bash tool call, retained so a synthetic
-  // terminal failure can still show output that coalescing suppressed.
-  private genericBashContent = new Map<string, ToolCallContent[]>()
+  // Latest content-bearing snapshot per generic bash tool call, retained
+  // unrendered so a synthetic terminal failure can still show output that
+  // coalescing suppressed without formatting every suppressed snapshot; an
+  // empty update never erases the retained one.
+  private genericBashSnapshots = new Map<string, unknown>()
 
   // pi-subagents children observed for the pending turn (id -> last emitted
   // running state). Nulled when the turn settles.
@@ -360,7 +389,6 @@ export class PiAcpSession {
   private disposalExpected = false
 
   constructor(opts: {
-    [key: string]: unknown
     sessionId: string
     cwd: string
     proc: PiRpcProcess
@@ -373,7 +401,7 @@ export class PiAcpSession {
     additionalDirectories?: readonly string[]
     /** Test seam: maximum wait for an observed out-of-band run to settle. */
     deferredAdmissionTimeoutMs?: number
-    /** Test seam: output growth (native totalBytes, else rendered bytes) before a coalesced generic in_progress bash update is re-sent. */
+    /** Test seam: output growth (native totalBytes, else escape-aware raw-text bytes) before a coalesced generic in_progress bash update is re-sent. */
     genericBashCoalesceBytes?: number
   }) {
     this.sessionId = opts.sessionId
@@ -518,10 +546,7 @@ export class PiAcpSession {
       return
     }
 
-    for (const entry of queued) {
-      if (entry.kind === 'prompt') entry.reject(failure)
-      else entry.fail(failure)
-    }
+    this.rejectQueued(queued, failure)
   }
 
   /**
@@ -748,15 +773,12 @@ export class PiAcpSession {
     const turnPromise = new Promise<StopReason>((resolve, reject) => {
       const queued: QueuedPrompt = { kind: 'prompt', message, images, resolve, reject, beforeRelease, requestOwner }
 
-      // If a turn or adapter command is running (or work is already waiting
-      // behind it), enqueue so every prompt path stays FIFO.
       if (this.isBusy() || this.turnQueue.length) {
         this.turnQueue.push(queued)
         this.emitQueuedNotice()
         return
       }
 
-      // Nothing is running; start immediately.
       this.startTurn(queued)
     })
 
@@ -781,9 +803,7 @@ export class PiAcpSession {
     // queued work: no adapter command may run local-only work and report
     // success for a session whose child is gone or whose channel was
     // quarantined. An unexpected exit or fault rejects; client cancel and
-    // adapter-driven teardown stay cancellations. Not reachable through
-    // PiAcpAgent today (its only caller has no await between restoring the
-    // session and this call), so keep it to this check.
+    // adapter-driven teardown stay cancellations.
     const entryFailure = this.terminalFailure(this.procTermination)
     if (entryFailure) throw entryFailure
     if (this.procTermination || this.isClosing()) return null
@@ -1002,7 +1022,6 @@ export class PiAcpSession {
   }
 
   private emitQueuedNotice(): void {
-    // Best-effort: notify the client that work was queued.
     this.emit({
       sessionUpdate: 'agent_message_chunk',
       content: {
@@ -1030,6 +1049,14 @@ export class PiAcpSession {
     }
   }
 
+  /** Reject every drained entry: prompts reject, commands fail. */
+  private rejectQueued(queued: QueuedWork[], error: unknown): void {
+    for (const entry of queued) {
+      if (entry.kind === 'prompt') entry.reject(error)
+      else entry.fail(error)
+    }
+  }
+
   async cancel(requestOwner?: symbol): Promise<void> {
     if (requestOwner !== undefined) {
       const queuedIndex = this.turnQueue.findIndex(
@@ -1051,7 +1078,6 @@ export class PiAcpSession {
     }
 
     this.drainPendingUiRequests()
-    // Cancel current and clear any queued work.
     this.cancelRequested = true
 
     const queued = this.turnQueue.splice(0, this.turnQueue.length)
@@ -1417,22 +1443,41 @@ export class PiAcpSession {
   }
 
   /**
-   * Pi caps snapshots at a rolling tail window, so the rendered size plateaus
-   * while output keeps growing: growth is measured by the native cumulative
-   * totalBytes when the snapshot reports it, rendered bytes otherwise. The
-   * two measures are never compared: a kind change always flushes, since an
-   * escaping-inflated rendered baseline could otherwise suppress a full
-   * window of new output.
+   * The in_progress generic-bash admission measure: the native cumulative
+   * totalBytes when the snapshot reports it, otherwise the JSON-escaped byte
+   * size of the raw result text. Pi caps snapshots at a rolling tail window,
+   * so text size alone plateaus while output keeps growing. Both bases are an
+   * approximation of the rendered payload (fence overhead, surrogate escapes
+   * and image bytes are excluded), so the threshold is a spam-control
+   * heuristic, not a byte-exact contract; image-bearing updates emit
+   * immediately because their rendered size cannot be cheaply measured.
+   * Everything is decided before any formatting, so a coalesced update is
+   * never rendered; empty text-only updates emit nothing and never move the
+   * measure. Returns the content to emit, or null when the update coalesces.
    */
-  private shouldEmitGenericBashUpdate(toolCallId: string, content: ToolCallContent[], result: unknown): boolean {
-    if (!content.length) return false
-    const coords = bashOutputSnapshot(result).coords
-    const native = coords !== undefined
-    const bytes = coords ? coords.totalBytes : Buffer.byteLength(JSON.stringify(content))
+  private coalescedGenericBashUpdate(
+    toolCallId: string,
+    result: unknown,
+    rawText: string,
+    imageBearing: boolean
+  ): ToolCallContent[] | null {
+    const coords = bashOutputSnapshot(result, rawText).coords
     const last = this.genericBashEmittedMeasure.get(toolCallId)
-    if (last && last.native === native && bytes - last.bytes < this.genericBashCoalesceBytes) return false
-    this.genericBashEmittedMeasure.set(toolCallId, { native, bytes })
-    return true
+    let bytes: number
+    if (coords !== undefined) {
+      if (last?.native === true && !imageBearing && coords.totalBytes - last.bytes < this.genericBashCoalesceBytes) {
+        return null
+      }
+      bytes = coords.totalBytes
+    } else {
+      bytes = escapedTextByteLength(rawText)
+      if (!bytes && !imageBearing) return null
+      if (last?.native === false && !imageBearing && bytes - last.bytes < this.genericBashCoalesceBytes) return null
+    }
+    const content = bashOrderedContent(result)
+    if (!content.length) return null
+    this.genericBashEmittedMeasure.set(toolCallId, { native: coords !== undefined, bytes })
+    return content
   }
 
   private emitBashOutputUpdate(params: {
@@ -1447,11 +1492,24 @@ export class PiAcpSession {
       // tool_call_update content replaces earlier content, so the snapshot
       // stays consistent while streaming. Terminal statuses always emit in
       // full; only in_progress flushes are coalesced.
-      const content = bashOrderedContent(params.result)
       if (params.status === 'in_progress') {
-        if (content.length) this.genericBashContent.set(params.toolCallId, content)
-        if (!this.shouldEmitGenericBashUpdate(params.toolCallId, content, params.result)) return
+        const rawText = bashResultText(params.result)
+        // Image-bearing snapshots are content even with no text; the image
+        // recognition is shared with the terminal path (toolResultImageBlocks).
+        const imageBearing = toolResultImageBlocks(params.result).length > 0
+        if (rawText || imageBearing) this.genericBashSnapshots.set(params.toolCallId, params.result)
+        const content = this.coalescedGenericBashUpdate(params.toolCallId, params.result, rawText, imageBearing)
+        if (content) {
+          this.emit({
+            sessionUpdate: 'tool_call_update',
+            toolCallId: params.toolCallId,
+            status: params.status,
+            content
+          })
+        }
+        return
       }
+      const content = bashOrderedContent(params.result)
       this.emit({
         sessionUpdate: 'tool_call_update',
         toolCallId: params.toolCallId,
@@ -1488,6 +1546,40 @@ export class PiAcpSession {
   }
 
   /**
+   * The non-bash tool-card emission shared by every event path (bash uses
+   * {@link emitBashToolCall}): the first `tool_call` with name/title/kind for
+   * a new card, or the `tool_call_update` that refreshes an existing one.
+   * Unset fields are omitted so all paths produce one shape.
+   */
+  private emitToolCallStart(params: {
+    existing: boolean
+    toolCallId: string
+    name: string | null | undefined
+    toolName: string
+    status: 'pending' | 'in_progress'
+    locations?: ToolCallLocation[]
+    rawInput?: unknown
+  }): void {
+    const common = {
+      toolCallId: params.toolCallId,
+      status: params.status,
+      ...(params.locations ? { locations: params.locations } : {}),
+      ...(params.rawInput === undefined ? {} : { rawInput: params.rawInput })
+    }
+    this.emit(
+      params.existing
+        ? { sessionUpdate: 'tool_call_update' as const, ...common }
+        : {
+            sessionUpdate: 'tool_call' as const,
+            ...common,
+            ...(params.name ? { name: params.name } : {}),
+            title: params.toolName,
+            kind: toToolKind(params.toolName)
+          }
+    )
+  }
+
+  /**
    * Pi can report progress or completion for a tool whose start event was
    * never observed. ACP requires a `tool_call` before any update for that id,
    * so synthesize one from the reporting event. Returns false once the call
@@ -1515,15 +1607,14 @@ export class PiAcpSession {
     }
 
     if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
-    this.emit({
-      sessionUpdate: 'tool_call',
+    this.emitToolCallStart({
+      existing: false,
       toolCallId,
-      ...(name ? { name } : {}),
-      title: toolName,
-      kind: toToolKind(toolName),
+      name,
+      toolName,
       status: 'in_progress',
-      ...(locations ? { locations } : {}),
-      ...(args === undefined ? {} : { rawInput: args })
+      locations,
+      rawInput: args
     })
     return true
   }
@@ -1540,19 +1631,20 @@ export class PiAcpSession {
     this.subagentToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
     this.genericBashEmittedMeasure.delete(toolCallId)
-    this.genericBashContent.delete(toolCallId)
+    this.genericBashSnapshots.delete(toolCallId)
   }
 
   private terminalizeToolCalls(): void {
     for (const toolCallId of this.currentToolCalls.keys()) {
       // A generic bash card keeps the latest known output — some of it may
       // only exist in a snapshot coalescing suppressed.
-      const content = this.genericBashContent.get(toolCallId)
+      const snapshot = this.genericBashSnapshots.get(toolCallId)
+      const content = snapshot === undefined ? [] : bashOrderedContent(snapshot)
       this.emit({
         sessionUpdate: 'tool_call_update',
         toolCallId,
         status: 'failed',
-        ...(content ? { content } : {}),
+        ...(content.length ? { content } : {}),
         ...(this.bashToolCallIds.has(toolCallId) && this.supportsTerminalOutputMeta
           ? { _meta: bashTerminalExitMeta(toolCallId, 1) }
           : {})
@@ -1566,7 +1658,7 @@ export class PiAcpSession {
     this.subagentToolCallIds.clear()
     this.bashOutputSnapshots.clear()
     this.genericBashEmittedMeasure.clear()
-    this.genericBashContent.clear()
+    this.genericBashSnapshots.clear()
   }
 
   private startTurn(t: QueuedPrompt): void {
@@ -1601,11 +1693,7 @@ export class PiAcpSession {
     // them buffered until dispatch so its content does not leak into this turn.
     if (!this.piBusyOutOfBand) this.sendPendingCustomMessages()
 
-    // Publish queue depth (0 because we're starting the turn now).
-    this.emit({
-      sessionUpdate: 'session_info_update',
-      _meta: { piAcp: { queueDepth: this.turnQueue.length, running: true } }
-    })
+    this.publishQueueState(true, this.turnQueue.length)
 
     // Kick off pi. The RPC `prompt` response only means the prompt was
     // accepted, queued, or handled — execution events continue streaming
@@ -1842,13 +1930,6 @@ export class PiAcpSession {
         // blocked. Capture and flush them after closing the queue, before settling
         // either the failed request or any drained queued requests.
         void this.flushEmits().finally(() => {
-          const failQueued = (error: unknown) => {
-            for (const entry of queued) {
-              if (entry.kind === 'prompt') entry.reject(error)
-              else entry.fail(error)
-            }
-          }
-
           if (cancelled) {
             // ACP cancellation semantics dominate all underlying failures,
             // including auth-looking stderr from a process being torn down.
@@ -1859,18 +1940,13 @@ export class PiAcpSession {
             // than masquerade as a successful end_turn.
             const failure = this.toTurnFailure(err)
             turn.reject(failure)
-            failQueued(failure)
+            this.rejectQueued(queued, failure)
           }
 
           // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
           // new prompt can start after the atomic queue close above; in that case
           // its own running metadata is authoritative and must not be overwritten.
-          if (!this.isBusy()) {
-            this.emit({
-              sessionUpdate: 'session_info_update',
-              _meta: { piAcp: { queueDepth: 0, running: false } }
-            })
-          }
+          if (!this.isBusy()) this.publishQueueState(false, 0)
         })
       })
   }
@@ -1995,17 +2071,14 @@ export class PiAcpSession {
       if (this.lowLevelAgentEnded && this.piQueueHasMessages) this.continuationExpected = true
     }
 
-    if (type === 'auto_retry_start' || type === 'auto_compaction_start' || type === 'compaction_start') {
+    if (type === 'auto_retry_start' || type === 'compaction_start') {
       // These events are explicit Pi promises that another low-level start
       // belongs to the same AgentSession run. Some supported versions emit the
       // marker before their corresponding agent_end, so do not key it on the
       // local end flag.
       this.continuationExpected = true
     }
-    if (
-      (type === 'compaction_end' || type === 'auto_compaction_end') &&
-      (ev as { willRetry?: unknown }).willRetry !== true
-    ) {
+    if (type === 'compaction_end' && (ev as { willRetry?: unknown }).willRetry !== true) {
       this.continuationExpected = false
     }
 
@@ -2091,7 +2164,6 @@ export class PiAcpSession {
       case 'message_update': {
         const ame = ev.assistantMessageEvent as PiAssistantMessageEvent | undefined
 
-        // Stream assistant text.
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
           this.emit({
             sessionUpdate: 'agent_message_chunk',
@@ -2191,24 +2263,15 @@ export class PiAcpSession {
                 locations,
                 includeTerminal: !existingStatus
               })
-            } else if (!existingStatus) {
-              this.currentToolCalls.set(toolCallId, 'pending')
-              this.emit({
-                sessionUpdate: 'tool_call',
-                toolCallId,
-                ...(name ? { name } : {}),
-                title: toolName,
-                kind: toToolKind(toolName),
-                status,
-                locations,
-                rawInput
-              })
             } else {
-              // Best-effort: keep rawInput updated while args are streaming.
-              // Keep the existing status (pending or in_progress).
-              this.emit({
-                sessionUpdate: 'tool_call_update',
+              // A first card emits `tool_call`; later deltas keep rawInput
+              // updated while args stream, never downgrading the status.
+              if (!existingStatus) this.currentToolCalls.set(toolCallId, 'pending')
+              this.emitToolCallStart({
+                existing: Boolean(existingStatus),
                 toolCallId,
+                name,
+                toolName,
                 status,
                 locations,
                 rawInput
@@ -2219,39 +2282,6 @@ export class PiAcpSession {
           break
         }
 
-        if (ame?.type === 'done') {
-          if (!ownsPiTurn && (this.piBusyOutOfBand || turn)) break
-          const reason = typeof ame.reason === 'string' ? ame.reason : null
-          // A known successful completion supersedes a provisional error from
-          // an attempt that pi recovered via retry or compaction. Unknown future
-          // reasons must not accidentally erase a real failure.
-          if (reason === 'stop' || reason === 'length' || reason === 'toolUse') {
-            this.turnFailure = null
-          }
-          // Only the latest message boundary counts: a mid-turn 'length' stop
-          // followed by a continued run that ends with 'stop' is not truncation.
-          this.lastDoneReason = reason
-          break
-        }
-
-        if (ame?.type === 'error') {
-          if (!ownsPiTurn && (this.piBusyOutOfBand || turn)) break
-          const reason = typeof ame.reason === 'string' ? ame.reason : 'error'
-          const errorMessage = (ame as { error?: { errorMessage?: unknown } })?.error?.errorMessage
-          const detail = typeof errorMessage === 'string' && errorMessage ? `: ${errorMessage}` : ''
-          if (reason === 'aborted') {
-            // Only a client-driven cancellation may map an abort to the ACP
-            // `cancelled` stop reason; anything else is a failed turn.
-            if (!this.cancelRequested) {
-              this.turnFailure ??= new Error(`pi aborted the run unexpectedly${detail}`)
-            }
-          } else {
-            this.turnFailure ??= new Error(`pi run failed${detail}`)
-          }
-          break
-        }
-
-        // Ignore other delta/event types for now.
         break
       }
 
@@ -2289,8 +2319,9 @@ export class PiAcpSession {
             message.stopReason === 'toolUse'
           ) {
             // A known successful completion supersedes a provisional error
-            // from an attempt that pi recovered via retry or compaction.
-            // Only the latest boundary counts, like the `done` event path.
+            // from an attempt that pi recovered via retry or compaction. Only
+            // the latest boundary counts: a mid-turn 'length' stop followed by
+            // a continued run that ends with 'stop' is not truncation.
             this.turnFailure = null
             this.lastDoneReason = message.stopReason
           }
@@ -2350,11 +2381,12 @@ export class PiAcpSession {
           this.fileMutationToolCallIds.add(toolCallId)
           const p = getToolPath(args)
           if (p) {
+            // ACP Diff requires an absolute path; pi may report a cwd-relative one.
             const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
             snapshotOldText = fileSnapshot(abs)
             if (snapshotOldText !== undefined) {
               this.fileSnapshots.set(toolCallId, {
-                path: p,
+                path: abs,
                 oldText: snapshotOldText
               })
               if (toolName === 'edit' && snapshotOldText !== null) {
@@ -2370,28 +2402,17 @@ export class PiAcpSession {
         const locations = toToolCallLocations(toolName, args, this.cwd, line)
 
         // If we already surfaced the tool call while the model streamed it, just transition.
-        if (!this.currentToolCalls.has(toolCallId)) {
-          this.currentToolCalls.set(toolCallId, 'in_progress')
-          this.emit({
-            sessionUpdate: 'tool_call',
-            toolCallId,
-            ...(typeof ev.toolName === 'string' && ev.toolName ? { name: ev.toolName } : {}),
-            title: toolName,
-            kind: toToolKind(toolName),
-            status: 'in_progress',
-            locations,
-            rawInput: args
-          })
-        } else {
-          this.currentToolCalls.set(toolCallId, 'in_progress')
-          this.emit({
-            sessionUpdate: 'tool_call_update',
-            toolCallId,
-            status: 'in_progress',
-            locations,
-            rawInput: args
-          })
-        }
+        const existingCard = this.currentToolCalls.has(toolCallId)
+        this.currentToolCalls.set(toolCallId, 'in_progress')
+        this.emitToolCallStart({
+          existing: existingCard,
+          toolCallId,
+          name: typeof ev.toolName === 'string' && ev.toolName ? ev.toolName : null,
+          toolName,
+          status: 'in_progress',
+          locations,
+          rawInput: args
+        })
 
         break
       }
@@ -2446,24 +2467,17 @@ export class PiAcpSession {
         let hasStructuredDiff = false
 
         if (!isError && snapshot) {
-          try {
-            const abs = isAbsolute(snapshot.path) ? snapshot.path : resolvePath(this.cwd, snapshot.path)
-            const newText = fileSnapshot(abs)
-            if (typeof newText === 'string' && (snapshot.oldText === null || newText !== snapshot.oldText)) {
-              hasStructuredDiff = true
-              content = [
-                {
-                  // ACP Diff requires an absolute path; pi may report a
-                  // cwd-relative one.
-                  type: 'diff',
-                  path: abs,
-                  oldText: snapshot.oldText,
-                  newText
-                }
-              ]
-            }
-          } catch {
-            // ignore; fall back to text only
+          const newText = fileSnapshot(snapshot.path)
+          if (typeof newText === 'string' && (snapshot.oldText === null || newText !== snapshot.oldText)) {
+            hasStructuredDiff = true
+            content = [
+              {
+                type: 'diff',
+                path: snapshot.path,
+                oldText: snapshot.oldText,
+                newText
+              }
+            ]
           }
         }
 
@@ -2542,29 +2556,6 @@ export class PiAcpSession {
         break
       }
 
-      // Legacy event names kept for compatibility with older pi versions.
-      case 'auto_compaction_start': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Context nearing limit, running automatic compaction...'
-          } satisfies ContentBlock
-        })
-        break
-      }
-
-      case 'auto_compaction_end': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text: 'Automatic compaction finished; context was summarized to continue the session.'
-          } satisfies ContentBlock
-        })
-        break
-      }
-
       case 'agent_start': {
         const activeTurn = this.pendingTurn
         const initialOwnedStart = Boolean(
@@ -2607,12 +2598,6 @@ export class PiAcpSession {
         }
         this.lowLevelAgentEnded = false
         if (this.piBusyOutOfBand && !this.lifecycleAmbiguity) this.sendPendingCustomMessages()
-        break
-      }
-
-      case 'turn_end': {
-        // pi uses `turn_end` for sub-steps (e.g. tool_use) and will often start another turn.
-        // Do NOT resolve the ACP `session/prompt` here.
         break
       }
 
@@ -2780,13 +2765,11 @@ export class PiAcpSession {
       return
     }
 
-    if (method === 'setWidget' && ev.widgetKey === 'pi-acp-lifecycle') {
+    if (method === 'setWidget' && ev.widgetKey === ACP_LIFECYCLE_WIDGET) {
       const turn = this.pendingTurn
       try {
-        const lines = ev.widgetLines
-        if (!Array.isArray(lines) || lines.length !== 1 || typeof lines[0] !== 'string') return
-        const state = JSON.parse(lines[0]) as { version?: unknown; owner?: unknown; state?: unknown; error?: unknown }
-        if (!turn || turn.completionStarted || state.version !== 1 || state.owner !== turn.owner) return
+        const state = decodeLifecycleWidget(ev)
+        if (!state || !turn || turn.completionStarted || state.owner !== turn.owner) return
         if (state.state === 'ready') {
           const deferred = this.deferredDispatch
           if (deferred?.turn === turn && !this.piBusyOutOfBand) {

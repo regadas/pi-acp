@@ -1,8 +1,9 @@
 import { agent as acpAgent, methods, RequestError, type AgentApp } from '@agentclientprotocol/sdk/unstable'
 import { agentProtocolRouter, type AgentProtocolRouter } from '@agentclientprotocol/sdk/experimental/v2'
-import { PiAcpAgent, runPromptWithCancellation } from './agent.js'
+import { PiAcpAgent } from './agent.js'
 import { ClientConnection } from './client.js'
 import { createPiAcpV2AgentApp } from './v2/app.js'
+import type { SessionStore } from './session-store.js'
 
 /**
  * Builds the ACP agent app with exactly the methods this adapter implements
@@ -10,7 +11,11 @@ import { createPiAcpV2AgentApp } from './v2/app.js'
  * created per connection in `onConnect` because it needs the
  * connection-scoped client peer handle.
  */
-export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null) => void }): AgentApp {
+export function createPiAcpAgentApp(opts?: {
+  onAgent?: (agent: PiAcpAgent | null) => void
+  /** Injects the session store backing list/load/delete (tests use temp stores). */
+  store?: SessionStore
+}): AgentApp {
   let active: PiAcpAgent | null = null
   // ACP wire state is connection-scoped. `initializing` closes the race where
   // two concurrent initialize requests both observed a false boolean.
@@ -31,7 +36,7 @@ export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null
 
   return acpAgent({ name: 'pi-acp' })
     .onConnect(connection => {
-      const agent = new PiAcpAgent(new ClientConnection(connection.client))
+      const agent = new PiAcpAgent(new ClientConnection(connection.client), opts?.store)
       active = agent
       initializeState = 'uninitialized'
       opts?.onAgent?.(agent)
@@ -77,9 +82,7 @@ export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null
     .onRequest(methods.agent.session.close, ctx => getInitializedAgent().closeSession(ctx.params))
     .onRequest(methods.agent.session.delete, ctx => getInitializedAgent().deleteSession(ctx.params))
     .onRequest(methods.agent.session.setConfigOption, ctx => getInitializedAgent().setSessionConfigOption(ctx.params))
-    .onRequest(methods.agent.session.prompt, ctx =>
-      runPromptWithCancellation(getInitializedAgent(), ctx.params, ctx.signal)
-    )
+    .onRequest(methods.agent.session.prompt, ctx => getInitializedAgent().prompt(ctx.params, ctx.signal))
     .onNotification(methods.agent.session.cancel, ctx => getInitializedAgent().cancel(ctx.params))
 }
 
@@ -92,6 +95,7 @@ export function createPiAcpAgentApp(opts?: { onAgent?: (agent: PiAcpAgent | null
  */
 export function createPiAcpProtocolRouter(opts?: {
   onAgent?: (agent: PiAcpAgent | null) => void
+  store?: SessionStore
 }): AgentProtocolRouter {
   return agentProtocolRouter().withV1(createPiAcpAgentApp(opts)).withV2(createPiAcpV2AgentApp(opts))
 }

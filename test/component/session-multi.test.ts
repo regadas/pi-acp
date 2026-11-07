@@ -14,17 +14,13 @@ test('SessionManager: independent sessions stay active side by side until explic
 
   const a = manager.getOrCreate('session-a', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: procA as any,
-    fileCommands: []
+    proc: procA as any
   })
   const b = manager.getOrCreate('session-b', {
     cwd: process.cwd(),
-    mcpServers: [],
     conn: asAgentConn(conn),
-    proc: procB as any,
-    fileCommands: []
+    proc: procB as any
   })
 
   // The single-live-subprocess policy is gone for good.

@@ -63,10 +63,8 @@ function makeSession(conn: GatedConnection, proc: FakePiRpcProcess): PiAcpSessio
   return new PiAcpSession({
     sessionId: 's1',
     cwd: process.cwd(),
-    mcpServers: [],
     proc: proc as unknown as PiRpcProcess,
-    conn: asAgentConn(conn),
-    fileCommands: FILE_COMMANDS
+    conn: asAgentConn(conn)
   })
 }
 

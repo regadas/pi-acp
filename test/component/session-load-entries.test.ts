@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { PiAcpAgent } from '../../src/acp/agent.js'
+import type { SessionStore } from '../../src/acp/session-store.js'
 import { PiAcpSession } from '../../src/acp/session.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
@@ -41,8 +42,7 @@ async function loadWith(snapshot: unknown, supportsTerminalOutputMeta = false): 
   ;(PiRpcProcess as any).spawn = mockSpawn(snapshot)
   try {
     const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
     await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: supportsTerminalOutputMeta ? { _meta: { terminal_output: true } } : {}
@@ -405,8 +405,7 @@ test('PiAcpAgent: loadSession fails clearly on malformed entry snapshots instead
 
   for (const [label, snapshot] of Object.entries({ missingLeaf, duplicate, cycle })) {
     const conn = new FakeAgentSideConnection()
-    const agent = new PiAcpAgent(asAgentConn(conn))
-    ;(agent as any).store = new FakeStore()
+    const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
     const originalSpawn = PiRpcProcess.spawn
     ;(PiRpcProcess as any).spawn = mockSpawn(snapshot)
     try {
@@ -426,8 +425,7 @@ test('PiAcpAgent: loadSession fails clearly on malformed entry snapshots instead
 
 test('PiAcpAgent: loadSession replays an empty session (null leaf) without updates', async () => {
   const conn = new FakeAgentSideConnection()
-  const agent = new PiAcpAgent(asAgentConn(conn))
-  ;(agent as any).store = new FakeStore()
+  const agent = new PiAcpAgent(asAgentConn(conn), new FakeStore() as unknown as SessionStore)
   const originalSpawn = PiRpcProcess.spawn
   ;(PiRpcProcess as any).spawn = mockSpawn({ entries: [], leafId: null })
   try {
