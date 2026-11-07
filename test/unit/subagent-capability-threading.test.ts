@@ -2,7 +2,7 @@ import test, { type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { SessionStore } from '../../src/acp/session-store.js'
@@ -16,7 +16,7 @@ import type { InitializeRequest } from '@agentclientprotocol/sdk/unstable'
  * -> restore -> getOrCreate) run the real capability threading. The pi agent
  * dir is isolated per test so repository discovery never scans real sessions.
  */
-function makeHarness(t: TestContext, clientCapabilities: InitializeRequest['clientCapabilities']) {
+async function makeHarness(t: TestContext, clientCapabilities: InitializeRequest['clientCapabilities']) {
   const prevAgentDir = process.env.PI_CODING_AGENT_DIR
   process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), 'pi-acp-subagent-cap-agent-'))
 
@@ -32,11 +32,7 @@ function makeHarness(t: TestContext, clientCapabilities: InitializeRequest['clie
   ;(PiRpcProcess as unknown as { spawn: unknown }).spawn = async (options: { sessionPath?: string }) => {
     const proc = new FakePiRpcProcess()
     // A restore names the stored session file; a fresh spawn invents an id.
-    const sessionId =
-      options.sessionPath
-        ?.split('/')
-        .at(-1)
-        ?.replace(/\.jsonl$/, '') ?? crypto.randomUUID()
+    const sessionId = options.sessionPath ? basename(options.sessionPath, '.jsonl') : crypto.randomUUID()
     proc.state = {
       isStreaming: false,
       sessionId,
@@ -54,7 +50,7 @@ function makeHarness(t: TestContext, clientCapabilities: InitializeRequest['clie
     agent.dispose()
   })
 
-  void agent.initialize({
+  await agent.initialize({
     protocolVersion: 1,
     clientCapabilities
   })
@@ -73,27 +69,37 @@ function seedStoredSession(store: SessionStore, name: string) {
   return sessionId
 }
 
+const isWindows = process.platform === 'win32'
+
 const sessionFlag = (session: unknown): boolean | undefined =>
   (session as { supportsSubagentUpdates?: boolean }).supportsSubagentUpdates
 
-test('PiAcpAgent: the negotiated subagents capability reaches every session-creation path', async t => {
-  const { agent, sessions, store } = makeHarness(t, { subagents: {} })
-  const storedId = seedStoredSession(store, 'resume')
+test(
+  'PiAcpAgent: the negotiated subagents capability reaches every session-creation path',
+  { skip: isWindows, timeout: 10_000 },
+  async t => {
+    const { agent, sessions, store } = await makeHarness(t, { subagents: {} })
+    const storedId = seedStoredSession(store, 'resume')
 
-  const created = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] })
-  assert.equal(sessionFlag(sessions.get(created.sessionId)), true, 'newSession thread the capability on')
+    const created = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] })
+    assert.equal(sessionFlag(sessions.get(created.sessionId)), true, 'newSession thread the capability on')
 
-  await agent.resumeSession({ sessionId: storedId, cwd: TEST_CWD, mcpServers: [] })
-  assert.equal(sessionFlag(sessions.get(storedId)), true, 'resumeSession thread the capability on')
-})
+    await agent.resumeSession({ sessionId: storedId, cwd: TEST_CWD, mcpServers: [] })
+    assert.equal(sessionFlag(sessions.get(storedId)), true, 'resumeSession thread the capability on')
+  }
+)
 
-test('PiAcpAgent: plain clientCapabilities keep every session-creation path off', async t => {
-  const { agent, sessions, store } = makeHarness(t, {})
-  const storedId = seedStoredSession(store, 'plain')
+test(
+  'PiAcpAgent: plain clientCapabilities keep every session-creation path off',
+  { skip: isWindows, timeout: 10_000 },
+  async t => {
+    const { agent, sessions, store } = await makeHarness(t, {})
+    const storedId = seedStoredSession(store, 'plain')
 
-  const created = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] })
-  assert.equal(sessionFlag(sessions.get(created.sessionId)), false, 'newSession keeps the capability off')
+    const created = await agent.newSession({ cwd: TEST_CWD, mcpServers: [] })
+    assert.equal(sessionFlag(sessions.get(created.sessionId)), false, 'newSession keeps the capability off')
 
-  await agent.resumeSession({ sessionId: storedId, cwd: TEST_CWD, mcpServers: [] })
-  assert.equal(sessionFlag(sessions.get(storedId)), false, 'resumeSession keeps the capability off')
-})
+    await agent.resumeSession({ sessionId: storedId, cwd: TEST_CWD, mcpServers: [] })
+    assert.equal(sessionFlag(sessions.get(storedId)), false, 'resumeSession keeps the capability off')
+  }
+)

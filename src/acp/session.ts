@@ -2918,9 +2918,11 @@ export class PiAcpSession {
   /** A settled turn can no longer observe its children: untrack and unknown the running ones. */
   private settleSubagentChildren(): void {
     const tracked = this.subagentChildren
-    if (!tracked) return
     this.subagentChildren = null
+    // Cleared even when nothing was tracked: a future mid-turn map reset
+    // must never leak messaged ids into the next turn.
     this.subagentMessaged.clear()
+    if (!tracked) return
     for (const [id, running] of tracked) {
       if (running) this.emit(subagentUnknownUpdate(id))
     }

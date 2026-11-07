@@ -67,8 +67,6 @@ const isNodeKind = (value: string): value is SubagentNodeKind =>
 export function decodeSubagentSnapshotWidget(widgetLines: unknown): DecodedSubagentSnapshot | null {
   const lines = Array.isArray(widgetLines) ? widgetLines.filter(line => typeof line === 'string') : []
   const encoded = lines.find(line => line.startsWith(SNAPSHOT_WIDGET_PREFIX))
-  // Absent or stringless lines mean the widget was cleared; a non-empty
-  // payload that carries no snapshot prefix is foreign data, not a clear.
   if (encoded === undefined) return lines.length ? null : { runs: [] }
   try {
     const parsed = JSON.parse(encoded.slice(SNAPSHOT_WIDGET_PREFIX.length)) as Record<string, unknown>

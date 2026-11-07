@@ -51,6 +51,7 @@ test('auxiliary probe docs pin the exact stock revision the eval scripts verify'
   assert.ok(doc.includes('PI_ACP_EVAL_SUBAGENTS'), 'docs must name the stock checkout variable')
   assert.ok(doc.includes('eval:subagents:completion'), 'docs must list the completion probe')
   assert.ok(doc.includes('eval:subagents:cancel'), 'docs must list the cancel probe')
+  assert.ok(doc.includes('eval:subagents:telemetry'), 'docs must list the telemetry probe')
   for (const probe of ['eval-subagents-completion', 'eval-subagents-cancel', 'eval-subagents-telemetry']) {
     const match = readFileSync(join(repoRoot, 'scripts', `${probe}.mjs`), 'utf8').match(
       /STOCK_REVISION = '([0-9a-f]{40})'/

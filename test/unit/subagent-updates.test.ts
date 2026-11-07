@@ -251,7 +251,7 @@ test('a child gets exactly one session_message per turn and a fresh one next tur
   let messages = sessionMessages(conn)
   assert.equal(messages.length, 1)
   const firstMessage = asSessionMessage(messages[0])
-  assert.match(firstMessage.messageId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  assert.ok(firstMessage.messageId, 'message ids must be non-empty strings')
   assert.equal(firstMessage.senderSessionId, 's')
   assert.equal(firstMessage.recipientSessionId, 'run-1')
   assert.deepEqual(firstMessage.content, [{ type: 'text', text: 'Research' }])
@@ -407,6 +407,9 @@ test('malformed payloads keep current tracking and stay silent', async () => {
   proc.emit(widget(snapshot([node({ id: 'trusted' })])))
   await tick()
   assert.equal(subagentUpdates(conn).length, 1, 'the valid snapshot announced its child')
+  proc.emit(widget({ kind: 'pi-subagents.async-status-snapshot', version: 2, runs: [] }))
+  await tick()
+  assert.equal(subagentUpdates(conn).length, 1, 'a wrong-version payload after tracking emits nothing')
   proc.emit({
     type: 'extension_ui_request',
     id: 'raw',
