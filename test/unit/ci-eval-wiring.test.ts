@@ -13,7 +13,8 @@ test('npm scripts expose the real-pi eval bridge and the manual stock-subagents 
   for (const [script, file] of [
     ['eval:acp', 'scripts/eval-acp-client.mjs'],
     ['eval:subagents:completion', 'scripts/eval-subagents-completion.mjs'],
-    ['eval:subagents:cancel', 'scripts/eval-subagents-cancel.mjs']
+    ['eval:subagents:cancel', 'scripts/eval-subagents-cancel.mjs'],
+    ['eval:subagents:telemetry', 'scripts/eval-subagents-telemetry.mjs']
   ] as const) {
     assert.ok(typeof scripts[script] === 'string', `${script} must be a discoverable npm script`)
     assert.ok(scripts[script].includes(file), `${script} must run ${file}`)
@@ -50,7 +51,7 @@ test('auxiliary probe docs pin the exact stock revision the eval scripts verify'
   assert.ok(doc.includes('PI_ACP_EVAL_SUBAGENTS'), 'docs must name the stock checkout variable')
   assert.ok(doc.includes('eval:subagents:completion'), 'docs must list the completion probe')
   assert.ok(doc.includes('eval:subagents:cancel'), 'docs must list the cancel probe')
-  for (const probe of ['eval-subagents-completion', 'eval-subagents-cancel']) {
+  for (const probe of ['eval-subagents-completion', 'eval-subagents-cancel', 'eval-subagents-telemetry']) {
     const match = readFileSync(join(repoRoot, 'scripts', `${probe}.mjs`), 'utf8').match(
       /STOCK_REVISION = '([0-9a-f]{40})'/
     )
@@ -60,7 +61,7 @@ test('auxiliary probe docs pin the exact stock revision the eval scripts verify'
 })
 
 test('stock-subagents probes refuse to run without the pinned checkout', () => {
-  for (const probe of ['eval-subagents-completion.mjs', 'eval-subagents-cancel.mjs']) {
+  for (const probe of ['eval-subagents-completion.mjs', 'eval-subagents-cancel.mjs', 'eval-subagents-telemetry.mjs']) {
     const result = spawnSync(process.execPath, [join(repoRoot, 'scripts', probe)], {
       encoding: 'utf8',
       env: { ...process.env, PI_ACP_EVAL_SUBAGENTS: '' },

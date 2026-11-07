@@ -12,12 +12,11 @@ const SNAPSHOT_VERSION = 1
 // The stock bounds depth at 3; untrusted payloads get a hard cycle guard.
 const MAX_TREE_DEPTH = 32
 
-export type SubagentNodeState =
-  'queued' | 'running' | 'complete' | 'failed' | 'partial' | 'paused' | 'stopped' | 'rejected'
+type SubagentNodeState = 'queued' | 'running' | 'complete' | 'failed' | 'partial' | 'paused' | 'stopped' | 'rejected'
 
-export type SubagentNodeKind = 'subagent' | 'workflow' | 'step' | 'host-step'
+type SubagentNodeKind = 'subagent' | 'workflow' | 'step' | 'host-step'
 
-export type SubagentSnapshotNode = {
+type SubagentSnapshotNode = {
   id: string
   kind: SubagentNodeKind
   label: string
@@ -29,14 +28,14 @@ export type SubagentSnapshotNode = {
   children?: SubagentSnapshotNode[]
 }
 
-export type SubagentSnapshotOmitted = { runs: number; children: number; byteLimitExceeded: boolean }
+type SubagentSnapshotOmitted = { runs: number; children: number; byteLimitExceeded: boolean }
 
-export type DecodedSubagentSnapshot = {
+type DecodedSubagentSnapshot = {
   runs: SubagentSnapshotNode[]
   omitted?: SubagentSnapshotOmitted
 }
 
-export type SubagentChild = {
+type SubagentChild = {
   id: string
   kind: 'subagent' | 'workflow' | 'step'
   parentId: string | null
@@ -60,14 +59,17 @@ const isNodeKind = (value: string): value is SubagentNodeKind =>
   value === 'subagent' || value === 'workflow' || value === 'step' || value === 'host-step'
 
 /**
- * Decode the `subagent-async` widget lines. Absent or empty lines mean the
- * widget was cleared (an empty snapshot); a present-but-malformed payload
- * returns null so the caller keeps its current tracking untouched.
+ * Decode the `subagent-async` widget lines. Absent or stringless lines mean
+ * the widget was cleared (an empty snapshot); a present payload that carries
+ * no snapshot prefix or fails validation returns null so the caller keeps its
+ * current tracking untouched.
  */
 export function decodeSubagentSnapshotWidget(widgetLines: unknown): DecodedSubagentSnapshot | null {
   const lines = Array.isArray(widgetLines) ? widgetLines.filter(line => typeof line === 'string') : []
   const encoded = lines.find(line => line.startsWith(SNAPSHOT_WIDGET_PREFIX))
-  if (encoded === undefined) return { runs: [] }
+  // Absent or stringless lines mean the widget was cleared; a non-empty
+  // payload that carries no snapshot prefix is foreign data, not a clear.
+  if (encoded === undefined) return lines.length ? null : { runs: [] }
   try {
     const parsed = JSON.parse(encoded.slice(SNAPSHOT_WIDGET_PREFIX.length)) as Record<string, unknown>
     if (parsed.kind !== SNAPSHOT_KIND || parsed.version !== SNAPSHOT_VERSION || !Array.isArray(parsed.runs)) return null

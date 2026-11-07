@@ -210,13 +210,15 @@ and then tolerates only the exit-0/exit-1
 conformance verdicts in the TCK step — re-raising harness/setup/timeout failures (exit 3) and any
 build/launcher failure — and uploads the report with
 `always()`; it never gates a required job.
-`npm run eval:subagents:completion` and `npm run eval:subagents:cancel` are explicit manual probes, not CI
-coverage: they additionally require `PI_ACP_EVAL_SUBAGENTS` pointing at a clean `nicobailon/pi-subagents`
-git-main checkout at revision `29284cd943c0c7ee852593c6e02d2a60febf6ba4` (declared entry `./index.ts`).
-The scripts verify that exact revision and a clean checkout, and never install or mutate the checkout, so
-an unpinned or dirty one is rejected. `PI_ACP_EVAL_PI` overrides the pi executable, `PI_ACP_EVAL_LOG_DIR`
-collects traces, and `PI_ACP_EVAL_KEEP` (completion probe) retains the disposable root. They drive the
-stock subagents runner with deterministic local providers — no provider network.
+`npm run eval:subagents:completion`, `npm run eval:subagents:cancel` and `npm run eval:subagents:telemetry`
+are explicit manual probes, not CI coverage: they additionally require `PI_ACP_EVAL_SUBAGENTS` pointing at a clean
+`nicobailon/pi-subagents` git-main checkout (declared entry `./index.ts`). The completion and cancel probes pin
+revision `29284cd943c0c7ee852593c6e02d2a60febf6ba4`; the telemetry probe pins
+`de6957becc859561f74195c8c0a0a717831e6b95`, the newer git-main revision whose `subagent-async` widget snapshot
+surface it exercises. The scripts verify that exact revision and a clean checkout, and never install or mutate
+the checkout, so an unpinned or dirty one is rejected. `PI_ACP_EVAL_PI` overrides the pi executable,
+`PI_ACP_EVAL_LOG_DIR` collects traces, and `PI_ACP_EVAL_KEEP` (completion probe) retains the disposable root.
+They drive the stock subagents runner with deterministic local providers — no provider network.
 After `npm run build`, the other `scripts/smoke-*.mjs` entrypoints are manual probes, not CI coverage.
 Use disposable `PI_CODING_AGENT_DIR`, `PI_ACP_DIR`, and `PI_CODING_AGENT_SESSION_DIR` directories.
 `smoke-compact.mjs`, `smoke-export.mjs`, and `smoke-acp-load.mjs` can generate provider traffic and require

@@ -338,10 +338,13 @@ export class PiAcpSession {
   // terminal failure can still show output that coalescing suppressed.
   private genericBashContent = new Map<string, ToolCallContent[]>()
 
-  // pi-subagents children announced for the pending turn (announced id ->
-  // per-turn message + last running state). Nulled when the turn settles.
-  private subagentChildren: Map<string, { messaged: boolean; running: boolean }> | null = null
-  private subagentMessageSequence = 0
+  // pi-subagents children observed for the pending turn (id -> last emitted
+  // running state). Nulled when the turn settles.
+  private subagentChildren: Map<string, boolean> | null = null
+  // Children that already received their one session_message this turn. It
+  // survives disappearance (unlike the observable map) so a child that
+  // reappears in a later snapshot is not messaged twice in the same turn.
+  private readonly subagentMessaged = new Set<string>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -2894,16 +2897,20 @@ export class PiAcpSession {
     for (const child of collectSubagentChildren(snapshot.runs)) {
       seen.add(child.id)
       this.emit(subagentUpdateFor(child, snapshot.omitted))
-      if (!tracked.get(child.id)?.messaged) {
-        this.subagentMessageSequence += 1
-        this.emit(subagentAnnouncementMessage(`pi-subagents-${this.subagentMessageSequence}`, this.sessionId, child))
+      if (!this.subagentMessaged.has(child.id)) {
+        this.subagentMessaged.add(child.id)
+        // Message ids must be unique across every replacement session that
+        // ever served this ACP sessionId: session_message is a transcript
+        // upsert keyed by messageId, so a reused id would overwrite history.
+        this.emit(subagentAnnouncementMessage(crypto.randomUUID(), this.sessionId, child))
       }
-      tracked.set(child.id, { messaged: true, running: child.state.state === 'running' })
+      tracked.set(child.id, child.state.state === 'running')
     }
     for (const id of [...tracked.keys()]) {
       if (seen.has(id)) continue
-      // Leaving the snapshot is not a completion: never claim idle.
-      this.emit(subagentUnknownUpdate(id))
+      // Leaving the snapshot is not a completion: never claim idle. A child
+      // already reported idle keeps that state; only running ones go unknown.
+      if (tracked.get(id)) this.emit(subagentUnknownUpdate(id))
       tracked.delete(id)
     }
   }
@@ -2913,8 +2920,9 @@ export class PiAcpSession {
     const tracked = this.subagentChildren
     if (!tracked) return
     this.subagentChildren = null
-    for (const [id, entry] of tracked) {
-      if (entry.running) this.emit(subagentUnknownUpdate(id))
+    this.subagentMessaged.clear()
+    for (const [id, running] of tracked) {
+      if (running) this.emit(subagentUnknownUpdate(id))
     }
   }
 

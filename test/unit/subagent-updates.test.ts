@@ -228,18 +228,33 @@ test('a child gets exactly one session_message per turn and a fresh one next tur
   const { conn, proc, session } = harness(true)
   const first = ownedTurn(proc, session, 'first')
   proc.emit(widget(snapshot([node({ id: 'run-1', label: 'Research' })])))
+  await tick()
+  // Protocol ordering MUST: the child's announcement update precedes the
+  // session_message naming the child, so clients can render the card.
+  const indexOf = (predicate: (update: SessionUpdateMsg['update']) => boolean) =>
+    conn.updates.findIndex(entry => predicate(entry.update))
+  const announceIndex = indexOf(
+    update =>
+      (update as { sessionUpdate?: string }).sessionUpdate === 'subagent_update' &&
+      (update as { sessionId?: string }).sessionId === 'run-1'
+  )
+  const messageIndex = indexOf(
+    update =>
+      (update as { sessionUpdate?: string }).sessionUpdate === 'session_message' &&
+      (update as { recipientSessionId?: string }).recipientSessionId === 'run-1'
+  )
+  assert.ok(announceIndex >= 0, 'the child was announced')
+  assert.ok(messageIndex > announceIndex, 'the session_message follows its child announcement')
   proc.emit(widget(snapshot([node({ id: 'run-1', label: 'Research', state: 'complete' })])))
   proc.emit({ type: 'agent_settled' })
   assert.equal(await first, 'end_turn')
   let messages = sessionMessages(conn)
   assert.equal(messages.length, 1)
-  assert.deepEqual(messages[0], {
-    sessionUpdate: 'session_message',
-    messageId: 'pi-subagents-1',
-    senderSessionId: 's',
-    recipientSessionId: 'run-1',
-    content: [{ type: 'text', text: 'Research' }]
-  })
+  const firstMessage = asSessionMessage(messages[0])
+  assert.match(firstMessage.messageId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+  assert.equal(firstMessage.senderSessionId, 's')
+  assert.equal(firstMessage.recipientSessionId, 'run-1')
+  assert.deepEqual(firstMessage.content, [{ type: 'text', text: 'Research' }])
 
   const second = ownedTurn(proc, session, 'second')
   proc.emit(widget(snapshot([node({ id: 'run-1', label: 'Research' })])))
@@ -249,6 +264,47 @@ test('a child gets exactly one session_message per turn and a fresh one next tur
   assert.equal(messages.length, 2)
   assert.equal(asSessionMessage(messages[1]).recipientSessionId, 'run-1')
   assert.notEqual(asSessionMessage(messages[1]).messageId, asSessionMessage(messages[0]).messageId)
+})
+
+test('a child that disappears and reappears within one turn is messaged only once', async () => {
+  const { conn, proc, session } = harness(true)
+  const turn = ownedTurn(proc, session)
+  proc.emit(widget(snapshot([node({ id: 'a' })])))
+  proc.emit(widget(snapshot([])))
+  proc.emit(widget(snapshot([node({ id: 'a' })])))
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await turn, 'end_turn')
+  assert.equal(sessionMessages(conn).length, 1, 'the reappearance does not message the child twice')
+  assert.deepEqual(
+    subagentUpdates(conn).map(update => [update.sessionId, update.state]),
+    [
+      ['a', { state: 'running' }],
+      ['a', { state: 'unknown' }],
+      ['a', { state: 'running' }],
+      ['a', { state: 'unknown' }]
+    ]
+  )
+})
+
+test('replacement sessions sharing an ACP session id never reuse a message id', async () => {
+  const first = harness(true)
+  const firstTurn = ownedTurn(first.proc, first.session)
+  first.proc.emit(widget(snapshot([node({ id: 'shared' })])))
+  first.proc.emit({ type: 'agent_settled' })
+  assert.equal(await firstTurn, 'end_turn')
+
+  // A later prompt on an unavailable subprocess transparently restores a
+  // replacement session under the same ACP session id; its transcript upserts
+  // are keyed by messageId, so a reused id would overwrite the earlier card.
+  const second = harness(true)
+  const secondTurn = ownedTurn(second.proc, second.session)
+  second.proc.emit(widget(snapshot([node({ id: 'shared' })])))
+  second.proc.emit({ type: 'agent_settled' })
+  assert.equal(await secondTurn, 'end_turn')
+
+  const messageIds = [first.conn, second.conn].flatMap(conn => sessionMessages(conn)).map(message => message.messageId)
+  assert.equal(messageIds.length, 2)
+  assert.notEqual(messageIds[0], messageIds[1])
 })
 
 test('settling the turn flushes only running children to unknown', async () => {
@@ -276,15 +332,44 @@ test('a child leaving the snapshot becomes unknown, never idle', async () => {
   const turn = ownedTurn(proc, session)
   proc.emit(widget(snapshot([node({ id: 'vanishing' }), node({ id: 'staying' })])))
   proc.emit(widget(snapshot([node({ id: 'staying', state: 'complete' })])))
+  await tick()
+  // The disappearance itself (not the later settle) produced the unknown.
+  assert.deepEqual(
+    subagentUpdates(conn)
+      .filter(update => update.sessionId === 'vanishing')
+      .map(update => update.state),
+    [{ state: 'running' }, { state: 'unknown' }]
+  )
   proc.emit({ type: 'agent_settled' })
   assert.equal(await turn, 'end_turn')
   const vanishing = subagentUpdates(conn).filter(update => update.sessionId === 'vanishing')
-  assert.deepEqual(
-    vanishing.map(update => update.state),
-    [{ state: 'running' }, { state: 'unknown' }]
-  )
   // The settled turn must not flush the already-untracked child again.
   assert.equal(vanishing.length, 2)
+})
+
+test('a completed child that later disappears keeps its idle state', async () => {
+  const { conn, proc, session } = harness(true)
+  const turn = ownedTurn(proc, session)
+  proc.emit(widget(snapshot([node({ id: 'finished', state: 'complete' })])))
+  await tick()
+  proc.emit(widget(snapshot([node({ id: 'other' })])))
+  await tick()
+  assert.deepEqual(
+    subagentUpdates(conn)
+      .filter(update => update.sessionId === 'finished')
+      .map(update => update.state),
+    [{ state: 'idle', stopReason: 'end_turn' }],
+    'the disappearance does not downgrade a completed child'
+  )
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await turn, 'end_turn')
+  assert.deepEqual(
+    subagentUpdates(conn)
+      .filter(update => update.sessionId === 'finished')
+      .map(update => update.state),
+    [{ state: 'idle', stopReason: 'end_turn' }],
+    'settle does not resurrect the untracked completed child either'
+  )
 })
 
 test('a cleared widget unknowns every tracked child', async () => {
@@ -292,8 +377,8 @@ test('a cleared widget unknowns every tracked child', async () => {
   const turn = ownedTurn(proc, session)
   proc.emit(widget(snapshot([node({ id: 'run-1' })])))
   proc.emit(widget())
-  proc.emit({ type: 'agent_settled' })
-  assert.equal(await turn, 'end_turn')
+  await tick()
+  // The clear itself (not the later settle) unknowns the child.
   assert.deepEqual(
     subagentUpdates(conn).map(update => [update.sessionId, update.state]),
     [
@@ -301,13 +386,27 @@ test('a cleared widget unknowns every tracked child', async () => {
       ['run-1', { state: 'unknown' }]
     ]
   )
+  proc.emit({ type: 'agent_settled' })
+  assert.equal(await turn, 'end_turn')
+  assert.deepEqual(
+    subagentUpdates(conn).map(update => [update.sessionId, update.state]),
+    [
+      ['run-1', { state: 'running' }],
+      ['run-1', { state: 'unknown' }]
+    ],
+    'settle adds nothing once the child is untracked'
+  )
 })
 
 test('malformed payloads keep current tracking and stay silent', async () => {
   const { conn, proc, session } = harness(true)
   const turn = ownedTurn(proc, session)
   proc.emit(widget({ kind: 'pi-subagents.async-status-snapshot', version: 2, runs: [] }))
+  await tick()
+  assert.equal(subagentUpdates(conn).length, 0, 'a wrong-version payload emits nothing')
   proc.emit(widget(snapshot([node({ id: 'trusted' })])))
+  await tick()
+  assert.equal(subagentUpdates(conn).length, 1, 'the valid snapshot announced its child')
   proc.emit({
     type: 'extension_ui_request',
     id: 'raw',
@@ -315,6 +414,8 @@ test('malformed payloads keep current tracking and stay silent', async () => {
     widgetKey: 'subagent-async',
     widgetLines: [`${WIDGET_PREFIX}{not json`]
   })
+  await tick()
+  assert.equal(subagentUpdates(conn).length, 1, 'a broken JSON payload emits nothing')
   proc.emit({
     type: 'extension_ui_request',
     id: 'foreign',
@@ -322,12 +423,39 @@ test('malformed payloads keep current tracking and stay silent', async () => {
     widgetKey: 'subagent-async',
     widgetLines: ['plain text']
   })
+  await tick()
+  assert.equal(subagentUpdates(conn).length, 1, 'an unprefixed payload emits nothing')
   proc.emit({ type: 'agent_settled' })
   assert.equal(await turn, 'end_turn')
-  const updates = subagentUpdates(conn)
-  assert.equal(updates.length, 2, 'only the trusted snapshot announced and settled')
-  assert.equal(updates[0] && updates[0].sessionId, 'trusted')
-  assert.equal(updates[1] && updates[1].sessionId, 'trusted')
+  // The malformed events never cleared tracking: the running child is still
+  // flushed to unknown at settlement.
+  assert.deepEqual(
+    subagentUpdates(conn).map(update => [update.sessionId, update.state]),
+    [
+      ['trusted', { state: 'running' }],
+      ['trusted', { state: 'unknown' }]
+    ]
+  )
+})
+
+test('a failed turn flushes its running children to unknown', async () => {
+  const { conn, proc, session } = harness(true)
+  const turn = ownedTurn(proc, session)
+  proc.emit(widget(snapshot([node({ id: 'doomed' })])))
+  await tick()
+  assert.equal(subagentUpdates(conn).length, 1, 'the child was announced before the failure')
+  proc.emitTermination()
+  await assert.rejects(turn)
+  await tick()
+  assert.deepEqual(
+    subagentUpdates(conn).at(-1),
+    {
+      sessionUpdate: 'subagent_update',
+      sessionId: 'doomed',
+      state: { state: 'unknown' }
+    },
+    'the failure path flushes the running child to unknown'
+  )
 })
 
 test('out-of-band widgets are ignored', async () => {

@@ -8,6 +8,8 @@ import { withSmokeAgent } from './smoke-client.mjs'
 
 // Genuine installed Pi + the operator's clean read-only git-main pi-subagents checkout.
 // The exact git revision is verified; the package version label is not runtime identity.
+// Pinned newer than the completion/cancel probes (29284cd): the subagent-async
+// widget snapshot surface this probe exercises is only present from this revision on.
 const stock = process.env.PI_ACP_EVAL_SUBAGENTS
 if (!stock) throw new Error('Set PI_ACP_EVAL_SUBAGENTS to the clean pi-subagents git checkout root')
 const STOCK_REVISION = 'de6957becc859561f74195c8c0a0a717831e6b95'
@@ -74,7 +76,8 @@ const waitFor = async (predicate, label, budget = 45_000) => {
     await sleep(25)
   }
 }
-let phaseClient
+// Per-phase clients and traces so later phases never overwrite earlier evidence.
+const phaseClients = []
 const env = {
   PATH: process.env.PATH,
   HOME: root,
@@ -119,10 +122,9 @@ child.on('exit', code => process.exit(code ?? 1));
   )
 
   // Phase 1: the subagents capability is negotiated; child sessions must surface.
-  let telemetryResult
   await withSmokeAgent(
     async client => {
-      phaseClient = client
+      phaseClients.push(client)
       await client.request('initialize', { protocolVersion: 1, clientCapabilities: { subagents: {} } })
       const { sessionId } = await client.request('session/new', { cwd: root, mcpServers: [] })
       const prompt = client.request('session/prompt', {
@@ -138,6 +140,7 @@ child.on('exit', code => process.exit(code ?? 1));
         () => subagentUpdatesOf(client).find(update => update.sessionId === childId),
         `subagent_update announcing child ${childId}`
       )
+      assert.deepEqual(announcement.state, { state: 'running' }, 'the gated child is announced as running')
       check('S_TELEMETRY', 'the async child is announced as an ACP child session', true, {
         childId,
         title: announcement.title,
@@ -149,16 +152,25 @@ child.on('exit', code => process.exit(code ?? 1));
       assert.deepEqual(announcement.capabilities, {}, 'no cancel capability is advertised')
 
       await writeFile(join(root, 'release-cancel'), 'release')
-      telemetryResult = await prompt
-      assert.equal(telemetryResult.stopReason, 'end_turn')
-
-      const childUpdates = subagentUpdatesOf(client).filter(update => update.sessionId === childId)
-      const states = new Set(childUpdates.map(update => JSON.stringify(update.state)))
-      assert.ok(childUpdates.length >= 2 && states.size >= 2, `a state transition was observed for ${childId}`)
-      check('S_TELEMETRY', 'the announced child reports a state transition', true, {
+      // Correlate the producer's own state change with the ACP mapping: the
+      // stock snapshot must report the child complete before the turn settles.
+      const completion = await wait(
+        rows =>
+          rows.find(
+            row => row.event === 'snapshot' && row.runs.some(run => run.id === childId && run.state === 'complete')
+          ),
+        `stock snapshot reporting child ${childId} complete`
+      )
+      const result = await prompt
+      assert.equal(result.stopReason, 'end_turn')
+      const settled = subagentUpdatesOf(client)
+        .filter(update => update.sessionId === childId)
+        .find(update => update.state?.state === 'idle' && update.state?.stopReason === 'end_turn')
+      assert.ok(settled, `the completed child was mapped to idle/end_turn (${JSON.stringify(completion)})`)
+      check('S_TELEMETRY', 'the producer state change is correlated with its ACP idle mapping', true, {
         childId,
-        states: [...states],
-        updates: childUpdates.length
+        producerCompleteAt: completion.at,
+        settledState: settled.state
       })
 
       const announced = new Set(subagentUpdatesOf(client).map(update => update.sessionId))
@@ -167,6 +179,7 @@ child.on('exit', code => process.exit(code ?? 1));
       const recipients = new Set(messages.map(message => message.recipientSessionId))
       assert.deepEqual([...recipients].sort(), [...announced].sort(), 'one session_message per announced child')
       assert.equal(messages.length, announced.size, 'exactly one session_message per announced child')
+      assert.equal(new Set(messages.map(message => message.messageId)).size, messages.length, 'message ids are unique')
       for (const message of messages) {
         assert.equal(message.senderSessionId, sessionId)
         assert.equal(message.content?.length, 1)
@@ -182,21 +195,35 @@ child.on('exit', code => process.exit(code ?? 1));
     { timeoutMs: 150_000, env }
   )
 
-  // Phase 2: plain capabilities; the same activity must stay invisible.
+  // Phase 2: plain capabilities; the same activity must stay invisible. The
+  // launch proof keeps the negative control from being vacuous.
   await withSmokeAgent(
     async client => {
-      phaseClient = client
+      phaseClients.push(client)
       await client.request('initialize', { protocolVersion: 1, clientCapabilities: {} })
+      // Captured before session/new: the phase-2 pi child (and its rows) does
+      // not exist yet, so its later launch row is distinguishable by pid.
+      const earlierPids = new Set((await records()).map(row => row.pid))
       const { sessionId } = await client.request('session/new', { cwd: root, mcpServers: [] })
       const result = await client.request('session/prompt', {
         sessionId,
         prompt: [{ type: 'text', text: 'S_CANCEL plain capabilities control' }]
       })
       assert.equal(result.stopReason, 'end_turn')
+      const launch = await wait(
+        rows =>
+          rows.find(
+            row =>
+              row.event === 'tool_result' && row.toolName === 'subagent' && !row.isError && !earlierPids.has(row.pid)
+          ),
+        'phase 2 stock subagent launch (the negative control saw real activity)'
+      )
       assert.equal(subagentUpdatesOf(client).length, 0, 'no subagent_update without the capability')
       assert.equal(sessionMessagesOf(client).length, 0, 'no session_message without the capability')
       check('S_TELEMETRY_PLAIN', 'plain clientCapabilities emit no child-session updates', true, {
-        stopReason: result.stopReason
+        stopReason: result.stopReason,
+        phase2ChildId: launch.details.asyncId,
+        phase2Updates: subagentUpdatesOf(client).length
       })
       await client.request('session/close', { sessionId }).catch(() => {})
     },
@@ -206,14 +233,30 @@ child.on('exit', code => process.exit(code ?? 1));
   verifyStock('after tests')
   console.log(JSON.stringify({ identity, checks }, null, 2))
 } finally {
-  // No phaseClient reset: this top-level script exits after the finally block.
-  const acpMessages = phaseClient ? [...phaseClient.messages] : []
+  // Release every gate first so a failed phase cannot strand gated runners.
+  await writeFile(join(root, 'release-cancel'), 'release').catch(() => {})
+  const acpMessages = phaseClients.flatMap(client => [...client.messages])
   const rows = await records()
-  const pids = [...new Set(rows.map(row => row.pid).filter(Number.isInteger))]
+  const runnerPids = []
+  for (const dir of new Set(
+    rows
+      .filter(row => row.event === 'tool_result')
+      .map(row => row.details?.asyncDir)
+      .filter(Boolean)
+  )) {
+    assert.ok(String(dir).startsWith(join(root, 'tmp') + '/'), 'only this isolated test owns these runner artifacts')
+    try {
+      const status = JSON.parse(await readFile(join(dir, 'status.json'), 'utf8'))
+      if (Number.isInteger(status.pid) && status.pid > 0) runnerPids.push(status.pid)
+    } catch {
+      /* The runner may have already removed its status file. */
+    }
+  }
+  const pids = [...new Set([...rows.map(row => row.pid).filter(Number.isInteger), ...runnerPids])]
   const deadline = Date.now() + 20_000
   while (pids.some(isLive) && Date.now() < deadline) await sleep(25)
   const livePids = pids.filter(isLive)
-  check('S_TELEMETRY', 'all recorded isolated Pi processes exited', livePids.length === 0, { pids, livePids })
+  check('S_TELEMETRY', 'all recorded isolated Pi/runner processes exited', livePids.length === 0, { pids, livePids })
   const destination = process.env.PI_ACP_EVAL_LOG_DIR
   if (destination) {
     await mkdir(destination, { recursive: true })
