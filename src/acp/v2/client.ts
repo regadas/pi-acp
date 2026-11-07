@@ -13,11 +13,10 @@ import {
   isTransparentUpdate,
   toV1PermissionResponse,
   toV2PermissionRequest,
-  toV2SessionUpdate
+  toV2SessionUpdate,
+  type ChunkKind
 } from './translate.js'
 import { replayEntryId } from '../replay-entry-id.js'
-
-type ChunkKind = ReturnType<typeof chunkUpdateKind> extends infer K | null ? K : never
 
 /** The v2 message upsert a replayed entry's chunks accumulate into. */
 const UPSERT_OF_CHUNK_KIND: Record<ChunkKind, 'user_message' | 'agent_message' | 'agent_thought'> = {
