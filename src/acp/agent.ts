@@ -53,6 +53,7 @@ import { normalizeAdditionalDirectories, workspaceRootsEquivalent } from './work
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import type { AvailableCommand } from '@agentclientprotocol/sdk/unstable'
 
 /**
@@ -97,7 +98,6 @@ function mergeCommands(a: AvailableCommand[], b: AvailableCommand[]): AvailableC
 
   return out
 }
-import { fileURLToPath } from 'node:url'
 
 const pkg = readNearestPackageJson(import.meta.url)
 
@@ -626,23 +626,21 @@ export class PiAcpAgent {
         continue
       }
 
-      return await this.registeredRestore(sessionId, opts)
+      return await this.registeredRestore(sessionId, this.restoreFromStore(sessionId, opts))
     }
   }
 
   /**
-   * The registered restore spawn path shared by every restore: the store
-   * read, retirement barrier, child spawn, identity check and registration
-   * run as the session's in-flight restore, so concurrent consumers join it
-   * and close/delete/load fence it.
+   * Run a restore as the session's registered in-flight restore: concurrent
+   * consumers join it and close/delete/load fence it. Unregistration is
+   * generation-checked so a later registration is never dropped.
    */
-  private async registeredRestore(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
-    const restorePromise = this.restoreFromStore(sessionId, opts)
-    this.restoringSessions.set(sessionId, restorePromise)
+  private async registeredRestore(sessionId: string, restore: Promise<PiAcpSession>): Promise<PiAcpSession> {
+    this.restoringSessions.set(sessionId, restore)
     try {
-      return await restorePromise
+      return await restore
     } finally {
-      if (this.restoringSessions.get(sessionId) === restorePromise) this.restoringSessions.delete(sessionId)
+      if (this.restoringSessions.get(sessionId) === restore) this.restoringSessions.delete(sessionId)
     }
   }
 
@@ -693,12 +691,7 @@ export class PiAcpAgent {
 
       return this.restoreFromStore(sessionId, opts)
     })()
-    this.restoringSessions.set(sessionId, replacement)
-    try {
-      return await replacement
-    } finally {
-      if (this.restoringSessions.get(sessionId) === replacement) this.restoringSessions.delete(sessionId)
-    }
+    return this.registeredRestore(sessionId, replacement)
   }
 
   private async restoreFromStore(sessionId: string, opts?: SessionRestoreOpts): Promise<PiAcpSession> {
@@ -929,35 +922,26 @@ export class PiAcpAgent {
         session.proc.getAvailableModels()
       ])
 
-      const modelsAuthErr = maybeAuthRequiredError(
-        modelsResult.status === 'rejected' ? modelsResult.reason : null,
-        this.authMethods
-      )
-      if (modelsAuthErr) throw modelsAuthErr
-      if (modelsResult.status === 'rejected') {
-        throw RequestError.internalError({}, String((modelsResult.reason as Error)?.message ?? modelsResult.reason))
+      const unwrap = (result: PromiseSettledResult<unknown>): unknown => {
+        if (result.status === 'fulfilled') return result.value
+        throw (
+          maybeAuthRequiredError(result.reason, this.authMethods) ??
+          RequestError.internalError({}, String((result.reason as Error)?.message ?? result.reason))
+        )
       }
+      const availableModels = unwrap(modelsResult)
 
       // If pi has no models available after spawning, it's effectively unauthenticated.
-      if (piModelsList(modelsResult.value).length === 0) {
+      if (piModelsList(availableModels).length === 0) {
         throw RequestError.authRequired(
           { authMethods: this.authMethods },
           'Configure an API key or log in with an OAuth provider.'
         )
       }
 
-      const stateAuthErr = maybeAuthRequiredError(
-        stateResult.status === 'rejected' ? stateResult.reason : null,
-        this.authMethods
-      )
-      if (stateAuthErr) throw stateAuthErr
-      if (stateResult.status === 'rejected') {
-        throw RequestError.internalError({}, String((stateResult.reason as Error)?.message ?? stateResult.reason))
-      }
-
       configOptions = await getSessionConfiguration(session.proc, {
-        state: stateResult.value,
-        availableModels: modelsResult.value
+        state: unwrap(stateResult),
+        availableModels
       })
       session.seedSessionConfiguration(configOptions)
     } catch (error) {

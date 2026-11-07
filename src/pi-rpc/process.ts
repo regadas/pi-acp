@@ -50,7 +50,12 @@ export class PiRpcRequestTimeoutError extends Error {
 }
 
 /** A healthy foreign model run won admission; no user input was queued. */
-export class PiRpcPromptDeferredError extends Error {}
+export class PiRpcPromptDeferredError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PiRpcPromptDeferredError'
+  }
+}
 
 export class PiRpcClosedError extends Error {
   constructor(message: string) {
@@ -251,7 +256,7 @@ export class PiRpcProcess {
   private handleStdoutLine(line: string): void {
     // Once the channel is quarantined or terminal, no record can safely be
     // attributed to an ACP turn (an orphaned descendant may still write).
-    if (this.disposeRequested || this.termination || !line.trim()) return
+    if (this.disposeRequested || this.termination) return
     let msg: unknown
     try {
       msg = JSON.parse(line)

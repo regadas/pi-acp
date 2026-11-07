@@ -970,12 +970,6 @@ export class PiAcpSession {
     entry.fail(error)
   }
 
-  /** Admit a parked command at pi's authoritative settlement boundary. */
-  private admitDeferredCommand(): void {
-    const entry = this.takeDeferredCommandAdmission()
-    entry?.admit(true)
-  }
-
   /**
    * Settle a parked command admission without running it (cancel, shutdown,
    * disposal, termination). It never reached pi, so it settles locally and
@@ -2640,7 +2634,7 @@ export class PiAcpSession {
         this.continuationExpected = false
         // An adapter command parked behind that run is admitted at the same
         // boundary that admits a deferred prompt dispatch.
-        this.admitDeferredCommand()
+        this.takeDeferredCommandAdmission()?.admit(true)
         const activeTurn = this.pendingTurn
         if (!activeTurn) break
 

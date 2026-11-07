@@ -3,6 +3,7 @@ import { open } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { CommandContext, PiAcpSession } from './session.js'
+import { piRecord } from '../pi-rpc/protocol.js'
 
 export function builtinAvailableCommands(): AvailableCommand[] {
   return [
@@ -116,26 +117,24 @@ export async function runBuiltinCommand(
   }
 
   if (cmd === 'session') {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const stats = (await session.proc.getSessionStats()) as any
+    const stats = await session.proc.getSessionStats()
+    const record = piRecord(stats)
 
     const lines: string[] = []
-    if (stats?.sessionId) lines.push(`Session: ${stats.sessionId}`)
-    if (stats?.sessionFile) lines.push(`Session file: ${stats.sessionFile}`)
-    if (typeof stats?.totalMessages === 'number') lines.push(`Messages: ${stats.totalMessages}`)
+    if (record.sessionId) lines.push(`Session: ${record.sessionId}`)
+    if (record.sessionFile) lines.push(`Session file: ${record.sessionFile}`)
+    if (typeof record.totalMessages === 'number') lines.push(`Messages: ${record.totalMessages}`)
 
-    if (typeof stats?.cost === 'number') lines.push(`Cost: ${stats.cost}`)
+    if (typeof record.cost === 'number') lines.push(`Cost: ${record.cost}`)
 
-    const t = stats?.tokens
-    if (t && typeof t === 'object') {
-      const parts: string[] = []
-      if (typeof t.input === 'number') parts.push(`in ${t.input}`)
-      if (typeof t.output === 'number') parts.push(`out ${t.output}`)
-      if (typeof t.cacheRead === 'number') parts.push(`cache read ${t.cacheRead}`)
-      if (typeof t.cacheWrite === 'number') parts.push(`cache write ${t.cacheWrite}`)
-      if (typeof t.total === 'number') parts.push(`total ${t.total}`)
-      if (parts.length) lines.push(`Tokens: ${parts.join(', ')}`)
-    }
+    const tokens = piRecord(record.tokens)
+    const parts: string[] = []
+    if (typeof tokens.input === 'number') parts.push(`in ${tokens.input}`)
+    if (typeof tokens.output === 'number') parts.push(`out ${tokens.output}`)
+    if (typeof tokens.cacheRead === 'number') parts.push(`cache read ${tokens.cacheRead}`)
+    if (typeof tokens.cacheWrite === 'number') parts.push(`cache write ${tokens.cacheWrite}`)
+    if (typeof tokens.total === 'number') parts.push(`total ${tokens.total}`)
+    if (parts.length) lines.push(`Tokens: ${parts.join(', ')}`)
 
     // Fallback if stats shape changes.
     const text = lines.length ? lines.join('\n') : `Session stats:\n${JSON.stringify(stats, null, 2)}`
@@ -192,9 +191,7 @@ export async function runBuiltinCommand(
         : undefined
   if (modeCommand) {
     const modeRaw = String(args[0] ?? '').toLowerCase()
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const state = (await session.proc.getState()) as any
-    const current = String(state?.[modeCommand.key] ?? '')
+    const current = String(piRecord(await session.proc.getState())[modeCommand.key] ?? '')
 
     if (!modeRaw) {
       await say(`${modeCommand.label} mode: ${current || 'unknown'}`)
@@ -221,10 +218,9 @@ export async function runBuiltinCommand(
     // IMPORTANT: pi's export_html reads the session JSONL file. If it doesn't exist yet
     // (no messages) or is empty, pi throws and RPC mode emits an uncorrelated parse error
     // (no id), which would otherwise hang our request. So we guard here.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-    const state = (await session.proc.getState()) as any
-    const sessionFile = typeof state?.sessionFile === 'string' ? state.sessionFile : null
-    const messageCount = typeof state?.messageCount === 'number' ? state.messageCount : 0
+    const state = piRecord(await session.proc.getState())
+    const sessionFile = typeof state.sessionFile === 'string' ? state.sessionFile : null
+    const messageCount = typeof state.messageCount === 'number' ? state.messageCount : 0
 
     if (!sessionFile || messageCount === 0 || !(await hasExportableSessionFile(sessionFile))) {
       await say('Nothing to export yet (no session messages). Send a prompt first.')
@@ -284,9 +280,7 @@ export async function runBuiltinCommand(
     } else if (AUTOCOMPACT_OFF_ALIASES.has(mode)) {
       enabled = false
     } else if (mode === 'toggle') {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- pi RPC payload is validated at this boundary.
-      const state = (await session.proc.getState()) as any
-      enabled = !state?.autoCompactionEnabled
+      enabled = !piRecord(await session.proc.getState()).autoCompactionEnabled
     } else {
       // An unrecognized argument is a typo, not a toggle: report usage
       // instead of silently flipping the setting.
