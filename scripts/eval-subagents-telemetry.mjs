@@ -230,6 +230,91 @@ child.on('exit', code => process.exit(code ?? 1));
     { timeoutMs: 150_000, env }
   )
 
+  // Phase 3: a v2 connection. Subagents are baseline in ACP v2 — no client
+  // capability exists — so the same activity must surface on the v2 wire with
+  // empty client capabilities. The gate file is removed first so the fresh
+  // child holds deterministically for the running announcement.
+  await rm(join(root, 'release-cancel'), { force: true })
+  await withSmokeAgent(
+    async client => {
+      phaseClients.push(client)
+      const initialize = await client.request('initialize', {
+        protocolVersion: 2,
+        info: { name: 'pi-acp-eval-v2', version: '0.0.0' },
+        capabilities: {}
+      })
+      assert.equal(initialize.protocolVersion, 2, 'the v2 chain answered the initialize')
+      const earlierPids = new Set((await records()).map(row => row.pid))
+      const { sessionId } = await client.request('session/new', { cwd: root })
+      const prompt = client.request('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: 'S_CANCEL v2 baseline subagent telemetry' }]
+      })
+      const launched = await wait(
+        rows =>
+          rows.find(
+            row =>
+              row.event === 'tool_result' && row.toolName === 'subagent' && !row.isError && !earlierPids.has(row.pid)
+          ),
+        'phase 3 stock subagent launch on the v2 connection'
+      )
+      const childId = launched.details.asyncId
+      const announcement = await waitFor(
+        () => subagentUpdatesOf(client).find(update => update.sessionId === childId),
+        `v2 subagent_update announcing child ${childId}`
+      )
+      assert.deepEqual(announcement.state, { state: 'running' }, 'the gated child is announced as running on v2')
+      check('S_TELEMETRY_V2', 'the async child is announced as a v2 subagent session (baseline, no capability)', true, {
+        childId,
+        title: announcement.title,
+        state: announcement.state
+      })
+      assert.ok(announcement.title, 'the v2 announcement carries a title')
+      assert.ok(announcement.description, 'the v2 announcement carries a description')
+      assert.deepEqual(announcement.capabilities, {}, 'no cancel capability is advertised on v2')
+
+      await writeFile(join(root, 'release-cancel'), 'release')
+      const completion = await wait(
+        rows =>
+          rows.find(
+            row => row.event === 'snapshot' && row.runs.some(run => run.id === childId && run.state === 'complete')
+          ),
+        `stock snapshot reporting child ${childId} complete (phase 3)`
+      )
+      const result = await prompt
+      assert.equal(typeof result.messageId, 'string', 'the v2 prompt response carries its messageId')
+      const settled = subagentUpdatesOf(client)
+        .filter(update => update.sessionId === childId)
+        .find(update => update.state?.state === 'idle' && update.state?.stopReason === 'end_turn')
+      assert.ok(settled, `the completed child was mapped to idle/end_turn on v2 (${JSON.stringify(completion)})`)
+      check('S_TELEMETRY_V2', 'the producer state change is correlated with its ACP idle mapping on v2', true, {
+        childId,
+        producerCompleteAt: completion.at,
+        settledState: settled.state
+      })
+
+      const announced = new Set(subagentUpdatesOf(client).map(update => update.sessionId))
+      assert.ok(announced.has(childId))
+      const messages = sessionMessagesOf(client)
+      const recipients = new Set(messages.map(message => message.recipientSessionId))
+      assert.deepEqual([...recipients].sort(), [...announced].sort(), 'one v2 session_message per announced child')
+      assert.equal(messages.length, announced.size, 'exactly one v2 session_message per announced child')
+      assert.equal(new Set(messages.map(message => message.messageId)).size, messages.length, 'message ids are unique')
+      for (const message of messages) {
+        assert.equal(message.senderSessionId, sessionId)
+        assert.equal(message.content?.length, 1)
+        assert.equal(message.content[0]?.type, 'text')
+        assert.ok(message.messageId)
+      }
+      check('S_TELEMETRY_V2', 'one parent-to-child session_message per announced child on v2', true, {
+        announcedChildren: [...announced],
+        messages: messages.map(message => ({ messageId: message.messageId, child: message.recipientSessionId }))
+      })
+      await client.request('session/close', { sessionId }).catch(() => {})
+    },
+    { timeoutMs: 150_000, env }
+  )
+
   verifyStock('after tests')
   console.log(JSON.stringify({ identity, checks }, null, 2))
 } finally {

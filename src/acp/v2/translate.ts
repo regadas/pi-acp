@@ -1,5 +1,6 @@
 import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
+import type { SessionUpdate as V2UnstableSessionUpdate } from '@agentclientprotocol/sdk/experimental/v2/unstable'
 import type {
   AvailableCommand,
   ContentBlock,
@@ -80,6 +81,13 @@ export function toV2SessionUpdate(
     case 'usage_update':
       // The v1-unstable and v2-stable shapes of these updates are the same.
       return update as v2.SessionUpdate
+    case 'subagent_update':
+    case 'session_message':
+      // The v1-unstable and v2-unstable shapes of these updates are the
+      // same; the stable v2 union has no members for these draft kinds, so
+      // the identical payload is asserted onto it — unknown variants cross
+      // the v2 wire unchanged.
+      return update as V2UnstableSessionUpdate as v2.SessionUpdate
     default:
       throw new Error(`pi-acp: no ACP v2 translation for ${update.sessionUpdate} session update`)
   }
@@ -167,6 +175,8 @@ export function toV2AvailableCommands(commands: readonly AvailableCommand[]): v2
  * the terminal-output meta stay off: the v2 surface does not advertise the
  * `auth/login`/`auth/logout` methods or v2 terminal updates they would
  * require, so a v2 client must configure pi credentials out of band.
+ * Subagents, by contrast, are baseline v2 (no client capability exists), so
+ * every v2 connection opts the engine in.
  */
 export function v1InitializeRequest(params: v2.InitializeRequest): InitializeRequest {
   const elicitation = params.capabilities?.elicitation
@@ -174,7 +184,10 @@ export function v1InitializeRequest(params: v2.InitializeRequest): InitializeReq
     protocolVersion: 1,
     clientInfo: params.info,
     clientCapabilities: {
-      ...(elicitation?.form != null ? { elicitation: { form: elicitation.form } } : {})
+      ...(elicitation?.form != null ? { elicitation: { form: elicitation.form } } : {}),
+      // v2 subagents are baseline (no client capability), so v2 connections
+      // are treated as opted in; the v1 path stays negotiated.
+      subagents: {}
     }
   }
 }
