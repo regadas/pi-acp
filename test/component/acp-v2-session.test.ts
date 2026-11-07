@@ -160,6 +160,41 @@ const fakeState = (sessionId: string, sessionFile: string = SESSION_FILE): Recor
   thinkingLevel: 'medium'
 })
 
+// A pi-subagents `subagent-async` widget snapshot event, the same wire shape
+// the v1 unit suite drives (see test/unit/subagent-updates.test.ts).
+const SUBAGENT_WIDGET_PREFIX = 'PI_SUBAGENT_ASYNC_JSON:'
+let subagentWidgetId = 0
+const subagentWidget = (runs: unknown[]) => ({
+  type: 'extension_ui_request',
+  id: `subagent-widget-${subagentWidgetId++}`,
+  method: 'setWidget',
+  widgetKey: 'subagent-async',
+  widgetLines: [
+    `${SUBAGENT_WIDGET_PREFIX}${JSON.stringify({
+      kind: 'pi-subagents.async-status-snapshot',
+      version: 1,
+      generatedAt: 1,
+      omitted: { runs: runs.length, children: 0, byteLimitExceeded: false },
+      runs
+    })}`
+  ]
+})
+const subagentNode = (spec: { id: string; label?: string; state?: string }) => ({
+  kind: 'subagent',
+  state: 'running',
+  label: spec.label ?? spec.id,
+  ...spec
+})
+
+// The fields of a v2 subagent_update the stable v2 union models as an
+// unknown variant; reading them needs the field cast this suite uses elsewhere.
+type SubagentUpdateFields = {
+  sessionId?: string
+  title?: string
+  description?: string
+  state?: { state: string; stopReason?: string }
+}
+
 async function initialize(conn: { agent: v2.ClientContext }): Promise<void> {
   await withTimeout(
     conn.agent.request(v2.methods.agent.initialize, {
@@ -253,6 +288,194 @@ test('v2 session lifecycle: new, prompt with translated updates, close', async (
       {}
     )
     assert.equal(proc.disposeCount, 1, 'close frees the pi subprocess')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 announces pi-subagents children as baseline subagent sessions', async () => {
+  const proc = patchSpawn(fakeState('v2-subagents'))
+  const { conn, updates, received } = connectV2()
+  try {
+    // No client capability is negotiated: v2 subagents are baseline, so the
+    // v2 initialize opts the engine in on its own.
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+
+    const prompt = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-subagents',
+      prompt: [{ type: 'text', text: 'run the crew' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+
+    // Before the first snapshot, nothing subagent-related is on the wire.
+    await waitFor(() => received('state_update').length > 0, 'running snapshot')
+    assert.equal(received('subagent_update').length, 0, 'no subagent_update before the first snapshot')
+    assert.equal(received('session_message').length, 0, 'no session_message before the first snapshot')
+
+    // First snapshot: three running children.
+    proc.emit(
+      subagentWidget([
+        subagentNode({ id: 'run-1', label: 'Research' }),
+        subagentNode({ id: 'run-2', label: 'Review' }),
+        subagentNode({ id: 'run-3', label: 'Draft' })
+      ])
+    )
+    await waitFor(() => received('subagent_update').length === 3, 'three child announcements')
+    await waitFor(() => received('session_message').length === 3, 'three session_messages')
+
+    // v2-shaped announcements: the engine's fields pass through unchanged.
+    assert.deepEqual(received('subagent_update')[0]!.update, {
+      sessionUpdate: 'subagent_update',
+      sessionId: 'run-1',
+      title: 'Research',
+      description: 'subagent',
+      capabilities: {},
+      state: { state: 'running' },
+      _meta: {
+        piSubagents: { kind: 'subagent', parentId: null, omitted: { runs: 3, children: 0, byteLimitExceeded: false } }
+      }
+    })
+
+    // The announcements ride the immediate parent session (the notification's
+    // sessionId), never the child's own id a regression would route them by.
+    const messages = received('session_message')
+    for (const notification of [...received('subagent_update'), ...messages]) {
+      assert.equal(notification.sessionId, 'v2-subagents', 'announcements ride the parent session')
+    }
+
+    // Exactly one session_message per child, each following its announcement.
+    assert.equal(messages.length, 3, 'exactly one session_message per child')
+    for (const child of ['run-1', 'run-2', 'run-3']) {
+      const message = messages.find(m => (m.update as { recipientSessionId?: string }).recipientSessionId === child)
+      assert.ok(message, `session_message for ${child}`)
+      const announcement = updates.findIndex(
+        update =>
+          update.update.sessionUpdate === 'subagent_update' &&
+          (update.update as SubagentUpdateFields).sessionId === child
+      )
+      assert.ok(announcement >= 0, `${child} was announced`)
+      assert.ok(updates.indexOf(message!) > announcement, `${child}: the announcement precedes its session_message`)
+      assert.equal((message!.update as { senderSessionId?: string }).senderSessionId, 'v2-subagents')
+      assert.deepEqual((message!.update as { content?: unknown[] }).content, [
+        { type: 'text', text: child === 'run-1' ? 'Research' : child === 'run-2' ? 'Review' : 'Draft' }
+      ])
+    }
+    const messageIds = messages.map(message => (message.update as { messageId: string }).messageId)
+    assert.equal(new Set(messageIds).size, 3, 'message ids are unique')
+
+    // Second snapshot: run-1 completes, run-3 disappears, run-2 keeps running.
+    proc.emit(
+      subagentWidget([
+        subagentNode({ id: 'run-1', label: 'Research', state: 'complete' }),
+        subagentNode({ id: 'run-2', label: 'Review' })
+      ])
+    )
+    const stateOf = (child: string): { state: string; stopReason?: string } | undefined => {
+      const last = received('subagent_update')
+        .filter(update => (update.update as SubagentUpdateFields).sessionId === child)
+        .at(-1)
+      return (last?.update as SubagentUpdateFields | undefined)?.state
+    }
+    await waitFor(() => stateOf('run-1')?.state === 'idle', 'run-1 idle')
+    assert.equal(stateOf('run-1')?.stopReason, 'end_turn', 'running → complete maps to idle/end_turn')
+    await waitFor(() => stateOf('run-3')?.state === 'unknown', "run-3's disappearance unknown")
+    assert.deepEqual(stateOf('run-3'), { state: 'unknown' }, 'the disappearance unknowns, never idles')
+
+    // Settling the turn flushes the still-running child to unknown.
+    proc.emit({ type: 'agent_settled' })
+    const response = await withTimeout(prompt, 'prompt')
+    assert.equal(typeof response.messageId, 'string')
+    await waitFor(() => stateOf('run-2')?.state === 'unknown', 'settle flush unknowns the running child')
+    // The engine drains its update queue (the child flush included) before
+    // resolving the turn, and the v2 idle snapshot follows that resolution:
+    // the running child's unknown precedes the parent's terminal idle.
+    const flushedUnknown = received('subagent_update').find(
+      notification =>
+        (notification.update as SubagentUpdateFields).sessionId === 'run-2' &&
+        (notification.update as SubagentUpdateFields).state?.state === 'unknown'
+    )
+    assert.ok(flushedUnknown, 'run-2 was flushed to unknown')
+    const terminalIdle = received('state_update')
+      .filter(notification => (notification.update as { state?: string }).state === 'idle')
+      .at(-1)
+    assert.ok(terminalIdle, 'the turn reported its terminal idle')
+    assert.ok(
+      updates.indexOf(flushedUnknown) < updates.indexOf(terminalIdle),
+      "the running child's unknown precedes the parent's terminal idle"
+    )
+    assert.equal(
+      (
+        received('subagent_update')
+          .filter(update => (update.update as SubagentUpdateFields).sessionId === 'run-1')
+          .at(-1)!.update as SubagentUpdateFields
+      ).state?.state,
+      'idle',
+      'the completed child keeps its idle state'
+    )
+    assert.equal(received('session_message').length, 3, 'no second session_message within the turn')
+  } finally {
+    conn.close()
+    proc.restore()
+  }
+})
+
+test('v2 streamed messages stay whole across subagent announcements', async () => {
+  const proc = patchSpawn(fakeState('v2-stream'))
+  const { conn, updates, received } = connectV2()
+  try {
+    await initialize(conn)
+    await conn.agent.request(v2.methods.agent.session.new, { cwd: TEST_CWD })
+
+    const prompt = conn.agent.request(v2.methods.agent.session.prompt, {
+      sessionId: 'v2-stream',
+      prompt: [{ type: 'text', text: 'stream across snapshots' }]
+    })
+    await waitFor(() => proc.prompts.length === 1, 'prompt dispatch')
+    proc.emit({ type: 'agent_start' })
+
+    // One streamed message interrupted by a child's announcement: snapshots
+    // re-emit while async children are live, and they must not split it.
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'hello ' } })
+    proc.emit(subagentWidget([subagentNode({ id: 'run-1', label: 'Research' })]))
+    proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'world' } })
+    proc.emit({ type: 'agent_settled' })
+
+    const response = await withTimeout(prompt, 'prompt')
+    assert.equal(typeof response.messageId, 'string')
+    await waitFor(() => received('agent_message_chunk').length === 2, 'both text chunks')
+    await waitFor(() => received('session_message').length === 1, 'the child announcement message')
+
+    const chunks = received('agent_message_chunk')
+    const chunkIds = chunks.map(chunk => (chunk.update as { messageId: string }).messageId)
+    assert.equal(
+      chunkIds[0],
+      chunkIds[1],
+      'both chunks share one messageId: the announcements did not split the message'
+    )
+    assert.deepEqual(
+      chunks.map(chunk => (chunk.update as { content: { type: string; text: string } }).content),
+      [
+        { type: 'text', text: 'hello ' },
+        { type: 'text', text: 'world' }
+      ]
+    )
+
+    // Both subagent updates passed through on the wire, between the chunks.
+    // (A second subagent_update — the settle flush's unknown — follows the
+    // turn; the announcement is the first.)
+    const announcement = received('subagent_update')[0]!
+    const message = received('session_message')[0]!
+    assert.equal((announcement.update as SubagentUpdateFields).sessionId, 'run-1')
+    assert.equal((message.update as { recipientSessionId?: string }).recipientSessionId, 'run-1')
+    assert.ok(
+      updates.indexOf(chunks[0]!) < updates.indexOf(announcement) &&
+        updates.indexOf(announcement) < updates.indexOf(message) &&
+        updates.indexOf(message) < updates.indexOf(chunks[1]!),
+      'the announcement interleaves the two chunks of one message'
+    )
   } finally {
     conn.close()
     proc.restore()

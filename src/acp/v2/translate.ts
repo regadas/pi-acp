@@ -1,5 +1,6 @@
 import { RequestError } from '@agentclientprotocol/sdk/unstable'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
+import type { SessionUpdate as V2UnstableSessionUpdate } from '@agentclientprotocol/sdk/experimental/v2/unstable'
 import type {
   AvailableCommand,
   ContentBlock,
@@ -33,6 +34,18 @@ export type ChunkKind = ChunkSessionUpdate['sessionUpdate']
 export function chunkUpdateKind(update: SessionUpdate): ChunkKind | null {
   const kind = update.sessionUpdate
   return kind === 'user_message_chunk' || kind === 'agent_message_chunk' || kind === 'agent_thought_chunk' ? kind : null
+}
+
+/**
+ * Subagent updates are transparent to the connection's open live message
+ * and buffered replay entry: snapshots re-emit every child about once a
+ * second while async children are live, and ending the open message on
+ * each would chop streamed text into a bubble per snapshot; v2 chunks
+ * resume under the same messageId.
+ */
+export function isTransparentUpdate(update: SessionUpdate): boolean {
+  const kind = update.sessionUpdate
+  return kind === 'subagent_update' || kind === 'session_message'
 }
 
 /**
@@ -80,6 +93,13 @@ export function toV2SessionUpdate(
     case 'usage_update':
       // The v1-unstable and v2-stable shapes of these updates are the same.
       return update as v2.SessionUpdate
+    case 'subagent_update':
+    case 'session_message':
+      // The v1-unstable and v2-unstable shapes of these updates are the
+      // same; the stable v2 union has no members for these draft kinds, so
+      // the identical payload is asserted onto it — unknown variants cross
+      // the v2 wire unchanged.
+      return update as V2UnstableSessionUpdate as v2.SessionUpdate
     default:
       throw new Error(`pi-acp: no ACP v2 translation for ${update.sessionUpdate} session update`)
   }
@@ -167,6 +187,8 @@ export function toV2AvailableCommands(commands: readonly AvailableCommand[]): v2
  * the terminal-output meta stay off: the v2 surface does not advertise the
  * `auth/login`/`auth/logout` methods or v2 terminal updates they would
  * require, so a v2 client must configure pi credentials out of band.
+ * Subagents, by contrast, are baseline v2 (no client capability exists), so
+ * every v2 connection opts the engine in.
  */
 export function v1InitializeRequest(params: v2.InitializeRequest): InitializeRequest {
   const elicitation = params.capabilities?.elicitation
@@ -174,7 +196,8 @@ export function v1InitializeRequest(params: v2.InitializeRequest): InitializeReq
     protocolVersion: 1,
     clientInfo: params.info,
     clientCapabilities: {
-      ...(elicitation?.form != null ? { elicitation: { form: elicitation.form } } : {})
+      ...(elicitation?.form != null ? { elicitation: { form: elicitation.form } } : {}),
+      subagents: {}
     }
   }
 }
