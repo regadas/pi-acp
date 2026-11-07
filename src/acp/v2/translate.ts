@@ -37,10 +37,11 @@ export function chunkUpdateKind(update: SessionUpdate): ChunkKind | null {
 }
 
 /**
- * Subagent updates are transparent to the connection's open live message:
- * snapshots re-emit every child about once a second while async children
- * are live, and ending the open message on each would chop streamed text
- * into a bubble per snapshot; v2 chunks resume under the same messageId.
+ * Subagent updates are transparent to the connection's open live message
+ * and buffered replay entry: snapshots re-emit every child about once a
+ * second while async children are live, and ending the open message on
+ * each would chop streamed text into a bubble per snapshot; v2 chunks
+ * resume under the same messageId.
  */
 export function isTransparentUpdate(update: SessionUpdate): boolean {
   const kind = update.sessionUpdate

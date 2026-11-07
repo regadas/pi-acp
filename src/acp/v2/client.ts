@@ -34,10 +34,10 @@ const UPSERT_OF_CHUNK_KIND: Record<ChunkKind, 'user_message' | 'agent_message' |
  * connection synthesizes them. Live chunks group consecutive chunks of the
  * same kind into one v2 message; any other update of the session ends the
  * current message, except subagent updates, which are transparent (see
- * {@link isTransparentUpdate}) — they are metadata, not transcript content.
- * The live ids are fresh UUIDs: the engine's live emission
- * path has no persisted-entry identity, so a live message's id can never
- * match the id its later replay uses — a documented association limitation
+ * {@link isTransparentUpdate}) — they do not delimit the current streamed
+ * message. The live ids are fresh UUIDs: the engine's live emission path
+ * has no persisted-entry identity, so a live message's id can never match
+ * the id its later replay uses — a documented association limitation
  * (see docs/adapter-reference.md).
  *
  * Inside {@link replaying} windows, replayed history is delivered as v2
