@@ -111,10 +111,10 @@ P2 (comments) — all fixed:
 - [x] re-copied rationales trimmed (dispose() one sentence; probe one-liner referencing `killTreeTargetsRootPid`; measure clause once, on the field)
 - [x] main.ts cancel() comment shortened
 
-## Deferred (not this loop)
+## Deferred — resolution
 
-- v2 replay gives a retained user message a second identity (`replay:<entryId>` vs the echoed UUID) — documented v2 limitation; a protocol behavior change needing its own design pass
-- async file-snapshot reads — snapshots are point-in-time by design; async would break the consistency validation
-- dropping fsync on session upsert — durability tradeoff, owner decision
-- caching `lstatSync` results in tool-call location translation — needs a cache design
-- 13 reviewer-dropped micro findings (two `split()`-based counters, `line.trim()` before parse, linear `Array.find`, restore try/finally dup, auth-error block dup, mid-file import, staged-prompt dup, two one-line wrappers, `assertNotDisposed` overlap, error `name` unset, five eslint-disabled `as any` casts)
+- [x] ~~v2 replay gives a retained user message a second identity~~ **closed: blocked upstream** — no pi RPC surface correlates a prompt to its persisted entry id (probed against pi 1.5.0 and its docs: prompt response, user message events, get_state, get_entries, get_fork_messages all lack it; the prompt request id is not persisted). Every join would be a content/ordering heuristic that misattributes on foreign user entries (`pi.sendUserMessage`) and equal prompt texts. `replay:<entryId>` stays — deterministic beats sometimes-wrong. Upstream ask: expose entry ids in live user message events, the prompt response, or persist the request id.
+- [x] ~~async file-snapshot reads~~ **closed by owner decision: keep sync** — point-in-time consistency by design; bounded (≤ 1 MiB, local disk), milliseconds at most
+- [x] ~~dropping fsync on session upsert~~ **closed by owner decision: keep fsync** — one-off 10–30 ms per session create/restore, off the streaming path; durability of the session-id→file mapping wins
+- [ ] caching `lstatSync` results in tool-call location translation — worker in flight (skip-and-report if no clean invalidation seam)
+- [ ] 13 reviewer-dropped micro findings (two `split()`-based counters, `line.trim()` before parse, linear `Array.find`, restore try/finally dup, auth-error block dup, mid-file import, staged-prompt dup, two one-line wrappers, `assertNotDisposed` overlap, error `name` unset, five eslint-disabled `as any` casts) — pending worker
