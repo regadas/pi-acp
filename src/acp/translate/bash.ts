@@ -44,9 +44,7 @@ export function bashCommand(value: unknown): string | undefined {
 }
 
 /** stdout/stderr/exitCode extracted from a pi result's `details`/top-level fields only (never content blocks). */
-export type BashResultFields = { stdout?: string; stderr?: string; exitCode?: number }
-
-export function bashResultFields(result: unknown): BashResultFields {
+export function bashResultFields(result: unknown): { stdout?: string; stderr?: string; exitCode?: number } {
   const record = result as BashResultRecord | null | undefined
   const details = record?.details as BashResultRecord | null | undefined
   const stdout =
@@ -62,11 +60,7 @@ export function bashResultFields(result: unknown): BashResultFields {
     (typeof record?.exitCode === 'number' ? record.exitCode : undefined) ??
     (typeof details?.code === 'number' ? details.code : undefined) ??
     (typeof record?.code === 'number' ? record.code : undefined)
-  return {
-    ...(stdout !== undefined ? { stdout } : {}),
-    ...(stderr !== undefined ? { stderr } : {}),
-    ...(exitCode !== undefined ? { exitCode } : {})
-  }
+  return { stdout, stderr, exitCode }
 }
 
 /** stdout/stderr from `details`/top-level fields only (never content blocks). */

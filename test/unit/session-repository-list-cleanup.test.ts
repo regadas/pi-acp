@@ -639,8 +639,12 @@ test('repository.list propagates metadata stream and fallback stat resource erro
   })
   const stat = fs.promises.stat
   let statError: string | null = null
+  let statCalls = 0
+  // Only a list's second stat rejects (the memo identity stat must succeed)
+  // so the rejection surfaces from project's own rethrowResourceExhaustion.
   t.mock.method(fs.promises, 'stat', (...args: Parameters<typeof stat>) => {
-    if (statError) return Promise.reject(Object.assign(new Error('stat failed'), { code: statError }))
+    if (statError && ++statCalls > 1)
+      return Promise.reject(Object.assign(new Error('stat failed'), { code: statError }))
     return stat(...args)
   })
   syncBuiltinESMExports()
@@ -651,8 +655,10 @@ test('repository.list propagates metadata stream and fallback stat resource erro
   streamError = null
   fs.writeFileSync(path, `${JSON.stringify({ type: 'session', id: 'errors', cwd: root })}\n`)
   statError = 'ENFILE'
+  statCalls = 0
   await assert.rejects(repository.list(root), { code: 'ENFILE' })
   statError = 'ENOENT'
+  statCalls = 0
   assert.deepEqual(await repository.list(root), [])
 })
 

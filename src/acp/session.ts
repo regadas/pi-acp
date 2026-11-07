@@ -183,8 +183,8 @@ const PI_TURN_BOUND_EVENT_TYPES = new Set([
 // finite for adapter commands that require exclusive access. Ordinary input
 // uses withdrawable staged admission instead of a run-duration deadline.
 const DEFERRED_ADMISSION_TIMEOUT_MS = 10 * 60_000
-// Every generic-client flush resends the full accumulated output, so in_progress
-// updates coalesce until this much new output has arrived.
+// Every generic-client flush resends the whole current (pi-capped) window, so
+// in_progress updates coalesce until this much new output has arrived.
 const GENERIC_BASH_COALESCE_BYTES = 64 * 1024
 const EXTENSION_UI_RAW_INPUT_KEYS = ['title', 'message', 'options', 'placeholder', 'prefill'] as const
 const CHOICE_OPTION_PREFIX = 'choice-'
@@ -321,8 +321,12 @@ export class PiAcpSession {
   private bashToolCallIds = new Set<string>()
   private subagentToolCallIds = new Set<string>()
   private bashOutputSnapshots = new Map<string, BashOutputSnapshot>()
-  // Rendered bytes of the last emitted generic in_progress bash update, per tool call.
+  // Output measure of the last emitted generic in_progress bash update, per
+  // tool call: native totalBytes when the snapshot reports it, rendered bytes otherwise.
   private genericBashEmittedBytes = new Map<string, number>()
+  // Latest rendered content per generic bash tool call, retained so a synthetic
+  // terminal failure can still show output that coalescing suppressed.
+  private genericBashContent = new Map<string, ToolCallContent[]>()
 
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
@@ -1393,14 +1397,14 @@ export class PiAcpSession {
   }
 
   /**
-   * Generic clients re-receive the full accumulated output on every flush,
-   * so in_progress updates are coalesced until the rendered content grows by
-   * the configured threshold. The first non-empty snapshot always lands so
-   * output appears early; the decision also records the emitted size.
+   * Pi caps snapshots at a rolling tail window, so the rendered size plateaus
+   * while output keeps growing: growth is measured by the native cumulative
+   * totalBytes when the snapshot reports it, rendered bytes otherwise.
    */
-  private shouldEmitGenericBashUpdate(toolCallId: string, content: ToolCallContent[]): boolean {
+  private shouldEmitGenericBashUpdate(toolCallId: string, content: ToolCallContent[], result: unknown): boolean {
     if (!content.length) return false
-    const bytes = Buffer.byteLength(JSON.stringify(content))
+    const coords = bashOutputSnapshot(result).coords
+    const bytes = coords ? coords.totalBytes : Buffer.byteLength(JSON.stringify(content))
     const last = this.genericBashEmittedBytes.get(toolCallId)
     if (last !== undefined && bytes - last < this.genericBashCoalesceBytes) return false
     this.genericBashEmittedBytes.set(toolCallId, bytes)
@@ -1420,7 +1424,10 @@ export class PiAcpSession {
       // stays consistent while streaming. Terminal statuses always emit in
       // full; only in_progress flushes are coalesced.
       const content = bashOrderedContent(params.result)
-      if (params.status === 'in_progress' && !this.shouldEmitGenericBashUpdate(params.toolCallId, content)) return
+      if (params.status === 'in_progress') {
+        if (content.length) this.genericBashContent.set(params.toolCallId, content)
+        if (!this.shouldEmitGenericBashUpdate(params.toolCallId, content, params.result)) return
+      }
       this.emit({
         sessionUpdate: 'tool_call_update',
         toolCallId: params.toolCallId,
@@ -1509,14 +1516,22 @@ export class PiAcpSession {
     this.subagentToolCallIds.delete(toolCallId)
     this.bashOutputSnapshots.delete(toolCallId)
     this.genericBashEmittedBytes.delete(toolCallId)
+    this.genericBashContent.delete(toolCallId)
   }
 
   private terminalizeToolCalls(): void {
     for (const toolCallId of this.currentToolCalls.keys()) {
+      // A generic bash card keeps the latest known output — some of it may
+      // only exist in a snapshot coalescing suppressed.
+      const genericBashContent =
+        this.bashToolCallIds.has(toolCallId) && !this.supportsTerminalOutputMeta
+          ? this.genericBashContent.get(toolCallId)
+          : undefined
       this.emit({
         sessionUpdate: 'tool_call_update',
         toolCallId,
         status: 'failed',
+        ...(genericBashContent?.length ? { content: genericBashContent } : {}),
         ...(this.bashToolCallIds.has(toolCallId) && this.supportsTerminalOutputMeta
           ? { _meta: bashTerminalExitMeta(toolCallId, 1) }
           : {})
@@ -1530,6 +1545,7 @@ export class PiAcpSession {
     this.subagentToolCallIds.clear()
     this.bashOutputSnapshots.clear()
     this.genericBashEmittedBytes.clear()
+    this.genericBashContent.clear()
   }
 
   private startTurn(t: QueuedPrompt): void {

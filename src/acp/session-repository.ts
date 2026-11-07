@@ -231,10 +231,10 @@ function isNewer(candidate: SessionRecord, previous: SessionRecord): boolean {
 
 async function project(
   path: string,
-  requestedId?: string,
-  knownHeader?: { sessionId: string; cwd: string },
-  strictRead = false,
-  scan: (path: string) => Promise<MetadataScan | null> = scanMetadata
+  requestedId: string | undefined,
+  knownHeader: { sessionId: string; cwd: string } | undefined,
+  strictRead: boolean,
+  scan: (path: string) => Promise<MetadataScan | null>
 ): Promise<SessionRecord | null> {
   const header = knownHeader ?? (await validatedHeader(path, requestedId, strictRead))
   if (!header) return null
@@ -304,7 +304,7 @@ export class SessionRepository {
 
   // Scan results keyed by stat identity (size + mtimeMs): an unchanged file
   // must not be re-read (up to 8 MiB) on every list/find call.
-  private readonly metadataScans = new Map<string, { size: number; mtimeMs: number; scan: MetadataScan | null }>()
+  private readonly metadataScans = new Map<string, { size: number; mtimeMs: number; scan: MetadataScan }>()
 
   private readonly scanMetadataCached = async (path: string): Promise<MetadataScan | null> => {
     let identity: Stats
@@ -317,7 +317,9 @@ export class SessionRepository {
     const cached = this.metadataScans.get(path)
     if (cached && cached.size === identity.size && cached.mtimeMs === identity.mtimeMs) return cached.scan
     const scan = await scanMetadata(path)
-    this.metadataScans.set(path, { size: identity.size, mtimeMs: identity.mtimeMs, scan })
+    // Only successful scans are memoized: a transient read failure must be
+    // retried on the next call instead of pinning null until the file changes.
+    if (scan) this.metadataScans.set(path, { size: identity.size, mtimeMs: identity.mtimeMs, scan })
     return scan
   }
 

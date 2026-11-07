@@ -677,6 +677,15 @@ test('repository.list memoizes metadata scans and refreshes them on file changes
   assert.equal(fourth[0]?.title, 'Refresh', 'a same-size file with a new mtime must not stay memoized')
   assert.equal(fourth[0]?.updatedAt, '2026-01-03T00:00:00.000Z')
   assert.equal(scanned.length, 3)
+
+  // Size-only change: the mtime is restored to the memoized value, so an
+  // mtime-only key would keep serving the stale scan.
+  writeSession('Grown beyond the memoized size', '2026-01-04T00:00:00.000Z')
+  utimesSync(sessionFile, at(3), at(3))
+  const fifth = await repository.list(root)
+  assert.equal(fifth[0]?.title, 'Grown beyond the memoized size')
+  assert.equal(fifth[0]?.updatedAt, '2026-01-04T00:00:00.000Z')
+  assert.equal(scanned.length, 4, 'a bigger file with an unchanged mtime must not stay memoized')
 })
 
 test('repository carries additional directories through find and list refreshes', async () => {
