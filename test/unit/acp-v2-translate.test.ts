@@ -32,28 +32,28 @@ test('v1InitializeRequest: a v2 initialize forwards the subagents capability as 
   )
 })
 
-test('toV2SessionUpdate: subagent_update passes through field for field', () => {
-  const update: SessionUpdate = {
-    sessionUpdate: 'subagent_update',
-    sessionId: 'child-1',
-    title: 'Research',
-    description: 'subagent · researcher',
-    capabilities: {},
-    state: { state: 'running' },
-    _meta: {
-      piSubagents: { kind: 'subagent', parentId: null, omitted: { runs: 1, children: 0, byteLimitExceeded: false } }
+test('toV2SessionUpdate: subagent_update and session_message pass through unchanged', () => {
+  const updates: SessionUpdate[] = [
+    {
+      sessionUpdate: 'subagent_update',
+      sessionId: 'child-1',
+      title: 'Research',
+      description: 'subagent · researcher',
+      capabilities: {},
+      state: { state: 'running' },
+      _meta: {
+        piSubagents: { kind: 'subagent', parentId: null, omitted: { runs: 1, children: 0, byteLimitExceeded: false } }
+      }
+    },
+    {
+      sessionUpdate: 'session_message',
+      messageId: '6f9619ff-8b86-d011-b42d-00cf4fc964ff',
+      senderSessionId: 'parent',
+      recipientSessionId: 'child-1',
+      content: [{ type: 'text', text: 'Research' }]
     }
+  ]
+  for (const update of updates) {
+    assert.equal(toV2SessionUpdate(update, undefined), update)
   }
-  assert.deepEqual(toV2SessionUpdate(update, undefined), update)
-})
-
-test('toV2SessionUpdate: session_message passes through field for field', () => {
-  const update: SessionUpdate = {
-    sessionUpdate: 'session_message',
-    messageId: '6f9619ff-8b86-d011-b42d-00cf4fc964ff',
-    senderSessionId: 'parent',
-    recipientSessionId: 'child-1',
-    content: [{ type: 'text', text: 'Research' }]
-  }
-  assert.deepEqual(toV2SessionUpdate(update, undefined), update)
 })

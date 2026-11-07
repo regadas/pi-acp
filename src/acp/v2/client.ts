@@ -8,7 +8,13 @@ import type {
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
 import { randomUUID } from 'node:crypto'
 import type { AcpClient, RequestOptions } from '../client.js'
-import { chunkUpdateKind, toV1PermissionResponse, toV2PermissionRequest, toV2SessionUpdate } from './translate.js'
+import {
+  chunkUpdateKind,
+  isTransparentUpdate,
+  toV1PermissionResponse,
+  toV2PermissionRequest,
+  toV2SessionUpdate
+} from './translate.js'
 import { replayEntryId } from '../replay-entry-id.js'
 
 type ChunkKind = ReturnType<typeof chunkUpdateKind> extends infer K | null ? K : never
@@ -27,7 +33,9 @@ const UPSERT_OF_CHUNK_KIND: Record<ChunkKind, 'user_message' | 'agent_message' |
  * The engine's chunk updates carry no message id (v1 allows none), so this
  * connection synthesizes them. Live chunks group consecutive chunks of the
  * same kind into one v2 message; any other update of the session ends the
- * current message. The live ids are fresh UUIDs: the engine's live emission
+ * current message, except subagent updates, which are transparent (see
+ * {@link isTransparentUpdate}) — they are metadata, not transcript content.
+ * The live ids are fresh UUIDs: the engine's live emission
  * path has no persisted-entry identity, so a live message's id can never
  * match the id its later replay uses — a documented association limitation
  * (see docs/adapter-reference.md).
@@ -66,7 +74,7 @@ export class V2ClientConnection implements AcpClient {
       await this.replayUpdate(sessionId, kind, params.update)
       return
     }
-    if (kind === null) {
+    if (kind === null && !isTransparentUpdate(params.update)) {
       this.currentMessage.delete(sessionId)
     }
     const messageId = kind !== null ? this.messageIdFor(sessionId, kind) : undefined
@@ -77,8 +85,9 @@ export class V2ClientConnection implements AcpClient {
   /**
    * A replayed update: the chunks of one retained entry accumulate into
    * that entry's single message; any other update (or the next entry) first
-   * completes the buffered one. Markerless chunks — none exist today — fall
-   * back to the live grouping.
+   * completes the buffered one — except transparent subagent updates, which
+   * pass through without completing it. Markerless chunks — none exist today
+   * — fall back to the live grouping.
    */
   private async replayUpdate(
     sessionId: string,
@@ -99,7 +108,7 @@ export class V2ClientConnection implements AcpClient {
       entries.set(key, entry)
       return
     }
-    await this.flushReplayEntry(sessionId)
+    if (!isTransparentUpdate(update)) await this.flushReplayEntry(sessionId)
     const messageId = kind !== null ? this.messageIdFor(sessionId, kind) : undefined
     const translated = toV2SessionUpdate(update, messageId)
     if (translated !== undefined)

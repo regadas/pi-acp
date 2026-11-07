@@ -220,6 +220,10 @@ surface it exercises. The scripts verify that exact revision and a clean checkou
 the checkout, so an unpinned or dirty one is rejected. `PI_ACP_EVAL_PI` overrides the pi executable,
 `PI_ACP_EVAL_LOG_DIR` collects traces, and `PI_ACP_EVAL_KEEP` (completion probe) retains the disposable root.
 They drive the stock subagents runner with deterministic local providers — no provider network.
+The telemetry probe runs three phases per run: a `subagents`-negotiated v1 connection, a plain-capabilities
+v1 negative control, and a v2 connection (subagents are baseline there, so its client capabilities are
+empty), each asserting the child announcements, the running → idle/end_turn state mapping and one
+`session_message` per announced child — except the negative control, which asserts their absence.
 After `npm run build`, the other `scripts/smoke-*.mjs` entrypoints are manual probes, not CI coverage.
 Use disposable `PI_CODING_AGENT_DIR`, `PI_ACP_DIR`, and `PI_CODING_AGENT_SESSION_DIR` directories.
 `smoke-compact.mjs`, `smoke-export.mjs`, and `smoke-acp-load.mjs` can generate provider traffic and require

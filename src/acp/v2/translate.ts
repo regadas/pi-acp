@@ -37,6 +37,17 @@ export function chunkUpdateKind(update: SessionUpdate): ChunkKind | null {
 }
 
 /**
+ * Subagent updates are transparent to the connection's open live message:
+ * snapshots re-emit every child about once a second while async children
+ * are live, and ending the open message on each would chop streamed text
+ * into a bubble per snapshot; v2 chunks resume under the same messageId.
+ */
+export function isTransparentUpdate(update: SessionUpdate): boolean {
+  const kind = update.sessionUpdate
+  return kind === 'subagent_update' || kind === 'session_message'
+}
+
+/**
  * The v2 form of a v1 session update, or undefined when v2 has no counterpart.
  * Chunk updates need the id of the message they belong to: v1 allows none, v2
  * requires one. Update kinds without a v2 counterpart throw rather than
@@ -185,8 +196,6 @@ export function v1InitializeRequest(params: v2.InitializeRequest): InitializeReq
     clientInfo: params.info,
     clientCapabilities: {
       ...(elicitation?.form != null ? { elicitation: { form: elicitation.form } } : {}),
-      // v2 subagents are baseline (no client capability), so v2 connections
-      // are treated as opted in; the v1 path stays negotiated.
       subagents: {}
     }
   }

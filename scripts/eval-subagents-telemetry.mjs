@@ -49,8 +49,10 @@ const isLive = pid => {
   }
 }
 
-// One isolated HOME/agent/tmp tree shared by both capability phases: the second
-// (plain-capability) prompt reuses the released gate so it settles quickly.
+// One isolated HOME/agent/tmp tree shared by all three phases: the second
+// (plain-capability) prompt reuses the released gate so it settles quickly;
+// the third (v2) removes it first to hold its child for the running
+// announcement, then rewrites it (see the phase comment).
 const root = await mkdtemp(join(tmpdir(), 'pi-acp-subagents-telemetry-'))
 const wrapper = join(root, 'pi-wrapper.mjs')
 const records = async () =>
