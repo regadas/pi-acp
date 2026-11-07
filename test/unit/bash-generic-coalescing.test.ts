@@ -237,6 +237,14 @@ test('PiAcpSession: capped windows flush on native totalBytes growth at the prod
   emitSnapshot(proc, 'b1', { content: [{ type: 'text', text: 'x'.repeat(1000) }] })
   emitSnapshot(proc, 'b1', capped(68536))
   emitSnapshot(proc, 'b1', capped(69536))
+  // Native-to-native growth past the threshold must flush on its own bytes:
+  // the earlier flush rode the measure-kind change, which would mask a broken
+  // native measure (e.g. always reading 0 or totalLines).
+  emitSnapshot(
+    proc,
+    'b1',
+    truncatedSnapshot('z'.repeat(51200), { totalLines: 1500, totalBytes: 138536, outputLines: 1280 })
+  )
   endBash(proc, 'b1', { content: [{ type: 'text', text: 'final done\n' }] })
   proc.emit({ type: 'agent_settled' })
   assert.equal(await prompt, 'end_turn')
@@ -247,6 +255,7 @@ test('PiAcpSession: capped windows flush on native totalBytes growth at the prod
     [
       ['in_progress', fenced('x'.repeat(1000))],
       ['in_progress', fenced(window)],
+      ['in_progress', fenced('z'.repeat(51200))],
       ['completed', fenced('final done\n')]
     ],
     'totalBytes growth flushes the capped window; sub-threshold totalBytes growth stays coalesced'
