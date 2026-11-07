@@ -13,7 +13,7 @@ export function acpStreamPair(): [Stream, Stream] {
   ]
 }
 
-type SessionUpdateMsg = SessionNotification
+export type SessionUpdateMsg = SessionNotification
 
 export type ConfigSyncRecord = {
   seeds: SessionConfigOption[][]

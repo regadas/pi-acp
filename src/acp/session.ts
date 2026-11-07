@@ -36,6 +36,13 @@ import {
 } from './translate/bash.js'
 import { translateCustomMessageContent, type TranslatedUserBlock } from './translate/pi-messages.js'
 import { toolResultImageBlocks, toolResultToolCallContent } from './translate/pi-tools.js'
+import {
+  collectSubagentChildren,
+  decodeSubagentSnapshotWidget,
+  subagentAnnouncementMessage,
+  subagentUnknownUpdate,
+  subagentUpdateFor
+} from './translate/subagents.js'
 import { getSessionConfiguration, THOUGHT_LEVEL_CONFIG_ID } from './session-config.js'
 import { isThinkingLevel } from './thinking-levels.js'
 import {
@@ -240,6 +247,9 @@ export class PiAcpSession {
   // Fabricated terminal references and terminal_* metadata are a negotiated
   // extension; never expose them to a client that did not opt in.
   private readonly supportsTerminalOutputMeta: boolean
+  // The unstable `subagents` client capability gates every subagent_update /
+  // session_message emission for pi-subagents child sessions.
+  private readonly supportsSubagentUpdates: boolean
   // Auth methods the owning agent advertised at initialize; auth-required
   // errors raised from this session must advertise exactly these.
   private readonly authMethods: AuthMethod[]
@@ -328,6 +338,14 @@ export class PiAcpSession {
   // terminal failure can still show output that coalescing suppressed.
   private genericBashContent = new Map<string, ToolCallContent[]>()
 
+  // pi-subagents children observed for the pending turn (id -> last emitted
+  // running state). Nulled when the turn settles.
+  private subagentChildren: Map<string, boolean> | null = null
+  // Children that already received their one session_message this turn. It
+  // survives disappearance (unlike the observable map) so a child that
+  // reappears in a later snapshot is not messaged twice in the same turn.
+  private readonly subagentMessaged = new Set<string>()
+
   // Ensure `session/update` notifications are sent in order and can be awaited
   // before completing a `session/prompt` request.
   private lastEmit: Promise<void> = Promise.resolve()
@@ -349,6 +367,7 @@ export class PiAcpSession {
     conn: AcpClient
     supportsElicitationForm?: boolean
     supportsTerminalOutputMeta?: boolean
+    supportsSubagentUpdates?: boolean
     authMethods?: AuthMethod[]
     /** Additional validated workspace roots for this session's child. */
     additionalDirectories?: readonly string[]
@@ -364,6 +383,7 @@ export class PiAcpSession {
     this.conn = opts.conn
     this.supportsElicitationForm = opts.supportsElicitationForm ?? false
     this.supportsTerminalOutputMeta = opts.supportsTerminalOutputMeta ?? false
+    this.supportsSubagentUpdates = opts.supportsSubagentUpdates ?? false
     this.authMethods = opts.authMethods ?? []
     this.deferredAdmissionTimeoutMs = opts.deferredAdmissionTimeoutMs ?? DEFERRED_ADMISSION_TIMEOUT_MS
     this.genericBashCoalesceBytes = opts.genericBashCoalesceBytes ?? GENERIC_BASH_COALESCE_BYTES
@@ -1770,6 +1790,7 @@ export class PiAcpSession {
     turn.completionStarted = true
     if (turn.piRunOwned || !this.piBusyOutOfBand) this.terminalizeToolCalls()
     this.clearDeferredDispatch()
+    this.settleSubagentChildren()
     const reason: StopReason = this.cancelRequested
       ? 'cancelled'
       : this.lastDoneReason === 'length'
@@ -1801,6 +1822,7 @@ export class PiAcpSession {
     turn.completionStarted = true
     if (turn.piRunOwned || !this.piBusyOutOfBand) this.terminalizeToolCalls()
     this.clearDeferredDispatch()
+    this.settleSubagentChildren()
 
     // Keep the failed turn installed while its existing updates flush so any
     // concurrent prompts queue rather than leapfrog it. Once that first flush
@@ -2809,6 +2831,11 @@ export class PiAcpSession {
       return
     }
 
+    if (method === 'setWidget' && ev.widgetKey === 'subagent-async') {
+      this.handleSubagentStatusWidget(ev)
+      return
+    }
+
     // Pi's display-only UI methods never wait for an extension_ui_response.
     if (method === 'setStatus' || method === 'setWidget' || method === 'setTitle' || method === 'set_editor_text')
       return
@@ -2849,6 +2876,56 @@ export class PiAcpSession {
     }
 
     await this.proc.sendExtensionUiResponse({ id, cancelled: true })
+  }
+
+  /**
+   * Translate a pi-subagents `subagent-async` status widget into ACP
+   * `subagent_update` child announcements, plus one parent-to-child
+   * `session_message` per child per turn (the first announcement only).
+   * Snapshots are attributed to the pending turn the way the lifecycle widget
+   * is: an out-of-band pi run's children stay invisible.
+   */
+  private handleSubagentStatusWidget(ev: PiRpcEvent): void {
+    if (!this.supportsSubagentUpdates) return
+    const turn = this.pendingTurn
+    if (!turn || !this.turnOwnsPiRun(turn)) return
+    const snapshot = decodeSubagentSnapshotWidget(ev.widgetLines)
+    if (snapshot === null) return
+    const tracked = this.subagentChildren ?? new Map()
+    this.subagentChildren = tracked
+    const seen = new Set<string>()
+    for (const child of collectSubagentChildren(snapshot.runs)) {
+      seen.add(child.id)
+      this.emit(subagentUpdateFor(child, snapshot.omitted))
+      if (!this.subagentMessaged.has(child.id)) {
+        this.subagentMessaged.add(child.id)
+        // Message ids must be unique across every replacement session that
+        // ever served this ACP sessionId: session_message is a transcript
+        // upsert keyed by messageId, so a reused id would overwrite history.
+        this.emit(subagentAnnouncementMessage(crypto.randomUUID(), this.sessionId, child))
+      }
+      tracked.set(child.id, child.state.state === 'running')
+    }
+    for (const id of [...tracked.keys()]) {
+      if (seen.has(id)) continue
+      // Leaving the snapshot is not a completion: never claim idle. A child
+      // already reported idle keeps that state; only running ones go unknown.
+      if (tracked.get(id)) this.emit(subagentUnknownUpdate(id))
+      tracked.delete(id)
+    }
+  }
+
+  /** A settled turn can no longer observe its children: untrack and unknown the running ones. */
+  private settleSubagentChildren(): void {
+    const tracked = this.subagentChildren
+    this.subagentChildren = null
+    // Cleared even when nothing was tracked: a future mid-turn map reset
+    // must never leak messaged ids into the next turn.
+    this.subagentMessaged.clear()
+    if (!tracked) return
+    for (const [id, running] of tracked) {
+      if (running) this.emit(subagentUnknownUpdate(id))
+    }
   }
 
   private async handleExtensionSelect(ev: PiRpcEvent, id: string): Promise<void> {

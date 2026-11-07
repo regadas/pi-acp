@@ -193,6 +193,9 @@ export class PiAcpAgent {
   // non-standard leaks before initialization.
   private supportsTerminalOutputMeta = false
   private supportsElicitationForm = false
+  // Negotiated at initialize: the unstable `subagents` capability gates ACP
+  // child-session announcements for pi-subagents activity.
+  private supportsSubagentUpdates = false
 
   dispose(): void {
     // Marking disposed first lets every in-flight create/restore that crosses
@@ -795,6 +798,7 @@ export class PiAcpAgent {
       conn: this.conn,
       proc,
       supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
+      supportsSubagentUpdates: this.supportsSubagentUpdates,
       authMethods: this.authMethods,
       supportsElicitationForm: this.supportsElicitationForm,
       additionalDirectories
@@ -866,12 +870,15 @@ export class PiAcpAgent {
       | {
           auth?: { terminal?: unknown } | null
           elicitation?: { form?: unknown } | null
+          subagents?: unknown | null
           _meta?: Record<string, unknown> | null
         }
       | null
       | undefined
     this.supportsTerminalOutputMeta = clientCapabilities?._meta?.['terminal_output'] === true
     this.supportsElicitationForm = clientCapabilities?.elicitation?.form != null
+    // `subagents` advertises itself with any non-null value (including `{}`).
+    this.supportsSubagentUpdates = clientCapabilities?.subagents != null
     // Terminal auth methods are advertised only against the stable v1
     // `auth.terminal` capability; the optional `_meta["terminal-auth"]`
     // launch spec is added only when the client also declared its meta flag.
@@ -923,6 +930,7 @@ export class PiAcpAgent {
       conn: this.conn,
       piCommand: process.env.PI_ACP_PI_COMMAND,
       supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
+      supportsSubagentUpdates: this.supportsSubagentUpdates,
       authMethods: this.authMethods,
       supportsElicitationForm: this.supportsElicitationForm,
       additionalDirectories
