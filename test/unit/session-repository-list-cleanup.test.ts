@@ -253,7 +253,9 @@ test('repository.list defers stat to missing timestamps and normalizes only the 
 
   const records = await repository.list(root)
   assert.equal(records.find(record => record.sessionId === 'timestamped')?.updatedAt, TIMESTAMP)
-  assert.deepEqual(stats, [missing])
+  // One stat per scanned file keys the metadata memo; the extra `missing`
+  // stat is the deferred mtime fallback for its absent timestamp.
+  assert.deepEqual([...stats].sort(), [missing, missing, timestamped].sort())
   assert.equal(normalizations, 2, 'only the final metadata timestamp and fallback mtime need normalization')
 })
 
@@ -637,8 +639,13 @@ test('repository.list propagates metadata stream and fallback stat resource erro
   })
   const stat = fs.promises.stat
   let statError: string | null = null
+  let statCalls = 0
+  let rejectCall = 0
+  // Exactly the rejectCall-th stat rejects: 1 surfaces the identity-stat
+  // rethrow inside scanMetadataCached, 2 project()'s fallback-stat rethrow.
   t.mock.method(fs.promises, 'stat', (...args: Parameters<typeof stat>) => {
-    if (statError) return Promise.reject(Object.assign(new Error('stat failed'), { code: statError }))
+    if (statError && ++statCalls === rejectCall)
+      return Promise.reject(Object.assign(new Error('stat failed'), { code: statError }))
     return stat(...args)
   })
   syncBuiltinESMExports()
@@ -648,9 +655,15 @@ test('repository.list propagates metadata stream and fallback stat resource erro
   assert.equal((await repository.list(root))[0]?.title, null, 'non-resource scan failures retain mtime fallback')
   streamError = null
   fs.writeFileSync(path, `${JSON.stringify({ type: 'session', id: 'errors', cwd: root })}\n`)
-  statError = 'ENFILE'
-  await assert.rejects(repository.list(root), { code: 'ENFILE' })
+  for (const leg of [1, 2]) {
+    statError = 'ENFILE'
+    statCalls = 0
+    rejectCall = leg
+    await assert.rejects(repository.list(root), { code: 'ENFILE' })
+  }
   statError = 'ENOENT'
+  statCalls = 0
+  rejectCall = 2
   assert.deepEqual(await repository.list(root), [])
 })
 

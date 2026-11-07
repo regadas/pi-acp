@@ -43,8 +43,8 @@ export function bashCommand(value: unknown): string | undefined {
   return typeof command === 'string' && command.trim() ? command : undefined
 }
 
-/** stdout/stderr from `details`/top-level fields only (never content blocks). */
-export function bashDetailsText(result: unknown): string {
+/** stdout/stderr/exitCode extracted from a pi result's `details`/top-level fields only (never content blocks). */
+export function bashResultFields(result: unknown): { stdout?: string; stderr?: string; exitCode?: number } {
   const record = result as BashResultRecord | null | undefined
   const details = record?.details as BashResultRecord | null | undefined
   const stdout =
@@ -55,7 +55,17 @@ export function bashDetailsText(result: unknown): string {
   const stderr =
     (typeof details?.stderr === 'string' ? details.stderr : undefined) ??
     (typeof record?.stderr === 'string' ? record.stderr : undefined)
+  const exitCode =
+    (typeof details?.exitCode === 'number' ? details.exitCode : undefined) ??
+    (typeof record?.exitCode === 'number' ? record.exitCode : undefined) ??
+    (typeof details?.code === 'number' ? details.code : undefined) ??
+    (typeof record?.code === 'number' ? record.code : undefined)
+  return { stdout, stderr, exitCode }
+}
 
+/** stdout/stderr from `details`/top-level fields only (never content blocks). */
+export function bashDetailsText(result: unknown): string {
+  const { stdout, stderr } = bashResultFields(result)
   return [stdout, stderr].filter((part): part is string => typeof part === 'string' && part.length > 0).join('\n')
 }
 
@@ -76,10 +86,8 @@ export function bashResultText(result: unknown): string {
 }
 
 export function bashExitCode(result: unknown, isError: boolean): number {
-  const record = result as BashResultRecord | null | undefined
-  const details = record?.details as BashResultRecord | null | undefined
-  const exitCode = details?.exitCode ?? record?.exitCode ?? details?.code ?? record?.code
-  return typeof exitCode === 'number' ? exitCode : isError ? 1 : 0
+  const { exitCode } = bashResultFields(result)
+  return exitCode ?? (isError ? 1 : 0)
 }
 
 /**
