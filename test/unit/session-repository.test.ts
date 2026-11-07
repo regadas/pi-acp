@@ -688,6 +688,48 @@ test('repository.list memoizes metadata scans and refreshes them on file changes
   assert.equal(scanned.length, 4, 'a bigger file with an unchanged mtime must not stay memoized')
 })
 
+test('repository.list retries a failed metadata scan without a file change', async t => {
+  const { default: fs } = await import('node:fs')
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-scan-retry-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = join(root, 'sessions')
+  mkdirSync(sessions)
+  writeFileSync(
+    join(sessions, 'retry.jsonl'),
+    [
+      JSON.stringify({ type: 'session', id: 'retry', cwd: root }),
+      JSON.stringify({ type: 'session_info', timestamp: '2026-01-01T00:00:00.000Z', name: 'Recovered' })
+    ].join('\n') + '\n'
+  )
+
+  const create = fs.createReadStream
+  let streamError: string | null = 'EIO'
+  t.mock.method(fs, 'createReadStream', (...args: Parameters<typeof create>) => {
+    const input = create(...args)
+    if (streamError) input.destroy(Object.assign(new Error('stream failed'), { code: streamError }))
+    return input
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+  })
+  const repository = new SessionRepository(
+    new SessionStore(join(root, 'map.json')),
+    { PI_CODING_AGENT_SESSION_DIR: sessions },
+    join(root, 'agent')
+  )
+
+  const failed = await repository.list(root)
+  assert.equal(failed[0]?.title, null, 'a transient stream error falls back to the mtime record')
+
+  // The file is unchanged: only the transient failure ended, so a memoized
+  // null would pin the lost title until the file changes.
+  streamError = null
+  const recovered = await repository.list(root)
+  assert.equal(recovered[0]?.title, 'Recovered', 'a failed scan is retried, not memoized')
+})
+
 test('repository carries additional directories through find and list refreshes', async () => {
   const root = mkdtempSync(join(tmpdir(), 'pi-acp-repository-roots-'))
   const sessions = join(root, 'sessions')
