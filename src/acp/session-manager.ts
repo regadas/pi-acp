@@ -18,6 +18,8 @@ type SessionCreateParams = {
   piCommand?: string
   /** Client negotiated the `_meta.terminal_output` tool rendering extension. */
   supportsTerminalOutputMeta?: boolean
+  /** Client negotiated the unstable `subagents` capability (ACP child sessions). */
+  supportsSubagentUpdates?: boolean
   /** Auth methods the owning agent advertised at initialize (for auth-required errors). */
   authMethods?: AuthMethod[]
   supportsElicitationForm?: boolean
@@ -408,6 +410,7 @@ export class SessionManager {
         proc,
         conn: params.conn,
         supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
+        supportsSubagentUpdates: params.supportsSubagentUpdates,
         authMethods: params.authMethods,
         supportsElicitationForm: params.supportsElicitationForm,
         additionalDirectories: params.additionalDirectories
@@ -461,6 +464,7 @@ export class SessionManager {
         proc: params.proc,
         conn: params.conn,
         supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
+        supportsSubagentUpdates: params.supportsSubagentUpdates,
         authMethods: params.authMethods,
         supportsElicitationForm: params.supportsElicitationForm,
         additionalDirectories: params.additionalDirectories
