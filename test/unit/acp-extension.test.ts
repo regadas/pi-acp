@@ -3114,6 +3114,91 @@ test('titles: generates once per session at prompt time with the cheap model', a
   assert.equal(h.completeCalls.length, 1, 'never regenerated')
 })
 
+test('titles: a skill invocation is titled from its arguments, not the command', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Audit The Code Again"}' }] }))
+
+  h.emit('session_start', {})
+  // pi rewrites a user slash command into a skill prompt before extensions see it.
+  h.emit('input', { source: 'extension', text: '/skill:ponytail-audit lets audit this code again' })
+  await flush()
+
+  assert.equal(h.completeCalls.length, 1, 'a skill invocation is a real request')
+  const prompt = h.completeCalls[0]!.context.messages[0].content[0].text as string
+  assert.equal(prompt.includes('lets audit this code again'), true)
+  assert.equal(prompt.includes('/skill:'), false, 'the command token is not conversation content')
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), {
+    title: 'lets audit this code again',
+    provisional: true
+  })
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[1]), { title: 'Audit The Code Again', provisional: false })
+})
+
+test('titles: a prompt that starts with a path or a URL keeps its first word', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Users Endpoint Returning 500"}' }] }))
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: '/api/v1/users returns 500 after login' })
+  await flush()
+  assert.equal(h.completeCalls.length, 1)
+  const prompt = h.completeCalls[0]!.context.messages[0].content[0].text as string
+  assert.equal(prompt.includes('/api/v1/users returns 500 after login'), true, 'the subject survives')
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), {
+    title: '/api/v1/users returns 500 after login',
+    provisional: true
+  })
+})
+
+test('titles: a command sent as a raw rpc prompt is titled from its arguments', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Reviewing App Entry Point"}' }] }))
+  h.emit('session_start', {})
+  // Prompt templates and /skill:<name> reach the hook raw, not as pi's rewrite.
+  h.emit('input', { source: 'rpc', text: '/review src/app.ts' })
+  await flush()
+  assert.equal(h.completeCalls.length, 1)
+  const prompt = h.completeCalls[0]!.context.messages[0].content[0].text as string
+  assert.equal(prompt.includes('src/app.ts'), true)
+  assert.equal(prompt.includes('/review'), false, 'the command token is not conversation content')
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), { title: 'src/app.ts', provisional: true })
+})
+
+test('titles: a bare command or an extension-sent notice is not a title source', async t => {
+  const bare = harness()
+  t.after(() => bare.emit('session_shutdown'))
+  bare.emit('session_start', {})
+  bare.emit('input', { source: 'extension', text: '/skill:ponytail-audit' })
+  bare.emit('message_end', {
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Audit report follows' }] }
+  })
+  bare.emit('agent_settled', {})
+  await flush()
+  assert.equal(bare.completeCalls.length, 0, 'a bare command has nothing to title from')
+  assert.deepEqual(bare.titleWidgets, [])
+
+  const notice = harness()
+  t.after(() => notice.emit('session_shutdown'))
+  notice.emit('session_start', {})
+  notice.emit('input', { source: 'extension', text: 'Detached subagent-abc: it keeps running in the background.' })
+  await flush()
+  assert.equal(notice.completeCalls.length, 0, 'foreign extension prose is not a user request')
+
+  const lone = harness()
+  t.after(() => lone.emit('session_shutdown'))
+  lone.emit('session_start', {})
+  lone.emit('input', { source: 'rpc', text: ' / ' })
+  lone.emit('message_end', {
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Nothing to do here, friend.' }] }
+  })
+  lone.emit('agent_settled', {})
+  await flush()
+  assert.equal(lone.completeCalls.length, 0, 'a lone slash is not a prompt')
+  assert.deepEqual(lone.titleWidgets, [])
+})
+
 test('titles: a short opener is titled at the end of its turn from the collected text', async t => {
   const h = harness()
   t.after(() => h.emit('session_shutdown'))
@@ -3266,6 +3351,7 @@ test('titles: skipped for restored sessions, named sessions, slash commands and 
   fresh.emit('session_start', {})
   fresh.emit('input', { source: 'rpc', text: '/compact' })
   fresh.emit('input', { source: 'interactive', text: 'typed in the tui' })
+  fresh.emit('input', { source: 'interactive', text: '/skill:demo typed in the tui' })
   await flush()
   assert.equal(fresh.completeCalls.length, 0)
 })

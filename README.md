@@ -72,6 +72,7 @@ Titles work the way the Claude and Codex ACP agents do: a dedicated cheap model 
 - One generation per session, published and persisted at up to 256 characters.
 - The model is the cheapest chat model in your catalogue that has credentials; `PI_ACP_TITLE_MODEL` pins a specific one. Your session's model is only the last resort.
 - Until it lands the thread carries a shortened title taken from your first message as a provisional title. If generation fails, that is what remains, and later prompts retry.
+- A prompt that starts with a slash command is titled from its arguments: `/review src/app.ts` is a thread about `src/app.ts`. A command with no arguments gives no title, and your next prompt names the thread. A first word holding another slash, like `/api/v1/users`, is a path and stays whole.
 - `/name`, or any name pi already had, always wins; a session restored with history is never re-titled.
 
 ## Configuration

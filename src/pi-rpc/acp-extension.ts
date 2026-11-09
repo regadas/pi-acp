@@ -193,6 +193,20 @@ function messageText(content: unknown): string {
     .join('')
 }
 
+/**
+ * The user's words in an `input` event. A slash command arrives either as pi's
+ * rewrite (source `extension`, text `/skill:<name> <args>`) or raw (source `rpc`,
+ * as `/skill:<name>` and prompt templates do); its name is not content, its
+ * arguments are. A first token holding another slash is a path or URL, kept whole.
+ */
+function titleSourceText(source: unknown, text: string): string {
+  if (source !== 'rpc' && source !== 'extension') return ''
+  const trimmed = text.trim()
+  // Prose from an extension is a delivery notice; only a slash form is a command.
+  if (source === 'extension' && !trimmed.startsWith('/')) return ''
+  return trimmed.replace(/^\/(?!\S*\/)\S*\s*/, '').trim()
+}
+
 /** A restored session already holds conversation; model/level records alone are not it. */
 function startsWithoutConversation(entries: unknown[]): boolean {
   return !entries.some(entry => {
@@ -792,10 +806,10 @@ export default function acpExtension(pi: Pi): void {
       event.source === 'rpc' && admission && typeof event.text === 'string'
         ? { text: event.text, hasImages: false }
         : undefined
-    if (titleExplicit || titleSettled || event.source !== 'rpc') return
+    if (titleExplicit || titleSettled) return
     if (typeof event.text !== 'string') return
-    const text = event.text.trim()
-    if (!text || text.startsWith('/')) return
+    const text = titleSourceText(event.source, event.text)
+    if (!text) return
     // Bounded, newline-framed excerpt: the model reads this as a conversation.
     titleContext = appendTitleContext(titleContext, `\n${text}\n`)
     titleFirstPrompt ??= text
