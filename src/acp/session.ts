@@ -46,6 +46,7 @@ import {
   subagentUpdateFor
 } from './translate/subagents.js'
 import { getSessionConfiguration, THOUGHT_LEVEL_CONFIG_ID } from './session-config.js'
+import { decodeTitleWidget, TITLE_WIDGET } from './session-title.js'
 import { isThinkingLevel } from './thinking-levels.js'
 import {
   findUniqueLineNumber,
@@ -261,6 +262,9 @@ export class PiAcpSession {
   private publishedCustomMessagesDuringLoad: PublishedCustomMessage[] | null = null
   private publishedTitle: string | null | undefined
   private sessionInfoSyncTail: Promise<void> = Promise.resolve()
+  // Never let a generated title replace a name the user or pi already set.
+  private sessionNameSeen = false
+  private userNamedSession = false
   private publishedConfigFingerprint: string | undefined
   private publishedThoughtLevel: string | undefined
   private publishedConfigOptions: SessionConfigOption[] = []
@@ -1327,6 +1331,40 @@ export class PiAcpSession {
     return operation
   }
 
+  /** An explicit user rename outranks any title this session derives later. Returns the previous state. */
+  markUserSessionName(named = true): boolean {
+    const previous = this.userNamedSession
+    this.userNamedSession = named
+    return previous
+  }
+
+  private titleSuperseded(): boolean {
+    return this.disposed || this.userNamedSession || this.sessionNameSeen
+  }
+
+  /** Publish a title the extension generated, unless a name already outranks it. */
+  private async applyGeneratedTitle(payload: { title: string; provisional: boolean } | null): Promise<void> {
+    if (!payload || this.titleSuperseded()) return
+
+    // Publish before persisting: a rename that lands during the pi write then
+    // wins, and the recheck below keeps this title out of pi's session name.
+    await this.syncSessionInfo(payload.title, () => this.titleSuperseded()).catch(() => {})
+
+    // Only a settled title names the pi session: a provisional placeholder must
+    // not permanently rename it (its echo would also outrank the real title).
+    if (payload.provisional || this.titleSuperseded()) return
+
+    // Publishing first means a rename this adapter already saw outranks the
+    // write below. A rename that reaches pi inside that one write's round trip
+    // cannot be withdrawn without a conditional write in pi's RPC, so the
+    // adapter assumes one writer per session, as the reference agents do.
+    try {
+      await this.proc.setSessionName(payload.title)
+    } catch {
+      /* Older pi has no set_session_name; the ACP title still works without it. */
+    }
+  }
+
   // An ACP-driven publication is authoritative: bumping the epoch discards
   // every configuration probe requested or read before this state.
   seedSessionConfiguration(configOptions: SessionConfigOption[]): void {
@@ -2109,6 +2147,7 @@ export class PiAcpSession {
       case 'session_info_changed': {
         const name = ev.name
         if (name !== undefined && typeof name !== 'string') break
+        if (name?.trim()) this.sessionNameSeen = true
         // A claimed FIFO slot may still be parked behind foreign work. Capture
         // only an executing command so its echo keeps that command's lifetime.
         const command = this.activeAdapterPromptTurns > 0 ? this.activeCommand : null
@@ -2810,6 +2849,11 @@ export class PiAcpSession {
 
     if (method === 'setWidget' && ev.widgetKey === 'subagent-async') {
       this.handleSubagentStatusWidget(ev)
+      return
+    }
+
+    if (method === 'setWidget' && ev.widgetKey === TITLE_WIDGET) {
+      void this.applyGeneratedTitle(decodeTitleWidget(ev.widgetLines)).catch(() => {})
       return
     }
 

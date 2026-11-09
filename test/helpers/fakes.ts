@@ -254,6 +254,17 @@ export class FakePiRpcProcess {
     return this.state
   }
 
+  readonly sessionNames: string[] = []
+  sessionNameError: Error | null = null
+  // Opt-in: real pi echoes its own rename as a session_info_changed event.
+  echoSessionName = false
+
+  async setSessionName(name: string): Promise<void> {
+    if (this.sessionNameError) throw this.sessionNameError
+    this.sessionNames.push(name)
+    if (this.echoSessionName) this.emit({ type: 'session_info_changed', name })
+  }
+
   readonly thinkingLevels: string[] = []
   availableThinkingLevels: string[] | null = null
 

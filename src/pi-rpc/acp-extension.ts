@@ -1,6 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { ACP_LIFECYCLE_WIDGET } from './protocol.js'
 import {
+  appendTitleContext,
+  buildTitlePrompt,
+  encodeTitleWidget,
+  firstMessageTitle,
+  MIN_TITLE_CONTEXT_LENGTH,
+  TITLE_WIDGET,
+  titleFromModelOutput
+} from '../acp/session-title.js'
+import {
   WORKSPACE_INSTRUCTIONS_SECTION,
   WORKSPACE_ROOTS_ENV,
   buildWorkspaceInstructionsSection,
@@ -14,9 +23,21 @@ type Context = {
   isIdle(): boolean
   hasPendingMessages(): boolean
   waitForIdle(): Promise<void>
+  model?: { provider?: unknown; id?: unknown }
+  modelRegistry?: {
+    complete(
+      model: unknown,
+      context: { messages: unknown[] },
+      options?: { signal?: AbortSignal; maxTokens?: number; cacheRetention?: string }
+    ): Promise<{ content: Array<{ type?: string; text?: string }>; stopReason?: string }>
+    find?(provider: string, id: string): unknown
+    getAvailable?(): unknown[]
+    hasConfiguredAuth?(model: unknown): boolean
+  }
   sessionManager: {
     getSessionId(): string
     getSessionFile(): string | undefined
+    getEntries?(): unknown[]
     getBranch?(): Array<{ type?: string; customType?: string; details?: unknown }>
   }
   ui: { setWidget(key: string, lines: string[] | undefined): void }
@@ -110,6 +131,8 @@ const NOTICE = 'subagent-notify'
 const SUPERVISOR_REQUEST = 'subagent_supervisor_request'
 const SUPERVISOR_WAKE_EVENT = 'pi-intercom:detach-request'
 const WAITING_TYPE = 'pi-acp-completion-wait'
+const TITLE_MODEL_ENV = 'PI_ACP_TITLE_MODEL'
+const TITLE_TIMEOUT_MS = 15_000
 
 function readSnapshot(status: Record<string, unknown>): Snapshot & { runs: SnapshotNode[] } {
   const snapshot = status.asyncSnapshot as Snapshot | undefined
@@ -156,6 +179,26 @@ function nestedStatus(text: unknown, id: string): { parent: string; root: string
       'State: (queued|running|complete|failed|partial|paused|stopped|rejected)(?:\\n|$)'
   ).exec(text)
   if (headers) return { root: headers[1]!, parent: headers[2]!, state: headers[3]! }
+}
+
+/** Plain text of a message's content, tolerating string and block forms. */
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .flatMap(block => {
+      const part = block as { type?: unknown; text?: unknown }
+      return part.type === 'text' && typeof part.text === 'string' ? [part.text] : []
+    })
+    .join('')
+}
+
+/** A restored session already holds conversation; model/level records alone are not it. */
+function startsWithoutConversation(entries: unknown[]): boolean {
+  return !entries.some(entry => {
+    const record = entry as { type?: unknown; message?: { role?: unknown } }
+    return record.type === 'message' && (record.message?.role === 'user' || record.message?.role === 'assistant')
+  })
 }
 
 /** Adapter-owned bridge to pi-subagents' optional v1 host liveness/stop contracts. */
@@ -650,12 +693,137 @@ export default function acpExtension(pi: Pi): void {
       }
     }
   })
-  pi.on('input', event => {
+  // Titles are generated here, in pi's own process: no second process, no
+  // duplicate credential resolution. The adapter publishes the result after its
+  // own precedence checks, so an explicit name always wins.
+  let titleContext: string | undefined
+  // The first real prompt: what the provisional title is taken from.
+  let titleFirstPrompt: string | undefined
+  let titleSettled = false
+  let titleAskedAtPrompt = false
+  let titleExplicit = false
+  pi.on('session_start', (_event, ctx) => {
+    // Fail closed: a restored conversation, or one pi cannot describe, is never
+    // titled.
+    const entries = ctx.sessionManager.getEntries?.()
+    if (entries && startsWithoutConversation(entries)) return
+    titleExplicit = true
+    titleSettled = true
+  })
+  /** The cheap title model: the Codex/Claude agents never title with the session's
+   *  model. `PI_ACP_TITLE_MODEL` pins one; otherwise the cheapest authenticated
+   *  catalogue model wins, and the session's own model is the last resort. */
+  const titleModel = (ctx: Context): unknown => {
+    const registry = ctx.modelRegistry
+    if (!registry) return ctx.model
+    const wanted = process.env[TITLE_MODEL_ENV]?.trim()
+    if (wanted) {
+      const separator = wanted.indexOf('/')
+      const found = separator > 0 ? registry.find?.(wanted.slice(0, separator), wanted.slice(separator + 1)) : undefined
+      if (found) return found
+    }
+    let cheapest: { model: unknown; cost: number } | undefined
+    for (const model of registry.getAvailable?.() ?? []) {
+      const record = model as { cost?: { input?: unknown; output?: unknown }; type?: unknown }
+      if (record.type !== undefined && record.type !== 'chat') continue
+      const input = Number(record.cost?.input)
+      const output = Number(record.cost?.output)
+      if (!Number.isFinite(input) || !Number.isFinite(output)) continue
+      if (registry.hasConfiguredAuth?.(model) === false) continue
+      const cost = input + output
+      if (!cheapest || cost < cheapest.cost) cheapest = { model, cost }
+    }
+    return cheapest?.model ?? ctx.model
+  }
+
+  const generateTitle = (firstPrompt: string, description: string, ctx: Context): void => {
+    if (titleSettled || titleExplicit) return
+    // Provisional title first, taken from the user's own first message (the
+    // collected context also carries the assistant's reply).
+    const provisional = firstMessageTitle(firstPrompt)
+    if (provisional) ctx.ui.setWidget(TITLE_WIDGET, encodeTitleWidget(provisional, true))
+
+    const registry = ctx.modelRegistry
+    const model = registry ? titleModel(ctx) : undefined
+    if (!registry || !model) return
+    titleSettled = true
+    // Reopened when the attempt yields nothing, so a later prompt retries.
+    const reopenTitle = () => {
+      titleSettled = false
+    }
+    void registry
+      .complete(
+        model,
+        {
+          messages: [
+            {
+              role: 'user',
+              content: [{ type: 'text', text: buildTitlePrompt(description) }],
+              timestamp: Date.now()
+            }
+          ]
+        },
+        // Generous: a reasoning model spends most of this on thinking before the JSON.
+        { maxTokens: 512, cacheRetention: 'none', signal: AbortSignal.timeout(TITLE_TIMEOUT_MS) }
+      )
+      .then(response => {
+        if (response.stopReason === 'aborted') return reopenTitle()
+        const raw = response.content
+          .filter(part => part.type === 'text')
+          .map(part => part.text ?? '')
+          .join('\n')
+        const title = titleFromModelOutput(raw)
+        if (!title) return reopenTitle()
+        ctx.ui.setWidget(TITLE_WIDGET, encodeTitleWidget(title))
+      })
+      .catch(reopenTitle)
+  }
+
+  /** The user's or pi's own session name outranks any generated title. */
+  pi.on('session_info_changed', event => {
+    const name = (event as { name?: unknown }).name
+    if (typeof name !== 'string' || !name.trim()) return
+    titleExplicit = true
+    titleSettled = true
+  })
+
+  pi.on('input', (event, ctx) => {
     expectedInput =
       event.source === 'rpc' && admission && typeof event.text === 'string'
         ? { text: event.text, hasImages: false }
         : undefined
+    if (titleExplicit || titleSettled || event.source !== 'rpc') return
+    if (typeof event.text !== 'string') return
+    const text = event.text.trim()
+    if (!text || text.startsWith('/')) return
+    // Bounded, newline-framed excerpt: the model reads this as a conversation.
+    titleContext = appendTitleContext(titleContext, `\n${text}\n`)
+    titleFirstPrompt ??= text
+    titleAskedAtPrompt = false
+    // An opener like "hi" has no title in it: title at the end of the turn instead.
+    if (text.length < MIN_TITLE_CONTEXT_LENGTH) return
+    titleAskedAtPrompt = true
+    // Fire and forget: a title must never delay the prompt it describes.
+    generateTitle(titleFirstPrompt, text, ctx)
   })
+
+  // Collected for the turn-end title only; the adapter owns the transcript.
+  pi.on('message_end', (event, _ctx) => {
+    if (titleFirstPrompt === undefined || titleSettled || titleExplicit) return
+    const message = (event as { message?: { role?: unknown; content?: unknown } }).message
+    if (message?.role !== 'assistant') return
+    const text = messageText(message.content)
+    if (text) titleContext = appendTitleContext(titleContext, text)
+  })
+
+  // A turn is titleable only when it carried a real user prompt.
+  pi.on('agent_settled', (_event, ctx) => {
+    if (titleFirstPrompt === undefined || titleAskedAtPrompt) return
+    const description = titleContext?.trim() ?? ''
+    if (description.length < MIN_TITLE_CONTEXT_LENGTH) return
+    generateTitle(titleFirstPrompt, description, ctx)
+  })
+
   pi.on('before_agent_start', event => {
     if (expectedInput !== undefined) {
       expectedInput =

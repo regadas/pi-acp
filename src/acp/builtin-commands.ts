@@ -151,9 +151,14 @@ export async function runBuiltinCommand(
       return { stopReason: 'end_turn' }
     }
 
+    // A user rename is authoritative: a generated title must never replace it.
+    const wasNamed = session.markUserSessionName()
+
     try {
       await session.proc.setSessionName(name)
     } catch (e: unknown) {
+      // A failed rename leaves the session as it was named before this attempt.
+      session.markUserSessionName(wasNamed)
       const msg = String(e instanceof Error ? e.message : e)
       const hint = /set_session_name/i.test(msg)
         ? ' This requires a newer pi version that supports `set_session_name` in RPC mode.'

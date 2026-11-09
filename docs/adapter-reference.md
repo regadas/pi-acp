@@ -23,6 +23,7 @@ The design targets ACP clients generically. Optional extensions are enabled only
   - For `edit`, `pi-acp` attempts to infer a 1-based line number from a unique `oldText` match in the pre-edit file snapshot and includes it in the emitted tool location when possible
   - For `edit`, `pi-acp` snapshots the file before the tool runs and emits an ACP **structured diff** (`oldText`/`newText`) on completion when possible
 - Stable ACP v1 session lifecycle
+  - Session titles follow the Claude and Codex ACP agents: one generation per session from a dedicated cheap model (the cheapest authenticated chat model, or `PI_ACP_TITLE_MODEL`), from the first prompt or, for an opener too short to title from, from the end of the first turn that collects enough text. Titles are published as `session_info_update` (up to 256 characters) and written to pi's session name, which `session/list`, load and resume read; a list entry shortens the name. A shortened title taken from the first message is published first as a provisional title, and a failed generation leaves it in place for a later prompt to retry. An explicit `/name` or an existing pi session name is never replaced, and a session restored with history is not titled
   - `session/list` discovers all known pi sessions or filters them by cwd
   - `session/load` restores a session and replays the complete active-branch history (via pi's `get_entries`) before responding: user text and images, assistant text, thinking, and tool calls, tool results, visible custom messages, and `!command` shell executions, including pre-compaction history
   - `session/resume` restores a session without replaying history
@@ -80,6 +81,7 @@ npm install -g @earendil-works/pi-coding-agent
 - `PI_ACP_DIR=/path/to/state` overrides the adapter-owned state directory (default: `~/.pi/pi-acp`).
 - `PI_CODING_AGENT_DIR=/path/to/agent` overrides pi's global agent directory for settings, sessions, prompts, extensions, and skills (default: `~/.pi/agent`).
 - `PI_CODING_AGENT_SESSION_DIR` selects pi's custom session directory. Otherwise merged global/project `sessionDir` settings apply, then pi's cwd-encoded default. `~` expands and relative custom paths resolve from the session cwd.
+- `PI_ACP_TITLE_MODEL=provider/model` pins the model used for the generated session title to a catalogue entry. Unset means the cheapest chat model with configured credentials.
 
 ## Slash commands
 

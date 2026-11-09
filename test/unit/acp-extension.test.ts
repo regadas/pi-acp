@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import acpExtension from '../../src/pi-rpc/acp-extension.js'
+import { decodeTitleWidget, TITLE_WIDGET } from '../../src/acp/session-title.js'
 import { WORKSPACE_INSTRUCTIONS_SECTION, WORKSPACE_ROOTS_ENV } from '../../src/pi-rpc/workspace-instructions.js'
 
 const key = Symbol.for('@agegr/pi-web/session-liveness/v1')
@@ -13,18 +14,43 @@ const key = Symbol.for('@agegr/pi-web/session-liveness/v1')
 const WORKSPACE_ROOTS_REGISTRY = Symbol.for('@regadas/pi-acp/workspace-roots/v1')
 const globals = globalThis as Record<symbol, any>
 
-function harness() {
-  const hooks = new Map<string, (event: any, ctx: any) => void>()
+function harness(options: { entries?: unknown[] } = {}) {
+  // Real pi runs every registered handler for a hook, in registration order.
+  const hooks = new Map<string, Array<(event: any, ctx: any) => any>>()
   const events = new EventEmitter()
   let command!: (args: string, ctx: any) => Promise<void>
   const tools = new Map<string, any>()
   const updates: any[] = []
+  // Title widgets carry generated session titles; they never reach `updates`.
+  const titleWidgets: string[][] = []
+  const completeCalls: Array<{ model: unknown; context: any; options: any }> = []
+  let completeResult = () => ({ content: [] as any[], stopReason: 'end_turn' })
+  const entries = options.entries ?? [{ type: 'model_change' }, { type: 'thinking_level_change' }]
   const ctx = {
     isIdle: () => true,
     hasPendingMessages: () => false,
     waitForIdle: async () => {},
-    sessionManager: { getSessionId: () => 'session', getSessionFile: () => '/session' },
-    ui: { setWidget: (_key: string, lines: string[]) => updates.push(JSON.parse(lines[0]!)) }
+    model: { provider: 'test', id: 'session-model' },
+    modelRegistry: {
+      complete: async (model: unknown, context: any, opts: any) => {
+        completeCalls.push({ model, context, options: opts })
+        return completeResult()
+      },
+      find: (provider: string, id: string) => CATALOGUE.find(model => model.provider === provider && model.id === id),
+      getAvailable: () => CATALOGUE,
+      hasConfiguredAuth: (model: any) => model.id !== 'unauthed'
+    },
+    sessionManager: {
+      getSessionId: () => 'session',
+      getSessionFile: () => '/session',
+      getEntries: () => entries
+    },
+    ui: {
+      setWidget: (key: string, lines: string[]) => {
+        if (key === TITLE_WIDGET) titleWidgets.push(lines)
+        else updates.push(JSON.parse(lines[0]!))
+      }
+    }
   }
   acpExtension({
     events: {
@@ -39,7 +65,7 @@ function harness() {
       }
     },
     on: (name, handler) => {
-      hooks.set(name, handler)
+      hooks.set(name, [...(hooks.get(name) ?? []), handler])
     },
     registerCommand: (_name, value) => {
       command = value.handler
@@ -51,6 +77,11 @@ function harness() {
   return {
     ctx,
     updates,
+    titleWidgets,
+    completeCalls,
+    setCompleteResult: (value: () => any) => {
+      completeResult = value
+    },
     events,
     command: (args: string) => command(/^(cancel|check) /.test(args) ? `${args} ${Date.now() + 9_000}` : args, ctx),
     // Simulated native-idle driver; real Pi abort ordering is checked separately.
@@ -64,13 +95,31 @@ function harness() {
         await new Promise(resolve => setTimeout(resolve, 25))
       }
     },
-    emit: (name: string, event: any = {}): any => hooks.get(name)?.(event, ctx),
+    emit: (name: string, event: any = {}): any => {
+      let last: any
+      for (const handler of hooks.get(name) ?? []) {
+        const result = handler(event, ctx)
+        if (result !== undefined) last = result
+      }
+      return last
+    },
     tool: (name: string, params: unknown) => tools.get(name)!.execute('call', params, undefined, undefined, ctx),
     tools,
     register: (value: any) => globals[key].register(value)
   }
 }
 const owner = '11111111-1111-4111-8111-111111111111'
+// One analogue of a real catalogue: a pricey session model, a cheap chat model,
+// a cheaper one without credentials, and a non-chat model.
+const CATALOGUE = [
+  { provider: 'test', id: 'session-model', type: 'chat', cost: { input: 15, output: 75 } },
+  { provider: 'test', id: 'cheap', type: 'chat', cost: { input: 0.1, output: 0.2 } },
+  { provider: 'test', id: 'cheap-input', type: 'chat', cost: { input: 0.05, output: 40 } },
+  { provider: 'test', id: 'cheap-output', type: 'chat', cost: { input: 40, output: 0.05 } },
+  { provider: 'test', id: 'unauthed', type: 'chat', cost: { input: 0.01, output: 0.01 } },
+  { provider: 'test', id: 'classifier', type: 'classifier', cost: { input: 0.001, output: 0.001 } },
+  { provider: 'test', id: 'pinned', type: 'chat', cost: { input: 5, output: 5 } }
+]
 
 test('before_agent_start leaves the rendered system prompt unchanged; acp_detach stays exposed', t => {
   const h = harness()
@@ -3028,4 +3077,329 @@ test('workspace roots survive an extension factory reload with the scrubbed env'
     hook(second)?.includes('reload-stable guidance'),
     'a factory reload must not lose the process-start workspace roots'
   )
+})
+
+test('titles: generates once per session at prompt time with the cheap model', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '```json\n{"title":"Derive ACP Titles"}\n```' }] }))
+
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: 'my threads all say New Thread, can we derive titles?' })
+  await flush()
+
+  assert.equal(h.completeCalls.length, 1, 'one model call')
+  // Parity with the Claude and Codex agents: a cheap model, not the session's.
+  assert.deepEqual(h.completeCalls[0]!.model, {
+    provider: 'test',
+    id: 'cheap',
+    type: 'chat',
+    cost: { input: 0.1, output: 0.2 }
+  })
+  assert.equal(
+    (h.completeCalls[0]!.context.messages[0].content[0].text as string).startsWith('Generate a very short title'),
+    true
+  )
+  assert.deepEqual(h.completeCalls[0]!.options.maxTokens, 512)
+  assert.equal(h.completeCalls[0]!.options.signal instanceof AbortSignal, true, 'the call is bounded by a timeout')
+  // Provisional title lands immediately; the model replaces it.
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), {
+    title: 'my threads all say New Thread, can we derive titles?',
+    provisional: true
+  })
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[1]), { title: 'Derive ACP Titles', provisional: false })
+
+  h.emit('input', { source: 'rpc', text: 'a later prompt' })
+  await flush()
+  assert.equal(h.completeCalls.length, 1, 'never regenerated')
+})
+
+test('titles: a short opener is titled at the end of its turn from the collected text', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Greeting Exchange"}' }] }))
+
+  h.emit('session_start', {})
+  // "hi" carries no title: nothing is asked at prompt time.
+  h.emit('input', { source: 'rpc', text: 'hi' })
+  await flush()
+  assert.equal(h.completeCalls.length, 0)
+
+  h.emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text: 'Hello! How can I help?' }] } })
+  h.emit('agent_settled', {})
+  await flush()
+
+  assert.equal(h.completeCalls.length, 1, 'titled from the turn, like the Claude agent')
+  // The placeholder is the user's own first message, never user+assistant run together.
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), { title: 'hi', provisional: true })
+  const prompt = h.completeCalls[0]!.context.messages[0].content[0].text as string
+  // The turn-end call site uses the shared neutral instruction and header.
+  assert.match(prompt, /^Generate a very short title for this conversation/)
+  assert.equal(prompt.includes('Conversation excerpt:'), true)
+  assert.equal(prompt.includes('hi'), true)
+  assert.equal(prompt.includes('Hello! How can I help?'), true)
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets.at(-1)), { title: 'Greeting Exchange', provisional: false })
+})
+
+test('titles: a failed prompt-time attempt is not retried by the same turn end', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [], stopReason: 'end_turn' }))
+
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: 'derive a thread title' })
+  await flush()
+  assert.equal(h.completeCalls.length, 1)
+
+  // Same turn: the prompt already asked, so the turn end must not ask again.
+  h.emit('message_end', {
+    message: { role: 'assistant', content: [{ type: 'text', text: 'A long enough reply to title from.' }] }
+  })
+  h.emit('agent_settled', {})
+  await flush()
+  assert.equal(h.completeCalls.length, 1, 'one attempt per turn')
+
+  // The next prompt retries, because the failure reopened the latch.
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Second Attempt"}' }] }))
+  h.emit('input', { source: 'rpc', text: 'another prompt here' })
+  await flush()
+  assert.equal(h.completeCalls.length, 2)
+})
+
+test('titles: a turn end below the context floor asks nothing', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: 'hi' })
+  // "hi" plus a two-character reply stays under the ten-character floor.
+  h.emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } })
+  h.emit('agent_settled', {})
+  await flush()
+
+  assert.equal(h.completeCalls.length, 0)
+  assert.deepEqual(h.titleWidgets, [])
+})
+
+test('titles: a turn-end title is generated once per session', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Greeting Exchange"}' }] }))
+
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: 'hi' })
+  h.emit('message_end', { message: { role: 'assistant', content: [{ type: 'text', text: 'Hello! How can I help?' }] } })
+  h.emit('agent_settled', {})
+  await flush()
+  assert.equal(h.completeCalls.length, 1)
+  const settledWidgets = h.titleWidgets.length
+
+  // A later turn must not title the session again.
+  h.emit('input', { source: 'rpc', text: 'another reasonably long prompt' })
+  h.emit('message_end', {
+    message: { role: 'assistant', content: [{ type: 'text', text: 'A second reply follows.' }] }
+  })
+  h.emit('agent_settled', {})
+  await flush()
+  assert.equal(h.completeCalls.length, 1, 'the settled title is never regenerated')
+  assert.equal(h.titleWidgets.length, settledWidgets, 'and no further title is published')
+
+  // A name arriving before the turn end suppresses the turn-end title entirely.
+  const named = harness()
+  t.after(() => named.emit('session_shutdown'))
+  named.emit('session_start', {})
+  named.emit('input', { source: 'rpc', text: 'hi' })
+  named.emit('session_info_changed', { name: 'Chosen Later' })
+  named.emit('message_end', {
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Hello! How can I help?' }] }
+  })
+  named.emit('agent_settled', {})
+  await flush()
+  assert.equal(named.completeCalls.length, 0)
+  assert.deepEqual(named.titleWidgets, [])
+})
+
+test('titles: a failed generation is retried on the next prompt', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => ({ content: [], stopReason: 'end_turn' }))
+
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: 'first attempt please' })
+  await flush()
+  assert.equal(h.completeCalls.length, 1)
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), { title: 'first attempt please', provisional: true })
+
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Second Time Lucky"}' }] }))
+  h.emit('input', { source: 'rpc', text: 'second attempt please, a much later message' })
+  await flush()
+  assert.equal(h.completeCalls.length, 2, 'the latch is released after a failed attempt')
+  // The retry names the thread from the first message, never from the later prompt.
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[1]), { title: 'first attempt please', provisional: true })
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets.at(-1)), { title: 'Second Time Lucky', provisional: false })
+})
+
+test('titles: skipped for restored sessions, named sessions, slash commands and typed prompts', async t => {
+  const restored = harness({
+    entries: [
+      { type: 'model_change' },
+      { type: 'message', message: { role: 'user' } },
+      { type: 'message', message: { role: 'assistant' } }
+    ]
+  })
+  t.after(() => restored.emit('session_shutdown'))
+  restored.emit('session_start', {})
+  restored.emit('input', { source: 'rpc', text: 'history already exists' })
+  await flush()
+  assert.equal(restored.completeCalls.length, 0)
+
+  const named = harness()
+  t.after(() => named.emit('session_shutdown'))
+  named.emit('session_start', {})
+  named.emit('session_info_changed', { name: '/rename wins' })
+  named.emit('input', { source: 'rpc', text: 'a perfectly good prompt' })
+  await flush()
+  assert.equal(named.completeCalls.length, 0)
+
+  const fresh = harness()
+  t.after(() => fresh.emit('session_shutdown'))
+  fresh.emit('session_start', {})
+  fresh.emit('input', { source: 'rpc', text: '/compact' })
+  fresh.emit('input', { source: 'interactive', text: 'typed in the tui' })
+  await flush()
+  assert.equal(fresh.completeCalls.length, 0)
+})
+
+test('titles: an empty or aborted model response leaves the provisional title', async () => {
+  for (const result of [
+    () => ({ content: [], stopReason: 'end_turn' }),
+    () => ({ content: [{ type: 'text', text: '{"title":"ignored"}' }], stopReason: 'aborted' })
+  ]) {
+    const h = harness()
+    h.setCompleteResult(result as () => any)
+    h.emit('session_start', {})
+    h.emit('input', { source: 'rpc', text: 'derive a title' })
+    await flush()
+    // Only the provisional title survives a failed model call.
+    assert.equal(h.titleWidgets.length, 1)
+    assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), { title: 'derive a title', provisional: true })
+    h.emit('session_shutdown')
+  }
+})
+
+test('titles: PI_ACP_TITLE_MODEL pins a catalogue model over the cheap default', async t => {
+  const previous = process.env.PI_ACP_TITLE_MODEL
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_ACP_TITLE_MODEL
+    else process.env.PI_ACP_TITLE_MODEL = previous
+  })
+
+  process.env.PI_ACP_TITLE_MODEL = 'test/pinned'
+  const pinned = harness()
+  t.after(() => pinned.emit('session_shutdown'))
+  pinned.emit('session_start', {})
+  pinned.emit('input', { source: 'rpc', text: 'derive a title' })
+  await flush()
+  assert.equal((pinned.completeCalls[0]!.model as { id: string }).id, 'pinned')
+
+  // An unknown pin falls through to the cheap model, never to the session's.
+  process.env.PI_ACP_TITLE_MODEL = 'nope/missing'
+  const missing = harness()
+  t.after(() => missing.emit('session_shutdown'))
+  missing.emit('session_start', {})
+  missing.emit('input', { source: 'rpc', text: 'derive a title' })
+  await flush()
+  assert.equal((missing.completeCalls[0]!.model as { id: string }).id, 'cheap')
+})
+
+test('titles: the cheapest model is chosen by input plus output cost', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: 'derive a title' })
+  await flush()
+  // The catalogue holds a model cheaper by input alone (0.05, expensive output)
+  // and one cheaper by output alone (0.05, expensive input): only the summed
+  // cost picks `cheap`, so this test can tell all three rules apart.
+  assert.equal((h.completeCalls[0]!.model as { id: string }).id, 'cheap')
+})
+
+test('titles: the prompt-time gate is exactly ten trimmed characters', async t => {
+  const short = harness()
+  const exact = harness()
+  const padded = harness()
+  t.after(() => {
+    short.emit('session_shutdown')
+    exact.emit('session_shutdown')
+    padded.emit('session_shutdown')
+  })
+  for (const h of [short, exact, padded]) h.emit('session_start', {})
+
+  short.emit('input', { source: 'rpc', text: '123456789' })
+  exact.emit('input', { source: 'rpc', text: '1234567890' })
+  padded.emit('input', { source: 'rpc', text: '   123456789   ' })
+  await flush()
+
+  assert.equal(short.completeCalls.length, 0, 'nine characters is too short to title from')
+  assert.equal(exact.completeCalls.length, 1, 'ten characters is enough')
+  assert.equal(padded.completeCalls.length, 0, 'the prompt is trimmed before the gate')
+})
+
+test('titles: a rejected model call reopens the title for a later prompt', async t => {
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  h.setCompleteResult(() => {
+    throw new Error('provider exploded')
+  })
+
+  h.emit('session_start', {})
+  h.emit('input', { source: 'rpc', text: 'derive a title' })
+  await flush()
+  assert.equal(h.completeCalls.length, 1)
+  // The rejection must not escape into pi and must keep the provisional title.
+  assert.equal(h.titleWidgets.length, 1)
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets[0]), { title: 'derive a title', provisional: true })
+
+  h.setCompleteResult(() => ({ content: [{ type: 'text', text: '{"title":"Recovered"}' }] }))
+  h.emit('input', { source: 'rpc', text: 'try this instead' })
+  await flush()
+  assert.equal(h.completeCalls.length, 2, 'a rejection reopens the latch like an empty reply')
+  assert.deepEqual(decodeTitleWidget(h.titleWidgets.at(-1)), { title: 'Recovered', provisional: false })
+})
+
+test('titles: a restored session is never titled at turn end either', async t => {
+  const restored = harness({
+    entries: [
+      { type: 'model_change' },
+      { type: 'message', message: { role: 'user' } },
+      { type: 'message', message: { role: 'assistant' } }
+    ]
+  })
+  t.after(() => restored.emit('session_shutdown'))
+  restored.emit('session_start', {})
+  restored.emit('input', { source: 'rpc', text: 'history already exists' })
+  restored.emit('message_end', {
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text: 'A long assistant reply for the restored session.' }]
+    }
+  })
+  restored.emit('agent_settled', {})
+  await flush()
+  assert.equal(restored.completeCalls.length, 0)
+  assert.deepEqual(restored.titleWidgets, [], 'a restored session is never titled')
+})
+
+test('titles: a fresh session whose only prompt was a command is never titled from the reply', async t => {
+  const commandFirst = harness()
+  t.after(() => commandFirst.emit('session_shutdown'))
+  commandFirst.emit('session_start', {})
+  commandFirst.emit('input', { source: 'rpc', text: '/compact' })
+  commandFirst.emit('message_end', {
+    message: { role: 'assistant', content: [{ type: 'text', text: 'Compacted the conversation successfully.' }] }
+  })
+  commandFirst.emit('agent_settled', {})
+  await flush()
+  assert.equal(commandFirst.completeCalls.length, 0)
+  assert.deepEqual(commandFirst.titleWidgets, [], 'no title without a real user prompt')
 })

@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
+import { encodeTitleWidget, TITLE_WIDGET } from '../../src/acp/session-title.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn, lastAgentMessageText } from '../helpers/fakes.js'
 
 class FakeSessions {
@@ -243,4 +244,100 @@ test('PiAcpAgent: /name and /compact preserve the raw free-text remainder', asyn
   assert.equal((await prompt('/steering one-at-a-time')).stopReason, 'end_turn')
   assert.deepEqual(steering, ['one-at-a-time'])
   assert.equal(proc.prompts.length, 0, 'adapter commands never reach pi as prompts')
+})
+
+test('PiAcpAgent: /name outranks a title the extension generates afterwards', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  const names: string[] = []
+  proc.setSessionName = async (name: string) => {
+    names.push(name)
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(makeSession(conn, proc)) as any
+
+  await agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: '/name Mine' }] } as any)
+
+  // The extension's settled title arrives after the user's rename.
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'title',
+    method: 'setWidget',
+    widgetKey: TITLE_WIDGET,
+    widgetLines: encodeTitleWidget('Generated')
+  })
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const shown = conn.updates
+    .map(update => (update as any).update)
+    .filter(update => update?.sessionUpdate === 'session_info_update' && 'title' in update)
+    .map(update => update.title)
+  assert.deepEqual(shown, ['Mine'], 'the generated title never replaces an explicit name')
+  assert.deepEqual(names, ['Mine'], 'and never renames the pi session')
+})
+
+test('PiAcpAgent: a failed /name keeps a name the user set earlier', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  const names: string[] = []
+  proc.setSessionName = async (name: string) => {
+    if (names.length === 1) throw new Error('set_session_name failed')
+    names.push(name)
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(makeSession(conn, proc)) as any
+
+  // The first rename sticks; the second fails. The earlier name must still
+  // outrank a generated title, so the failed attempt restores the latch.
+  await agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: '/name First Name' }] } as any)
+  await agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: '/name Second Attempt' }] } as any)
+
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'title',
+    method: 'setWidget',
+    widgetKey: TITLE_WIDGET,
+    widgetLines: encodeTitleWidget('Generated Title')
+  })
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const shown = conn.updates
+    .map(update => (update as any).update)
+    .filter(update => update?.sessionUpdate === 'session_info_update' && 'title' in update)
+    .map(update => update.title)
+  assert.deepEqual(shown, ['First Name'], 'the earlier name still outranks a generated title')
+  assert.deepEqual(names, ['First Name'], 'and the failed rename never reached pi')
+})
+
+test('PiAcpAgent: a failed /name leaves the session open to a generated title', async () => {
+  const conn = new FakeAgentSideConnection()
+  const proc = new FakePiRpcProcess() as any
+  proc.setSessionName = async () => {
+    throw new Error('unknown command: set_session_name')
+  }
+
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as any).sessions = new FakeSessions(makeSession(conn, proc)) as any
+
+  const res = await agent.prompt({ sessionId: 's1', prompt: [{ type: 'text', text: '/name Mine' }] } as any)
+  assert.equal(res.stopReason, 'end_turn')
+  assert.match(lastAgentMessageText(conn), /Failed to set session name/)
+
+  // No name was set, so the generated title is still allowed to name the thread.
+  proc.emit({
+    type: 'extension_ui_request',
+    id: 'title',
+    method: 'setWidget',
+    widgetKey: TITLE_WIDGET,
+    widgetLines: encodeTitleWidget('Generated')
+  })
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const shown = conn.updates
+    .map(update => (update as any).update)
+    .filter(update => update?.sessionUpdate === 'session_info_update' && 'title' in update)
+    .map(update => update.title)
+  assert.deepEqual(shown, ['Generated'], 'a rejected rename does not block titles forever')
 })

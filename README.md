@@ -65,6 +65,15 @@ Pi advertises its own skills, prompt templates, and extension commands when it h
 
 `/model` and `/thinking` point you at your client's session controls. `/clear` isn't a thing here — start a new session instead.
 
+### Session titles
+
+Titles work the way the Claude and Codex ACP agents do: a dedicated cheap model names the session once, from your first prompt (or, when that opener is too short to title from, from the end of the first turn that collects enough text), and the result goes out as the ACP `session_info_update` notification and is written to pi's own session name, which `session/list`, load and resume read (list entries shorten a long name).
+
+- One generation per session, published and persisted at up to 256 characters.
+- The model is the cheapest chat model in your catalogue that has credentials; `PI_ACP_TITLE_MODEL` pins a specific one. Your session's model is only the last resort.
+- Until it lands the thread carries a shortened title taken from your first message as a provisional title. If generation fails, that is what remains, and later prompts retry.
+- `/name`, or any name pi already had, always wins; a session restored with history is never re-titled.
+
 ## Configuration
 
 Credentials and pi settings stay in pi (`~/.pi/agent`); adapter state lives in `~/.pi/pi-acp`. The knobs:
@@ -75,6 +84,7 @@ Credentials and pi settings stay in pi (`~/.pi/agent`); adapter state lives in `
 | `PI_CODING_AGENT_DIR`         | Override pi's settings, sessions, prompts, extensions, and skills directory |
 | `PI_CODING_AGENT_SESSION_DIR` | Choose a custom pi session directory                                        |
 | `PI_ACP_PI_COMMAND`           | Use an explicit pi command instead of automatic executable resolution       |
+| `PI_ACP_TITLE_MODEL`          | Pin the model for the generated session title                               |
 
 Clients that can host a terminal can walk you through `pi login` interactively; or do it yourself:
 
