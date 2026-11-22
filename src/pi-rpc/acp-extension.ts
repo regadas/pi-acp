@@ -112,6 +112,8 @@ type Attention = { id: string; runId: string; openedHeld: number; delivered: boo
 type NoticeRun = { runId?: unknown; workflowRunId?: unknown; childRuns?: unknown }
 type Capture = Obligation & {
   unsupported?: string
+  // A top-level live row proves an awaited split workflow child of this capture is still running.
+  workflowLive: boolean
   attention: Map<string, Attention>
   // Live runs reported by completion notices under this root (stock promotes them to separate rows);
   // they owe their own delivery but are detached and cancelled only through the root.
@@ -130,6 +132,8 @@ const NOTICE = 'subagent-notify'
 // Stock native supervisor channel: a queued triggerTurn message, then this shared-bus event.
 const SUPERVISOR_REQUEST = 'subagent_supervisor_request'
 const SUPERVISOR_WAKE_EVENT = 'pi-intercom:detach-request'
+const WORKFLOW_CHILD_STATUS_EVENT = 'subagent:child-status'
+const ASYNC_STARTED_EVENT = 'subagent:async-started'
 const WAITING_TYPE = 'pi-acp-completion-wait'
 const TITLE_MODEL_ENV = 'PI_ACP_TITLE_MODEL'
 const TITLE_TIMEOUT_MS = 15_000
@@ -272,6 +276,14 @@ export default function acpExtension(pi: Pi): void {
   // Owner-scoped completion notices consumed before any exact captured lineage named their run: evidence only,
   // never ownership, polling, waiting, stop or detach authority. Cleared on every release.
   const candidates = new Map<string, { run: NoticeRun; seq: number }>()
+  // Owner-scoped child -> parent workflow lineage for awaited workflow children; attributes supervisor wakes and
+  // proves drain when stock splits a still-running child out of its terminal workflow as a top-level run.
+  const workflowParents = new Map<string, string>()
+  // Captures already hydrated from targeted workflowChildren on a terminal poll.
+  const hydratedTerminal = new Set<string>()
+  // Wake keys whose fallback lineage probe ran; duplicate foreign wakes never fan out twice.
+  const probedWakes = new Set<string>()
+  const probingWakes = new Set<string>()
   const supervisorKey = (requestId: string, runId: string) => JSON.stringify([requestId, runId])
   let failure: string | undefined
   let seq = 0
@@ -339,6 +351,7 @@ export default function acpExtension(pi: Pi): void {
   }
   const settledCapture = (capture: Capture) =>
     capture.terminalAt !== undefined &&
+    !capture.workflowLive &&
     [...capture.descendants.values()].every(descendant => descendant.terminalAt !== undefined)
   const obligations = () => [...required.values()].flatMap(capture => [capture, ...capture.descendants.values()])
   const controlledIds = () => [...required.values()].flatMap(capture => [capture.id, ...capture.descendants.keys()])
@@ -346,7 +359,7 @@ export default function acpExtension(pi: Pi): void {
     `completion notice for required run ${obligation.id} was not consumed within 30s of ACP waiting after terminal status`
   const lateAttention = (item: Attention) =>
     `supervisor request ${item.id} from required run ${item.runId} was not consumed within 30s of ACP waiting`
-  const openAttention = () =>
+  const pendingAttention = () =>
     [...required.values()].flatMap(capture => [...capture.attention.values()]).filter(item => !item.delivered)
   const overdue = (spent: number) => {
     const expired = obligations().find(
@@ -356,7 +369,7 @@ export default function acpExtension(pi: Pi): void {
         spent - obligation.terminalHeld >= DELIVERY_DEADLINE_MS
     )
     if (expired) return lateDelivery(expired)
-    const asking = openAttention().find(item => spent - item.openedHeld >= DELIVERY_DEADLINE_MS)
+    const asking = pendingAttention().find(item => spent - item.openedHeld >= DELIVERY_DEADLINE_MS)
     if (asking) return lateAttention(asking)
   }
   const assess = (capture: Capture, snapshot: Snapshot & { runs: SnapshotNode[] }, now: number) => {
@@ -384,7 +397,30 @@ export default function acpExtension(pi: Pi): void {
         }
       }
     }
+    // Stock promotes a still-running awaited child of a terminal workflow to a top-level run; it never
+    // notifies, so its own row is the drain proof. It also outlives the workflow row in status. A live root
+    // and a folded-back live nested child keep the same lineage live, so omission must fail closed.
     const node = find(capture.id)
+    let liveSplit = capture.terminalAt !== undefined && node !== undefined && subtreeState(node) === 'live'
+    let terminalSplit = false
+    for (const row of workflowRoots(capture, snapshot)) {
+      const tree = subtreeState(row)
+      if (tree !== 'terminal' && tree !== 'live') capture.unsupported ??= `${tree} for workflow child ${String(row.id)}`
+      else if (tree === 'live') liveSplit = true
+      else terminalSplit = true
+    }
+    const truncatedWorkflowChild =
+      typeof maxLength === 'number' &&
+      [...workflowParents.keys()].some(id => id.length >= maxLength && ownedCapture(id) === capture)
+    const cannotProveSplitDrained =
+      lossy ||
+      truncatedWorkflowChild ||
+      ((omitted.runs as number) > 0 && !snapshot.runs.some(row => TERMINAL.has(String(row?.state))))
+    if (capture.workflowLive && !liveSplit && cannotProveSplitDrained)
+      capture.unsupported ??= `bounded status cannot prove descendants of ${capture.id} drained`
+    else if ((terminalSplit || (capture.workflowLive && !liveSplit)) && (lossy || (omitted.children as number) > 0))
+      capture.unsupported ??= `bounded status cannot prove descendants of ${capture.id} drained`
+    capture.workflowLive = liveSplit || (capture.workflowLive && cannotProveSplitDrained)
     // A latched root may leave status by retention; its descendants are still assessed.
     if (node) latch(capture, node, 'required run')
     else if (capture.terminalAt === undefined) {
@@ -423,6 +459,24 @@ export default function acpExtension(pi: Pi): void {
         const status = await rpc('status', Date.now() + 5_000, undefined, true)
         if (owner !== token) return
         const snapshot = readSnapshot(status)
+        if (hasUnattributedLiveRow(snapshot)) {
+          const toHydrate = captures.filter(capture => {
+            const row = snapshot.runs.find(row => row?.id === capture.id)
+            return (
+              required.get(capture.id) === capture &&
+              row?.kind !== 'subagent' &&
+              !hydratedTerminal.has(capture.id) &&
+              (capture.terminalAt !== undefined || TERMINAL.has(String(row?.state)))
+            )
+          })
+          if (toHydrate.length) {
+            const results = await hydrateWorkflowChildren(toHydrate, Date.now() + 5_000, token, true)
+            if (owner !== token) return
+            for (const r of results) if (r.ok) hydratedTerminal.add(r.rootId)
+            const failed = results.find(r => !r.ok)
+            if (failed) throw failed.error
+          }
+        }
         const now = Date.now()
         for (const capture of captures) if (required.get(capture.id) === capture) assess(capture, snapshot, now)
       } catch (error) {
@@ -446,6 +500,10 @@ export default function acpExtension(pi: Pi): void {
   const release = () => {
     required.clear()
     candidates.clear()
+    workflowParents.clear()
+    hydratedTerminal.clear()
+    probedWakes.clear()
+    probingWakes.clear()
     failure = undefined
     stopPolling()
     wake()
@@ -585,9 +643,43 @@ export default function acpExtension(pi: Pi): void {
           } catch {
             throw new Error('Missing v1 async status snapshot during cancellation')
           }
+          let hydratedAll = true
+          if (hasUnattributedLiveRow(snapshot)) {
+            const targets = [...required.values()].filter(c => {
+              const row = snapshot.runs.find(r => r?.id === c.id)
+              if (row?.kind === 'subagent') return false
+              const isTerm = c.terminalAt !== undefined || (row !== undefined && TERMINAL.has(String(row.state)))
+              return !(isTerm && hydratedTerminal.has(c.id))
+            })
+            const results = await hydrateWorkflowChildren(targets, deadline, owner, false)
+            for (const r of results) {
+              if (r.ok) {
+                const row = snapshot.runs.find(row => row?.id === r.rootId)
+                const capture = targets.find(c => c.id === r.rootId)
+                if (capture?.terminalAt !== undefined || (row !== undefined && TERMINAL.has(String(row.state))))
+                  hydratedTerminal.add(r.rootId)
+                continue
+              }
+              if (!(r.error instanceof Error) || (r.error as { code?: unknown }).code !== 'execution_failed')
+                throw r.error
+              cancellationDiagnostic = r.error.message
+              hydratedAll = false
+            }
+          }
+          // A terminal workflow splits a still-running awaited child into its own top-level row; that row
+          // never notifies, so it is a control root and drain proof of its own.
+          const descendants = new Set([...required.values()].flatMap(capture => [...capture.descendants.keys()]))
+          const liveWorkflowChildren: string[] = []
+          for (const row of snapshot.runs) {
+            const id = row?.id
+            if (typeof id !== 'string' || required.has(id) || descendants.has(id)) continue
+            // A terminal split child can still carry a live nested subagent: it stays a control root.
+            if (ownedCapture(id) !== undefined && subtreeState(row) !== 'terminal') liveWorkflowChildren.push(id)
+          }
+          const controlRoots = [...controlledIds(), ...liveWorkflowChildren]
           if (operation === 'cancel') {
             // Proven promoted descendants are control roots too; ancestry below each is still verified.
-            for (const root of controlledIds()) {
+            for (const root of controlRoots) {
               if (!canonicalUuid.test(root)) continue
               const node = snapshot.runs.find(node => node.id === root)
               if (!node) continue
@@ -654,8 +746,9 @@ export default function acpExtension(pi: Pi): void {
             assess(capture, snapshot, now)
             exact &&= !capture.unsupported && settledCapture(capture)
           }
+          exact &&= hydratedAll && liveWorkflowChildren.length === 0
           await Promise.all(
-            controlledIds().map(async id => {
+            controlRoots.map(async id => {
               const run = snapshot.runs!.find(run => run.id === id)
               if (!run) {
                 terminal = false
@@ -853,15 +946,75 @@ export default function acpExtension(pi: Pi): void {
     if (section) sections[WORKSPACE_INSTRUCTIONS_SECTION] = section
     else delete sections[WORKSPACE_INSTRUCTIONS_SECTION]
   })
-  const unsubscribeWake = pi.events.on(SUPERVISOR_WAKE_EVENT, raw => {
-    const wakeEvent = raw as { requestId?: unknown; runId?: unknown } | undefined
-    const requestId = wakeEvent?.requestId
-    const runId = wakeEvent?.runId
-    if (typeof requestId !== 'string' || !requestId || typeof runId !== 'string') return
-    if (supervisorRequests.has(supervisorKey(requestId, runId))) return
-    if (!owner || !foregroundRun || cancelling || !context || !inScope(context)) return
-    const capture = required.get(runId) ?? [...required.values()].find(capture => capture.descendants.has(runId))
-    if (!capture) return
+  const recordWorkflowChild = (childId: unknown, parentId: unknown) => {
+    // Cancellation still records lineage: a child spawned while cancelling must remain controllable.
+    if (!owner || !context || !inScope(context)) return
+    if (typeof childId !== 'string' || !childId || typeof parentId !== 'string' || !parentId || childId === parentId)
+      return
+    if (!workflowParents.has(childId) || (!ownedCapture(childId) && ownedCapture(parentId) !== undefined))
+      workflowParents.set(childId, parentId)
+  }
+  const ownedCapture = (runId: string): Capture | undefined => {
+    const seen = new Set<string>()
+    let current: string | undefined = runId
+    while (current !== undefined && !seen.has(current)) {
+      seen.add(current)
+      const direct = required.get(current) ?? [...required.values()].find(capture => capture.descendants.has(current!))
+      if (direct) return direct
+      current = workflowParents.get(current)
+    }
+    return undefined
+  }
+  // Top-level status rows that a promoted awaited workflow child of this capture occupies.
+  const workflowRoots = (capture: Capture, snapshot: Snapshot & { runs: SnapshotNode[] }) =>
+    snapshot.runs.filter(row => {
+      const id = row?.id
+      return (
+        typeof id === 'string' &&
+        id !== capture.id &&
+        !required.has(id) &&
+        !capture.descendants.has(id) &&
+        ownedCapture(id) === capture
+      )
+    })
+
+  // An unowned live row that targeted workflowChildren may attribute to an owned capture.
+  const hasUnattributedLiveRow = (snapshot: Snapshot & { runs: SnapshotNode[] }) =>
+    snapshot.runs.some(row => {
+      const id = row?.id
+      return (
+        typeof id === 'string' &&
+        !TERMINAL.has(String(row.state)) &&
+        !required.has(id) &&
+        ![...required.values()].some(c => c.descendants.has(id)) &&
+        ownedCapture(id) === undefined
+      )
+    })
+  const hydrateWorkflowChildren = async (
+    roots: Capture[],
+    deadline: number,
+    token: string | null,
+    advisory: boolean
+  ): Promise<Array<{ rootId: string; ok: boolean; error?: unknown }>> => {
+    if (!roots.length) return []
+    return Promise.all(
+      roots.map(async root => {
+        try {
+          const data = await rpc('status', deadline, root.id, advisory)
+          if (owner !== token || !context || !inScope(context)) return { rootId: root.id, ok: true }
+          const wf = (
+            data.details as { workflowChildren?: { workflowRunId?: unknown; children?: unknown } } | undefined
+          )?.workflowChildren
+          if (wf?.workflowRunId !== root.id || !Array.isArray(wf.children)) return { rootId: root.id, ok: true }
+          for (const child of wf.children) recordWorkflowChild((child as { runId?: unknown } | null)?.runId, root.id)
+          return { rootId: root.id, ok: true }
+        } catch (error) {
+          return { rootId: root.id, ok: false, error }
+        }
+      })
+    )
+  }
+  const openAttention = (capture: Capture, requestId: string, runId: string) => {
     supervisorRequests.add(supervisorKey(requestId, runId))
     capture.attention.set(supervisorKey(requestId, runId), {
       id: requestId,
@@ -871,6 +1024,42 @@ export default function acpExtension(pi: Pi): void {
       probes: 0
     })
     wake()
+  }
+  const unsubscribeChildStatus = pi.events.on(WORKFLOW_CHILD_STATUS_EVENT, raw => {
+    const event = raw as { version?: unknown; runId?: unknown; childRunId?: unknown; status?: unknown } | undefined
+    if (event?.version === 1 && event.status === 'started') recordWorkflowChild(event.childRunId, event.runId)
+  })
+  const unsubscribeAsyncStarted = pi.events.on(ASYNC_STARTED_EVENT, raw => {
+    const event = raw as { id?: unknown; parentWorkflowRunId?: unknown } | undefined
+    recordWorkflowChild(event?.id, event?.parentWorkflowRunId)
+  })
+  const unsubscribeWake = pi.events.on(SUPERVISOR_WAKE_EVENT, raw => {
+    const wakeEvent = raw as { requestId?: unknown; runId?: unknown } | undefined
+    const requestId = wakeEvent?.requestId
+    const runId = wakeEvent?.runId
+    if (typeof requestId !== 'string' || !requestId || typeof runId !== 'string') return
+    const key = supervisorKey(requestId, runId)
+    if (supervisorRequests.has(key) || probedWakes.has(key) || probingWakes.has(key)) return
+    if (!owner || !foregroundRun || cancelling || !context || !inScope(context)) return
+    const capture = ownedCapture(runId)
+    if (capture) {
+      openAttention(capture, requestId, runId)
+      return
+    }
+    const unsettled = [...required.values()].filter(c => !settledCapture(c))
+    if (!unsettled.length) return
+    // A resumed workflow reattaches a still-running awaited child without child-status/async-started events;
+    // its targeted workflowChildren is the only lineage proof, so one is awaited before opening attention.
+    const token = owner
+    probingWakes.add(key)
+    void hydrateWorkflowChildren(unsettled, Date.now() + 5_000, token, true).then(results => {
+      probingWakes.delete(key)
+      if (owner !== token || !foregroundRun || cancelling || !context || !inScope(context)) return
+      if (results.every(result => result.ok)) probedWakes.add(key)
+      if (supervisorRequests.has(key)) return
+      const resolved = ownedCapture(runId)
+      if (resolved) openAttention(resolved, requestId, runId)
+    })
   })
   // Applies one structured notice run to its exact owned obligation; `at` orders it against provider cycles.
   const consumeNotice = (run: NoticeRun, capture: Capture, at: number) => {
@@ -1036,6 +1225,7 @@ export default function acpExtension(pi: Pi): void {
       observed: false,
       delivered: false,
       probes: 0,
+      workflowLive: false,
       descendants: new Map(),
       attention: new Map()
     }
@@ -1103,7 +1293,7 @@ export default function acpExtension(pi: Pi): void {
         const spent = held()
         const pending = obligations()
         const awaiting = pending.filter(obligation => obligation.terminalHeld !== undefined && !obligation.delivered)
-        const asking = openAttention()
+        const asking = pendingAttention()
         const expired = overdue(spent)
         if (expired) return fail(expired)
         if (captures.every(settledCapture) && pending.every(obligation => obligation.delivered) && !asking.length) {
@@ -1174,6 +1364,8 @@ export default function acpExtension(pi: Pi): void {
   // Keep the token through native abort settlement; its final tool_result may arrive during abort.
   pi.on('session_shutdown', () => {
     release()
+    unsubscribeChildStatus()
+    unsubscribeAsyncStarted()
     unsubscribeWake()
     if (globals[REGISTRY] === registry) {
       if (previous === undefined) delete globals[REGISTRY]

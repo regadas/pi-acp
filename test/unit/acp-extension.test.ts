@@ -204,11 +204,17 @@ type Row = { id: string; state: string; kind?: string; children?: any[] }
 function host(h: ReturnType<typeof harness>, rows: Row[] = []) {
   const state = {
     rows: new Map(rows.map(row => [row.id, row])),
+    workflowChildren: new Map<string, unknown>(),
+    statusText: new Map<string, string>(),
+    targetFailure: new Map<string, unknown>(),
+    targetHold: new Set<string>(),
     omitted: { runs: 0, children: 0, byteLimitExceeded: false } as any,
     failure: undefined as any,
     held: undefined as undefined | Array<() => void>,
     statusCount: 0,
-    stops: [] as string[]
+    statusTargets: [] as string[],
+    stops: [] as string[],
+    interrupts: [] as string[]
   }
   h.events.on('subagents:rpc:v1:request', request => {
     let body: any = { success: true, data: {} }
@@ -226,6 +232,20 @@ function host(h: ReturnType<typeof harness>, rows: Row[] = []) {
           }
         }
       }
+    } else if (request.method === 'status') {
+      state.statusTargets.push(request.params.id)
+      const failure = state.targetFailure.get(request.params.id)
+      const workflowChildren = state.workflowChildren.get(request.params.id)
+      if (failure) {
+        state.targetFailure.delete(request.params.id)
+        body = failure
+      } else if (state.targetHold.has(request.params.id)) return
+      else if (workflowChildren) body = { success: true, data: { details: { workflowChildren } } }
+      else if (state.statusText.has(request.params.id))
+        body = { success: true, data: { text: state.statusText.get(request.params.id) } }
+    } else if (request.method === 'interrupt') {
+      state.interrupts.push(request.params.id)
+      body = { success: true, data: { runId: request.params.id } }
     } else if (request.method === 'stop') {
       state.stops.push(request.params.id)
       const row = state.rows.get(request.params.id)
@@ -2178,8 +2198,402 @@ test('a slow parent turn outside the barrier never expires a descendant supervis
   assert.deepEqual(failures(h), [])
 })
 
+test('awaited runs.all workflow child supervisor ask wakes the barrier without requiring a child completion notice', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    {
+      id: rootA,
+      kind: 'workflow',
+      state: 'running',
+      children: [{ id: 'correctness', kind: 'step', state: 'running' }]
+    }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  h.events.emit('subagent:child-status', {
+    type: 'subagent.child-status',
+    version: 1,
+    runId: rootA,
+    childId: 'correctness',
+    status: 'started',
+    childRunId: wfChild,
+    workflowKey: 'correctness'
+  })
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false)
+  ask(h, 'req-wf-1', wfChild)
+  const wake = await drive(t, holding, 1_000)
+  assert.ok(isProbe(wake.value), 'an awaited workflow child supervisor request wakes the parent workflow barrier')
+  assert.match(wake.value.entries.at(-1).content, /req-wf-1/)
+  assert.match(wake.value.entries.at(-1).content, new RegExp(wfChild))
+  answer(h, 'req-wf-1', wfChild)
+  reply(h)
+  const next = settle(h)
+  assert.equal((await drive(t, next, 35_000, 1_000)).done, false, 'workflow still holds after ask is consumed')
+  assert.deepEqual(failures(h), [])
+  // Awaited workflow children fold into the workflow result and never emit their own subagent-notify.
+  status.rows.get(rootA)!.state = 'complete'
+  status.rows.get(rootA)!.children = [{ id: 'correctness', kind: 'step', state: 'complete', startedAt: 1, endedAt: 2 }]
+  assert.ok(isProbe((await drive(t, next, 3_000)).value))
+  notice(h, [rootA])
+  reply(h)
+  assert.deepEqual(await drive(t, settle(h), 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+test('nested workflow child supervisor ask attributed through subagent:async-started wakes the root barrier', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  host(h, [{ id: rootA, kind: 'workflow', state: 'running' }])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  const subWf = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+  const grandChild = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+  h.events.emit('subagent:async-started', { id: subWf, parentWorkflowRunId: rootA })
+  h.events.emit('subagent:async-started', { id: grandChild, parentWorkflowRunId: subWf })
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false)
+  ask(h, 'req-nested', grandChild)
+  const wake = await drive(t, holding, 1_000)
+  assert.ok(isProbe(wake.value))
+  assert.match(wake.value.entries.at(-1).content, /req-nested/)
+  answer(h, 'req-nested', grandChild)
+  reply(h)
+  assert.equal((await drive(t, settle(h), 3_000)).done, false)
+  assert.deepEqual(failures(h), [])
+})
+
+test('a reattached workflow child wake without child-status events is proven by targeted status', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [{ id: rootA, kind: 'workflow', state: 'running' }])
+  status.workflowChildren.set(rootA, {
+    workflowRunId: rootA,
+    children: [{ childId: 'correctness', state: 'running', runId: wfChild }]
+  })
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false)
+  ask(h, 'req-foreign', foreignRun)
+  assert.equal((await drive(t, holding, 2_000)).done, false, 'a foreign ask grants no continuation')
+  const probes = status.statusTargets.length
+  ask(h, 'req-foreign', foreignRun)
+  await flush()
+  assert.equal(status.statusTargets.length, probes, 'a duplicate foreign wake never fans out a second lineage probe')
+  ask(h, 'req-reattach', wfChild)
+  const wake = await drive(t, holding, 1_000)
+  assert.ok(isProbe(wake.value), 'targeted workflowChildren proves the reattached child lineage')
+  assert.match(wake.value.entries.at(-1).content, /req-reattach/)
+  assert.match(wake.value.entries.at(-1).content, new RegExp(wfChild))
+  assert.deepEqual(failures(h), [])
+  answer(h, 'req-reattach', wfChild)
+  reply(h)
+  const next = settle(h)
+  assert.equal((await drive(t, next, 3_000)).done, false, 'the workflow still holds after ask is consumed')
+  status.rows.get(rootA)!.state = 'complete'
+  status.rows.get(rootA)!.children = [{ id: 'correctness', kind: 'step', state: 'complete', startedAt: 1, endedAt: 2 }]
+  assert.ok(isProbe((await drive(t, next, 3_000)).value))
+  notice(h, [rootA])
+  reply(h)
+  assert.deepEqual(await drive(t, settle(h), 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+for (const shape of ['foreign', 'detached', 'old-owner', 'cycle']) {
+  test(`workflow child supervisor attention without exact root ownership grants no continuation: ${shape}`, async t => {
+    timers(t)
+    const h = harness()
+    t.after(() => h.emit('session_shutdown'))
+    const status = host(h, [
+      { id: rootA, kind: 'workflow', state: 'running' },
+      { id: rootB, kind: 'workflow', state: 'running' },
+      { id: foreignRun, kind: 'workflow', state: 'running' }
+    ])
+    await foreground(h)
+    launch(h, rootA, { workflow: true, async: true })
+    launch(h, rootB, { workflow: true, async: true })
+    const child = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd'
+    if (shape === 'foreign') {
+      h.events.emit('subagent:async-started', { id: child, parentWorkflowRunId: foreignRun })
+      ask(h, 'req-f', child)
+    } else if (shape === 'detached') {
+      h.events.emit('subagent:child-status', { version: 1, runId: rootB, status: 'started', childRunId: child })
+      await h.tool('acp_detach', { runIds: [rootB] })
+      ask(h, 'req-det', child)
+    } else if (shape === 'old-owner') {
+      h.events.emit('subagent:child-status', { version: 1, runId: rootA, status: 'started', childRunId: child })
+      await foreground(h, '77777777-7777-4777-8777-777777777777')
+      status.rows.set('new-root', { id: 'new-root', kind: 'workflow', state: 'running' })
+      launch(h, 'new-root', { workflow: true, async: true })
+      ask(h, 'req-old', child)
+    } else if (shape === 'cycle') {
+      const other = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+      h.events.emit('subagent:async-started', { id: child, parentWorkflowRunId: other })
+      h.events.emit('subagent:async-started', { id: other, parentWorkflowRunId: child })
+      ask(h, 'req-cyc', child)
+    }
+    const holding = settle(h)
+    assert.equal((await drive(t, holding, 35_000, 1_000)).done, false)
+    assert.deepEqual(failures(h), [])
+  })
+}
+
 // git-main explicit async workflow child: dispatch notice maps runId to workflowKey; the child's own native notice follows later.
 const wfChild = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+
+const childStarted = (h: ReturnType<typeof harness>, runId: string, childRunId: string) =>
+  h.events.emit('subagent:child-status', {
+    type: 'subagent.child-status',
+    version: 1,
+    runId,
+    childId: 'correctness',
+    status: 'started',
+    childRunId,
+    workflowKey: 'correctness'
+  })
+
+test('a terminal workflow split from its live awaited child stays uncancelled until that child exits', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  childStarted(h, rootA, wfChild)
+  await flush()
+  // Stock promotes the still-running awaited child to a top-level row and omits it from rootA.children.
+  status.rows.get(rootA)!.state = 'stopped'
+  await h.command(`cancel ${owner}`)
+  assert.deepEqual(status.stops, [wfChild], 'the split child is stopped, not only its terminal workflow')
+  status.rows.get(wfChild)!.state = 'running' // stop is asynchronous: the runner still reports running
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'pending', 'a live split child refuses "cancelled"')
+  status.rows.get(wfChild)!.state = 'complete'
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'cancelled')
+  assert.equal(h.updates.filter(update => update.state === 'cancelled').length, 1)
+})
+
+test('a live split workflow child holds the barrier after its failed workflow notice, then settles alone', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  childStarted(h, rootA, wfChild)
+  status.rows.get(rootA)!.state = 'failed'
+  notice(h, [{ runId: rootA, status: 'failed' }])
+  reply(h)
+  const holding = settle(h)
+  assert.equal(
+    (await drive(t, holding, 35_000, 1_000)).done,
+    false,
+    'the live split child holds the failed workflow open'
+  )
+  assert.deepEqual(failures(h), [])
+  assert.equal(
+    h.updates.some(update => update.state === 'idle'),
+    false
+  )
+  status.rows.get(wfChild)!.state = 'complete'
+  assert.deepEqual(await drive(t, holding, 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+test('a drained workflow with known children survives later unrelated status omission', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'complete' },
+    { id: rootB, state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  launch(h, rootB)
+  childStarted(h, rootA, wfChild) // lineage is known even though the drained child already left status
+  await flush()
+  notice(h, [rootA])
+  reply(h)
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false, 'unsettled rootB keeps the barrier open')
+  assert.deepEqual(failures(h), [])
+  // Stock always lists running/queued rows ahead of terminal ones: a terminal row still proves no live row was omitted.
+  status.omitted.runs = 1
+  assert.equal((await drive(t, holding, 5_000)).done, false)
+  assert.deepEqual(failures(h), [], 'a later lossy snapshot cannot revoke latched terminal proof')
+  status.rows.get(rootB)!.state = 'complete'
+  notice(h, [rootB])
+  reply(h)
+  assert.deepEqual(await drive(t, settle(h), 5_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+test('an explicit async workflow dispatch is probed while its split child still runs', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  childStarted(h, rootA, wfChild)
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false, 'the live split child holds the dispatching workflow')
+  // Stock finishes dispatching the explicit async workflow while its child is still a separate live row.
+  status.rows.get(rootA)!.state = 'complete'
+  const probe = await drive(t, holding, 3_000)
+  assert.ok(isProbe(probe.value), "the workflow's queued dispatch notice is probed, never starved")
+  assert.match(probe.value.entries.at(-1).content, new RegExp(rootA))
+  assert.equal(
+    h.updates.some(update => update.state === 'idle'),
+    false
+  )
+  dispatch(h) // the dispatch notice moves the running child under the workflow as a descendant
+  reply(h)
+  const next = settle(h)
+  assert.equal((await drive(t, next, 3_000)).done, false, 'the dispatched child still holds')
+  status.rows.get(wfChild)!.state = 'complete'
+  assert.ok(isProbe((await drive(t, next, 3_000)).value), "the child's own notice is still owed")
+  notice(h, [wfChild])
+  reply(h)
+  assert.deepEqual(await drive(t, settle(h), 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+test('a workflow child reported during cancellation is still stopped and awaited', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const rows = new Map([[rootA, 'running']])
+  const stops: string[] = []
+  let armed = false
+  h.events.on('subagents:rpc:v1:request', request => {
+    let body: any = { success: true, data: {} }
+    if (request.method === 'status' && !request.params.id) {
+      if (armed) {
+        armed = false
+        // cancel already set its cancellation state; stock still emits the child's lineage while aborting.
+        childStarted(h, rootA, wfChild)
+        rows.set(wfChild, 'running')
+        rows.set(rootA, 'stopped')
+      }
+      body = {
+        success: true,
+        data: {
+          asyncSnapshot: {
+            kind: 'pi-subagents.async-status-snapshot',
+            version: 1,
+            caps: { maxStringLength: 160 },
+            omitted: { runs: 0, children: 0, byteLimitExceeded: false },
+            runs: [...rows].map(([id, state]) => ({ id, state }))
+          }
+        }
+      }
+    } else if (request.method === 'stop') {
+      stops.push(request.params.id)
+      body = { success: true, data: { runId: request.params.id } }
+    }
+    h.events.emit(`subagents:rpc:v1:reply:${request.requestId}`, {
+      version: 1,
+      requestId: request.requestId,
+      ...body
+    })
+  })
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  await flush()
+  armed = true
+  await h.command(`cancel ${owner}`)
+  assert.deepEqual(stops, [wfChild], 'the child spawned during cancellation is stopped')
+  rows.set(wfChild, 'running') // stop is asynchronous: the runner still reports running
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'pending', 'a live workflow child refuses "cancelled"')
+  rows.set(wfChild, 'complete')
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'cancelled')
+  assert.equal(h.updates.filter(update => update.state === 'cancelled').length, 1)
+})
+
+test('a reattached workflow child identified only by targeted status holds the failed workflow', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, state: 'running' }
+  ])
+  status.workflowChildren.set(rootA, {
+    workflowRunId: rootA,
+    children: [{ childId: 'correctness', state: 'running', runId: wfChild }]
+  })
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  status.rows.get(rootA)!.state = 'failed'
+  notice(h, [{ runId: rootA, status: 'failed' }])
+  reply(h)
+  const holding = settle(h)
+  assert.equal(
+    (await drive(t, holding, 35_000, 1_000)).done,
+    false,
+    'polling hydrates the reattached child so it holds the failed workflow'
+  )
+  assert.deepEqual(failures(h), [])
+  assert.equal(
+    h.updates.some(update => update.state === 'idle'),
+    false
+  )
+  status.rows.get(wfChild)!.state = 'complete'
+  assert.deepEqual(await drive(t, holding, 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+test('cancellation hydrates a reattached workflow child, stops it, and waits for its exit', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, state: 'running' }
+  ])
+  status.workflowChildren.set(rootA, {
+    workflowRunId: rootA,
+    children: [{ childId: 'correctness', state: 'running', runId: wfChild }]
+  })
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  await flush()
+  status.rows.get(rootA)!.state = 'stopped'
+  await h.command(`cancel ${owner}`)
+  assert.deepEqual(status.stops, [wfChild], 'the hydrated reattached child is stopped')
+  status.rows.get(wfChild)!.state = 'running' // stop is asynchronous: the runner still reports running
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'pending', 'a live reattached child refuses "cancelled"')
+  status.rows.get(wfChild)!.state = 'complete'
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'cancelled')
+})
+
 const dispatch = (
   h: ReturnType<typeof harness>,
   childRuns: unknown[] = [{ runId: wfChild, workflowKey: 'child', status: 'running' }]
@@ -2191,6 +2605,197 @@ const folded = (extra: Record<string, unknown> = {}) => ({
   startedAt: 1,
   endedAt: 2,
   ...extra
+})
+
+test('a snapshot omitting a known live split workflow child fails closed', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, kind: 'subagent', state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  childStarted(h, rootA, wfChild)
+  status.rows.get(rootA)!.state = 'failed'
+  notice(h, [{ runId: rootA, status: 'failed' }])
+  reply(h)
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false, 'the visible live split child holds')
+  // Both the latched root and its known live split child leave the bounded snapshot; no terminal row remains.
+  status.rows.clear()
+  status.rows.set(foreignRun, { id: foreignRun, state: 'running' })
+  status.omitted.runs = 2
+  assert.deepEqual(await drive(t, holding, 5_000), { done: true, value: undefined })
+  assert.match(failures(h).at(-1)?.error ?? '', /bounded status cannot prove descendants of .* drained/)
+  assert.notEqual(h.updates.at(-1).state, 'idle')
+})
+
+test('a folded-back terminal workflow child carrying a live nested subagent holds the barrier', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, kind: 'subagent', state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  childStarted(h, rootA, wfChild)
+  status.rows.get(rootA)!.state = 'failed'
+  notice(h, [{ runId: rootA, status: 'failed' }])
+  reply(h)
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false, 'the split child holds while still top-level')
+  // Stock folds the terminal child back under its root, but its nested subagent is still running.
+  status.rows.delete(wfChild)
+  status.rows.get(rootA)!.children = [folded({ children: [{ id: 'nested', kind: 'subagent', state: 'running' }] })]
+  assert.equal((await drive(t, holding, 5_000)).done, false, 'a live nested subagent under the folded child holds')
+  assert.deepEqual(failures(h), [])
+  assert.equal(
+    h.updates.some(update => update.state === 'idle'),
+    false
+  )
+  status.rows.get(rootA)!.children = [folded({ children: [{ id: 'nested', kind: 'subagent', state: 'complete' }] })]
+  assert.deepEqual(await drive(t, holding, 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+test('a terminal split workflow child carrying a live nested subagent is still cancelled', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'running' },
+    { id: wfChild, kind: 'subagent', state: 'running' }
+  ])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  childStarted(h, rootA, wfChild)
+  await flush()
+  status.rows.get(rootA)!.state = 'stopped'
+  // The split child itself finished, but its own nested subagent is still running.
+  const nested = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+  status.rows.get(wfChild)!.state = 'complete'
+  status.rows.get(wfChild)!.children = [{ id: nested, kind: 'subagent', state: 'running' }]
+  status.statusText.set(
+    nested,
+    `Status target: run ${nested}\nSpawn budget: unlimited\nActive async capacity: 1/unlimited used\n` +
+      `Nested run: ${nested}\nRoot: ${wfChild}\nParent: ${wfChild}\nState: running`
+  )
+  await h.command(`cancel ${owner}`)
+  assert.deepEqual(status.interrupts, [nested], 'the nested subagent under the terminal split child is interrupted')
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'pending', 'a live nested subagent refuses "cancelled"')
+  status.rows.get(wfChild)!.children = [{ id: nested, kind: 'subagent', state: 'complete' }]
+  await h.command(`check ${owner}`)
+  assert.equal(h.updates.at(-1).state, 'cancelled')
+})
+
+test('a failed advisory hydration of a terminal workflow is not cached and never settles', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [
+    { id: rootA, kind: 'workflow', state: 'failed' },
+    { id: wfChild, kind: 'subagent', state: 'running' }
+  ])
+  status.targetFailure.set(rootA, {
+    success: false,
+    error: { code: 'execution_failed', message: 'targeted status is temporarily unavailable' }
+  })
+  status.workflowChildren.set(rootA, {
+    workflowRunId: rootA,
+    children: [{ childId: 'correctness', state: 'running', runId: wfChild }]
+  })
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  await flush()
+  assert.deepEqual(failures(h), [], 'an advisory poll failure is not a barrier failure')
+  assert.equal(
+    h.updates.some(update => update.state === 'idle'),
+    false
+  )
+  assert.deepEqual(status.statusTargets, [rootA], 'the transient failure was observed once')
+  notice(h, [{ runId: rootA, status: 'failed' }])
+  reply(h)
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 35_000, 1_000)).done, false, 'the retried hydration holds the failed workflow')
+  assert.ok(status.statusTargets.length >= 2, 'a failed hydration is retried, never cached as terminal')
+  assert.deepEqual(failures(h), [])
+  status.rows.get(wfChild)!.state = 'complete'
+  assert.deepEqual(await drive(t, holding, 3_000), { done: true, value: undefined })
+  assert.equal(h.updates.at(-1).state, 'idle')
+  assert.deepEqual(failures(h), [])
+})
+
+for (const shape of ['execution_failed', 'timeout']) {
+  test(`cancellation fails closed when targeted workflow hydration fails: ${shape}`, async t => {
+    timers(t)
+    const h = harness()
+    t.after(() => h.emit('session_shutdown'))
+    const status = host(h, [
+      { id: rootA, kind: 'workflow', state: 'running' },
+      { id: wfChild, kind: 'subagent', state: 'running' }
+    ])
+    h.register({ name: 'pi-subagents', sessionId: 'session', isActive: () => true })
+    await foreground(h)
+    launch(h, rootA, { workflow: true, async: true })
+    await flush()
+    status.rows.get(rootA)!.state = 'stopped'
+    if (shape === 'execution_failed')
+      status.targetFailure.set(rootA, {
+        success: false,
+        error: { code: 'execution_failed', message: 'targeted workflow status rejected' }
+      })
+    else status.targetHold.add(rootA)
+    const checking = h.command(`check ${owner}`).then(
+      () => undefined,
+      (error: unknown) => error
+    )
+    const result = await drive(t, checking, 12_000)
+    assert.equal(result.done, true)
+    assert.equal(
+      h.updates.some(update => update.state === 'cancelled'),
+      false
+    )
+    if (shape === 'execution_failed') {
+      assert.equal(result.value, undefined)
+      assert.equal(h.updates.at(-1).state, 'pending', 'unproven hydration cannot prove cancellation')
+    } else {
+      assert.match(String(result.value), /timed out/)
+      assert.equal(h.updates.at(-1).state, 'error', 'a hydration timeout fails the check closed')
+    }
+  })
+}
+
+test('an owned resumed workflow reattaches an unowned workflow child and claims its wakes', async t => {
+  timers(t)
+  const h = harness()
+  t.after(() => h.emit('session_shutdown'))
+  const status = host(h, [{ id: rootA, kind: 'workflow', state: 'running' }])
+  await foreground(h)
+  launch(h, rootA, { workflow: true, async: true })
+  // W1 is not this owner's workflow: its unowned lineage never attributes the child.
+  h.events.emit('subagent:async-started', { id: wfChild, parentWorkflowRunId: foreignRun })
+  status.workflowChildren.set(rootA, {
+    workflowRunId: rootA,
+    children: [{ childId: 'correctness', state: 'running', runId: wfChild }]
+  })
+  const holding = settle(h)
+  assert.equal((await drive(t, holding, 2_000)).done, false)
+  ask(h, 'req-foreign', foreignRun)
+  await flush()
+  ask(h, 'req-reattach', wfChild)
+  const wake = await drive(t, holding, 1_000)
+  assert.ok(isProbe(wake.value), 'the owned resumed workflow claims the reattached child wake')
+  assert.match(wake.value.entries.at(-1).content, /req-reattach/)
+  assert.match(wake.value.entries.at(-1).content, new RegExp(wfChild))
+  answer(h, 'req-reattach', wfChild)
+  reply(h)
+  assert.deepEqual(failures(h), [])
 })
 let toolCalls = 0
 const collect = (
