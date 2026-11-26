@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -342,4 +342,184 @@ test('SessionStore: legacy records without additional directories load with none
     'utf-8'
   )
   assert.throws(() => store.get('legacy'), SessionStoreCorruptError)
+})
+
+test('SessionStore: explicitTitle round-trips in sidecar only, avoids rewriting live record, preserves updatedAt, and clears on delete', () => {
+  const { dir, mapPath, store } = makeStore()
+  const stateDir = `${mapPath}.d`
+  const sessionFile = join(dir, 's-title.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 's-title', cwd: dir })}\n`, 'utf-8')
+
+  store.upsert({ sessionId: 's-title', cwd: dir, sessionFile, additionalDirectories: ['/ws/a'] })
+  const originalUpdatedAt = store.get('s-title')!.updatedAt
+  const recordFile = join(stateDir, `${Buffer.from('s-title', 'utf-8').toString('base64url')}.json`)
+  const statBeforeRename = statSync(recordFile)
+
+  store.upsert({
+    sessionId: 's-title',
+    cwd: dir,
+    sessionFile,
+    explicitTitle: 'My Renamed Session',
+    preserveUpdatedAt: true
+  })
+  const renamed = store.get('s-title')!
+  assert.equal(renamed.explicitTitle, 'My Renamed Session')
+  assert.equal(renamed.updatedAt, originalUpdatedAt, 'preserveUpdatedAt keeps stored timestamp unchanged')
+  assert.deepEqual(renamed.additionalDirectories, ['/ws/a'])
+
+  // Explicit-title write on an existing matching record writes ONLY `<id>.title`
+  // and leaves `<id>.json` untouched (no rewrite, no inline explicitTitle).
+  const statAfterRename = statSync(recordFile)
+  assert.equal(statAfterRename.ino, statBeforeRename.ino, '<id>.json must not be rewritten on explicit-title update')
+  assert.equal(
+    'explicitTitle' in (JSON.parse(readFileSync(recordFile, 'utf-8')) as { session: Record<string, unknown> }).session,
+    false,
+    '<id>.json must never persist explicitTitle inline'
+  )
+
+  // Backward compatibility: every `*.json` file in stateDir must be a valid session record
+  // (sidecars use `.title`, never `.title.json`, so older pi-acp versions do not crash).
+  const entries = readdirSync(stateDir)
+  assert.equal(
+    entries.some(name => name.endsWith('.title.json')),
+    false,
+    'sidecars must never use .title.json extension'
+  )
+  assert.ok(
+    entries.some(name => name.endsWith('.title')),
+    'sidecar must use .title extension'
+  )
+  for (const name of entries.filter(n => n.endsWith('.json'))) {
+    const parsed = JSON.parse(readFileSync(join(stateDir, name), 'utf-8')) as {
+      version?: number
+      session?: { sessionId?: string }
+      deleted?: boolean
+    }
+    assert.equal(parsed.version, 1)
+    assert.ok(parsed.deleted === true || typeof parsed.session?.sessionId === 'string')
+  }
+
+  // Ordinary cwd/root refreshes preserve explicitTitle without writing it inline.
+  store.upsert({ sessionId: 's-title', cwd: dir, sessionFile, additionalDirectories: ['/ws/b'] })
+  assert.equal(store.get('s-title')?.explicitTitle, 'My Renamed Session')
+  assert.equal(
+    'explicitTitle' in (JSON.parse(readFileSync(recordFile, 'utf-8')) as { session: Record<string, unknown> }).session,
+    false
+  )
+
+  // Deletion tombstones and clears explicitTitle.
+  store.delete('s-title')
+  assert.equal(store.get('s-title'), null)
+  // Explicit restore after deletion does not resurrect the old pre-delete title.
+  store.upsert({ sessionId: 's-title', cwd: dir, sessionFile })
+  assert.equal(store.get('s-title')?.explicitTitle, undefined)
+})
+
+test('SessionStore: explicitTitle sidecar survives cross-process metadata refreshes, is hidden on delete, and upsert propagates OS errors from legacy map', async () => {
+  const { dir, mapPath, store } = makeStore()
+  const otherProcessStore = new SessionStore(mapPath)
+  const sessionFile = join(dir, 's-sidecar.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 's-sidecar', cwd: dir })}\n`, 'utf-8')
+
+  store.upsert({ sessionId: 's-sidecar', cwd: dir, sessionFile })
+  // Process A commits explicit title to independent sidecar.
+  store.upsert({
+    sessionId: 's-sidecar',
+    cwd: dir,
+    sessionFile,
+    explicitTitle: 'Sidecar Title',
+    preserveUpdatedAt: true
+  })
+
+  // Process B runs a concurrent metadata refresh without explicitTitle; sidecar must survive intact.
+  otherProcessStore.upsert({
+    sessionId: 's-sidecar',
+    cwd: dir,
+    sessionFile,
+    additionalDirectories: ['/ws/extra']
+  })
+  assert.equal(store.get('s-sidecar')?.explicitTitle, 'Sidecar Title')
+  assert.deepEqual(store.get('s-sidecar')?.additionalDirectories, ['/ws/extra'])
+
+  // list() excludes .title sidecars from session records and overlays them onto live sessions.
+  const listed = await store.list()
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0]?.sessionId, 's-sidecar')
+  assert.equal(listed[0]?.explicitTitle, 'Sidecar Title')
+
+  // delete() removes the sidecar and tombstones the record; setExplicitTitle refuses behind a tombstone,
+  // and even a stray sidecar file on disk beside a tombstone stays hidden.
+  store.delete('s-sidecar')
+  assert.equal(store.get('s-sidecar'), null)
+  assert.deepEqual(await store.list(), [])
+  assert.deepEqual(store.setExplicitTitle('s-sidecar', 'Stray Sidecar'), { committed: false })
+  const sidecarFile = join(`${mapPath}.d`, `${Buffer.from('s-sidecar', 'utf-8').toString('base64url')}.title`)
+  writeFileSync(
+    sidecarFile,
+    JSON.stringify({ version: 1, sessionId: 's-sidecar', explicitTitle: 'Stray On Disk' }),
+    'utf8'
+  )
+  assert.equal(store.get('s-sidecar'), null)
+  assert.deepEqual(await store.list(), [])
+
+  // Real OS/IO errors reading the legacy map (not corruption) must propagate out of upsert().
+  const { dir: errDir, mapPath: errMapPath, store: errStore } = makeStore()
+  // Replacing the legacy map path with a directory causes EISDIR on readFileSync (a real OS error, not JSON corruption).
+  mkdirSync(errMapPath)
+  assert.throws(
+    () => errStore.upsert({ sessionId: 'os-err', cwd: errDir, sessionFile: join(errDir, 'x.jsonl') }),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === 'EISDIR'
+  )
+})
+
+test('SessionStore: list() tolerates ENOENT sidecars, delete() validates corrupt sidecars up front, and rollbackExplicitTitle is revision-fenced', async () => {
+  const { dir, mapPath, store } = makeStore()
+  const stateDir = `${mapPath}.d`
+  const sessionFile = join(dir, 's-rev.jsonl')
+  writeFileSync(sessionFile, `${JSON.stringify({ type: 'session', id: 's-rev', cwd: dir })}\n`, 'utf-8')
+
+  const rev1 = store.upsert({ sessionId: 's-rev', cwd: dir, sessionFile, explicitTitle: 'Title 1' })
+  assert.equal(typeof rev1, 'string')
+  const rev2 = store.upsert({ sessionId: 's-rev', cwd: dir, sessionFile, explicitTitle: 'Title 2' })
+  assert.equal(typeof rev2, 'string')
+  assert.notEqual(rev1, rev2)
+
+  // Stale revision rollback must NOT clobber newer title!
+  assert.equal(store.rollbackExplicitTitle('s-rev', rev1!, null), false)
+  assert.equal(store.get('s-rev')?.explicitTitle, 'Title 2')
+
+  // Matching revision rollback restores previous title cleanly.
+  assert.equal(store.rollbackExplicitTitle('s-rev', rev2!, 'Title 1'), true)
+  assert.equal(store.get('s-rev')?.explicitTitle, 'Title 1')
+
+  // Corrupt sidecar causes delete() to throw BEFORE writing a tombstone to <base>.json.
+  const sidecarPath = join(stateDir, `${Buffer.from('s-rev', 'utf-8').toString('base64url')}.title`)
+  writeFileSync(sidecarPath, '{corrupt', 'utf8')
+  assert.throws(() => store.delete('s-rev'), SessionStoreCorruptError)
+  // Direct record is still live (not tombstoned) once sidecar is repaired.
+  assert.equal(store.isTombstoned('s-rev'), false)
+  // list() still propagates corrupt sidecar errors.
+  await assert.rejects(() => store.list(), SessionStoreCorruptError)
+
+  // Replace corrupt sidecar with a broken symlink (ENOENT on readFile) to simulate a sidecar
+  // unlinked between readdir and readFile: list() tolerates ENOENT cleanly.
+  if (process.platform !== 'win32') {
+    const fs = await import('node:fs')
+    fs.unlinkSync(sidecarPath)
+    fs.symlinkSync(join(dir, 'vanished-target'), sidecarPath)
+    const listed = await store.list()
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.sessionId, 's-rev')
+    assert.equal(listed[0]?.explicitTitle, undefined)
+    fs.unlinkSync(sidecarPath)
+  } else {
+    const fs = await import('node:fs')
+    fs.unlinkSync(sidecarPath)
+  }
+
+  // Rollback behind a tombstone refuses to recreate a sidecar.
+  const rev3 = store.upsert({ sessionId: 's-rev', cwd: dir, sessionFile, explicitTitle: 'Before Delete' })
+  store.delete('s-rev')
+  assert.equal(store.rollbackExplicitTitle('s-rev', rev3!, 'Restored'), false)
+  assert.equal(store.get('s-rev'), null)
 })

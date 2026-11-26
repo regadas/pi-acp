@@ -336,8 +336,25 @@ export class SessionRepository {
     cwd: string
     sessionFile: string
     additionalDirectories?: readonly string[]
+    explicitTitle?: string | null
+    preserveUpdatedAt?: boolean
   }): void {
     this.store.upsert(entry)
+  }
+
+  upsertExplicitTitle(entry: {
+    sessionId: string
+    cwd: string
+    sessionFile: string
+    explicitTitle: string
+  }): string | undefined {
+    return this.store.upsert({
+      sessionId: entry.sessionId,
+      cwd: entry.cwd,
+      sessionFile: entry.sessionFile,
+      explicitTitle: entry.explicitTitle,
+      preserveUpdatedAt: true
+    })
   }
 
   tombstone(sessionId: string): void {
@@ -374,7 +391,7 @@ export class SessionRepository {
     // Custom stores are test/embedder seams; the production SessionStore is
     // always validated against the exact JSONL header before use.
     if (stored && !(this.store instanceof SessionStore)) {
-      return { ...stored, title: null, updatedAt: stored.updatedAt ?? null }
+      return { ...stored, title: stored.explicitTitle ?? null, updatedAt: stored.updatedAt ?? null }
     }
     if (stored) {
       const header = await validatedHeader(stored.sessionFile, sessionId)
@@ -384,7 +401,7 @@ export class SessionRepository {
         }
         return {
           ...header,
-          title: null,
+          title: stored.explicitTitle ?? null,
           updatedAt: stored.updatedAt,
           sessionFile: stored.sessionFile,
           additionalDirectories: stored.additionalDirectories ?? []
@@ -398,9 +415,50 @@ export class SessionRepository {
     }
     if (!newest) return null
     this.store.upsert({ sessionId: newest.sessionId, cwd: newest.cwd, sessionFile: newest.sessionFile })
-    // Discovery (re)established the mapping; the roots recorded for this
-    // session identity survive the refresh.
-    return { ...newest, additionalDirectories: this.store.get(newest.sessionId)?.additionalDirectories ?? [] }
+    // Discovery (re)established the mapping; the roots and explicit title
+    // recorded for this session identity survive the refresh.
+    const refreshed = this.store.get(newest.sessionId)
+    return {
+      ...newest,
+      title: refreshed?.explicitTitle ?? newest.title,
+      additionalDirectories: refreshed?.additionalDirectories ?? []
+    }
+  }
+
+  /**
+   * Pure read-only lookup for `session/status` and pre-commit checks: uses the
+   * same validated header/root discovery as `find`/`list` without ever calling
+   * `store.upsert` or `store.delete`. Genuine store corruption or mapped-file
+   * I/O errors propagate instead of degrading silently.
+   */
+  async findReadOnly(sessionId: string, cwd?: string): Promise<SessionRecord | null> {
+    const stored = this.store.get(sessionId)
+    if (stored && !(this.store instanceof SessionStore)) {
+      return { ...stored, title: stored.explicitTitle ?? null, updatedAt: stored.updatedAt ?? null }
+    }
+    if (stored) {
+      const header = await validatedHeader(stored.sessionFile, sessionId, true)
+      if (header) {
+        return {
+          ...header,
+          title: stored.explicitTitle ?? null,
+          updatedAt: stored.updatedAt,
+          sessionFile: stored.sessionFile,
+          additionalDirectories: stored.additionalDirectories ?? []
+        }
+      }
+    }
+
+    let newest: SessionRecord | null = null
+    for (const candidate of await this.matchingRecords(sessionId, cwd)) {
+      if (!newest || isNewer(candidate, newest)) newest = candidate
+    }
+    if (!newest) return null
+    return {
+      ...newest,
+      title: stored?.explicitTitle ?? newest.title,
+      additionalDirectories: stored?.additionalDirectories ?? []
+    }
   }
 
   async list(cwd?: string): Promise<SessionRecord[]> {
@@ -509,8 +567,9 @@ export class SessionRepository {
       if (inScope(selected.cwd) && (stored?.sessionFile !== selected.sessionFile || stored?.cwd !== selected.cwd)) {
         this.store.upsert(selected)
       }
-      // Roots follow the adapter mapping, not the discovered file.
+      // Roots and explicit ACP titles follow the adapter mapping, not the discovered file.
       selected.additionalDirectories = stored?.additionalDirectories ?? []
+      if (stored?.explicitTitle) selected.title = stored.explicitTitle
     }
     return [...byId.values()]
       .filter(record => inScope(record.cwd))

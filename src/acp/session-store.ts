@@ -9,7 +9,7 @@ import {
   unlinkSync,
   writeSync
 } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFile, readdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { getPiAcpSessionMapPath } from './paths.js'
@@ -24,6 +24,11 @@ export type StoredSession = {
    * old records (which have none) stay valid; consumers treat missing as [].
    */
   additionalDirectories?: readonly string[]
+  /**
+   * Explicit title set via `session/set_title` or `/name`. Authoritative ACP
+   * overlay preserved across metadata/cwd/root refreshes and cleared on delete.
+   */
+  explicitTitle?: string
 }
 
 /**
@@ -44,6 +49,17 @@ export class SessionStoreCorruptError extends Error {
   }
 }
 
+/** Attempted to write an explicit title for a session that has been tombstoned/deleted. */
+export class SessionTombstonedError extends Error {
+  readonly sessionId: string
+
+  constructor(sessionId: string) {
+    super(`Session has been deleted: ${sessionId}`)
+    this.name = 'SessionTombstonedError'
+    this.sessionId = sessionId
+  }
+}
+
 type LegacySessionMapFile = {
   version: 1
   sessions: Record<string, StoredSession>
@@ -52,6 +68,14 @@ type LegacySessionMapFile = {
 /** One per-session record: either live state or a deletion tombstone. */
 type SessionRecordFile =
   { version: 1; deleted?: false; session: StoredSession } | { version: 1; deleted: true; sessionId: string }
+
+/** Independent atomic sidecar for an explicit ACP title, isolated from metadata refreshes. */
+type SessionTitleSidecarFile = {
+  version: 1
+  sessionId: string
+  explicitTitle: string
+  revision?: string
+}
 
 function isStoredSession(value: unknown): value is StoredSession {
   const record = value as StoredSession | null | undefined
@@ -103,6 +127,43 @@ function parseRecord(path: string, raw: string, expectedSessionId?: string): Ses
     )
   }
   return { version: 1, session: record.session }
+}
+
+function parseTitleSidecar(path: string, raw: string, expectedSessionId?: string): SessionTitleSidecarFile {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch (e) {
+    throw new SessionStoreCorruptError(path, `invalid JSON: ${String((e as Error)?.message ?? e)}`)
+  }
+  const record = parsed as {
+    version?: unknown
+    sessionId?: unknown
+    explicitTitle?: unknown
+    revision?: unknown
+  } | null
+  if (
+    !record ||
+    typeof record !== 'object' ||
+    record.version !== 1 ||
+    typeof record.sessionId !== 'string' ||
+    typeof record.explicitTitle !== 'string' ||
+    (record.revision !== undefined && typeof record.revision !== 'string')
+  ) {
+    throw new SessionStoreCorruptError(path, 'unknown title sidecar shape or version')
+  }
+  if (expectedSessionId !== undefined && record.sessionId !== expectedSessionId) {
+    throw new SessionStoreCorruptError(
+      path,
+      `title sidecar sessionId ${record.sessionId} does not match ${expectedSessionId}`
+    )
+  }
+  return {
+    version: 1,
+    sessionId: record.sessionId,
+    explicitTitle: record.explicitTitle,
+    ...(record.revision !== undefined ? { revision: record.revision } : {})
+  }
 }
 
 function parseLegacyMap(path: string, raw: string): LegacySessionMapFile {
@@ -247,12 +308,88 @@ export class SessionStore {
     this.stateDir = `${path}.d`
   }
 
-  private recordPath(sessionId: string): string {
+  private recordBaseName(sessionId: string): string {
     const encoded = Buffer.from(sessionId, 'utf-8').toString('base64url')
     // Path-safe and reversible for realistic ids (UUIDs); hash unusually long
     // ids so the file name stays within filesystem limits.
-    const name = encoded.length <= 180 ? encoded : `sha256-${createHash('sha256').update(sessionId).digest('hex')}`
-    return join(this.stateDir, `${name}.json`)
+    return encoded.length <= 180 ? encoded : `sha256-${createHash('sha256').update(sessionId).digest('hex')}`
+  }
+
+  private recordPath(sessionId: string): string {
+    return join(this.stateDir, `${this.recordBaseName(sessionId)}.json`)
+  }
+
+  private titleSidecarPath(sessionId: string): string {
+    return join(this.stateDir, `${this.recordBaseName(sessionId)}.title`)
+  }
+
+  private readTitleSidecarRecord(sessionId: string): SessionTitleSidecarFile | null {
+    const path = this.titleSidecarPath(sessionId)
+    const raw = readFileOrNull(path)
+    return raw === null ? null : parseTitleSidecar(path, raw, sessionId)
+  }
+
+  private readTitleSidecar(sessionId: string): string | null {
+    return this.readTitleSidecarRecord(sessionId)?.explicitTitle ?? null
+  }
+
+  /** Whether the direct record for this session is currently a deletion tombstone. */
+  isTombstoned(sessionId: string): boolean {
+    return this.readDirect(sessionId)?.deleted === true
+  }
+
+  /**
+   * Write or clear the independent per-session explicit-title sidecar atomically.
+   * Refuses to write when the direct session record is tombstoned.
+   */
+  setExplicitTitle(sessionId: string, explicitTitle: string | null): { committed: boolean; revision?: string } {
+    const direct = this.readDirect(sessionId)
+    const path = this.titleSidecarPath(sessionId)
+    // Preserve corruption visibility before replacing or removing.
+    this.readTitleSidecarRecord(sessionId)
+    if (explicitTitle === null) {
+      try {
+        unlinkSync(path)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      return { committed: true }
+    }
+    if (direct?.deleted === true) {
+      return { committed: false }
+    }
+    const revision = randomUUID()
+    const sidecar: SessionTitleSidecarFile = { version: 1, sessionId, explicitTitle, revision }
+    writeFileAtomic(path, JSON.stringify(sidecar, null, 2) + '\n')
+    return { committed: true, revision }
+  }
+
+  /**
+   * Roll back an explicit title only if the session has not been tombstoned and
+   * the on-disk sidecar still carries `expectedRevision`. Prevents clobbering a
+   * concurrent newer rename or recreating a sidecar behind a tombstone.
+   */
+  rollbackExplicitTitle(sessionId: string, expectedRevision: string, previousTitle: string | null): boolean {
+    const direct = this.readDirect(sessionId)
+    if (direct?.deleted === true) return false
+    const current = this.readTitleSidecarRecord(sessionId)
+    if (!current || current.revision !== expectedRevision) return false
+    if (previousTitle === null) {
+      try {
+        unlinkSync(this.titleSidecarPath(sessionId))
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      return true
+    }
+    const restored: SessionTitleSidecarFile = {
+      version: 1,
+      sessionId,
+      explicitTitle: previousTitle,
+      revision: randomUUID()
+    }
+    writeFileAtomic(this.titleSidecarPath(sessionId), JSON.stringify(restored, null, 2) + '\n')
+    return true
   }
 
   private readLegacy(sessionId: string): StoredSession | null {
@@ -277,8 +414,15 @@ export class SessionStore {
 
   get(sessionId: string): StoredSession | null {
     const record = this.readDirect(sessionId)
-    if (record) return record.deleted ? null : record.session
-    return this.readLegacy(sessionId)
+    if (record) {
+      if (record.deleted) return null
+      const sidecarTitle = this.readTitleSidecar(sessionId)
+      return sidecarTitle !== null ? { ...record.session, explicitTitle: sidecarTitle } : record.session
+    }
+    const legacy = this.readLegacy(sessionId)
+    if (!legacy) return null
+    const sidecarTitle = this.readTitleSidecar(sessionId)
+    return sidecarTitle !== null ? { ...legacy, explicitTitle: sidecarTitle } : legacy
   }
 
   /** Enumerate live records, including legacy entries not hidden by tombstones. */
@@ -300,13 +444,16 @@ export class SessionStore {
       }
     }
 
-    let names: string[] = []
+    let allNames: string[] = []
     try {
-      names = (await readdir(this.stateDir)).filter(name => name.endsWith('.json'))
+      allNames = await readdir(this.stateDir)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     }
-    const paths = names.map(name => join(this.stateDir, name))
+    const recordNames = allNames.filter(name => name.endsWith('.json'))
+    const titleNames = allNames.filter(name => name.endsWith('.title'))
+
+    const paths = recordNames.map(name => join(this.stateDir, name))
     // Parsing stays sequential so corruption surfaces exactly like get()'s.
     const contents = await boundedAll(paths, RECORD_READ_CONCURRENCY, path => readFile(path, 'utf8'))
     for (let index = 0; index < paths.length; index++) {
@@ -319,6 +466,29 @@ export class SessionStore {
       if (record.deleted) byId.delete(id)
       else byId.set(id, record.session)
     }
+
+    // Overlay independent explicit-title sidecars onto live (non-tombstoned) sessions.
+    const titlePaths = titleNames.map(name => join(this.stateDir, name))
+    const titleContents = await boundedAll(titlePaths, RECORD_READ_CONCURRENCY, async path => {
+      try {
+        return await readFile(path, 'utf8')
+      } catch (error) {
+        // A concurrent delete or rollback may unlink a sidecar between readdir and readFile.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+        throw error
+      }
+    })
+    for (let index = 0; index < titlePaths.length; index++) {
+      const raw = titleContents[index]
+      if (raw === null || raw === undefined) continue
+      const path = titlePaths[index]!
+      const sidecar = parseTitleSidecar(path, raw)
+      if (path !== this.titleSidecarPath(sidecar.sessionId)) {
+        throw new SessionStoreCorruptError(path, `title sidecar filename does not match sessionId ${sidecar.sessionId}`)
+      }
+      const existing = byId.get(sidecar.sessionId)
+      if (existing) byId.set(sidecar.sessionId, { ...existing, explicitTitle: sidecar.explicitTitle })
+    }
     return [...byId.values()]
   }
 
@@ -327,40 +497,110 @@ export class SessionStore {
     cwd: string
     sessionFile: string
     additionalDirectories?: readonly string[]
-  }): void {
+    explicitTitle?: string | null
+    preserveUpdatedAt?: boolean
+  }): string | undefined {
     // Refuse to replace malformed state. This validation is intentionally per
     // record and does not introduce a shared read-modify-write file.
     const current = this.readDirect(entry.sessionId)
+    const previousSidecar = entry.explicitTitle !== undefined ? this.readTitleSidecarRecord(entry.sessionId) : undefined
     // A concurrent delete tombstones the id after unlinking its file; a stale
-    // discovery upsert must not resurrect that mapping. A session file that
-    // exists again is an explicit restore and does replace the tombstone.
-    if (current?.deleted === true && !existsSync(entry.sessionFile)) return
-    // An omitted root list preserves the recorded one: ordinary metadata
-    // refreshes (cwd repairs, discovery re-mappings) must not clear workspace
-    // roots. An explicit list — empty included — replaces it.
-    const additionalDirectories =
-      entry.additionalDirectories ??
-      (current && 'session' in current ? current.session.additionalDirectories : undefined)
+    // discovery upsert must not resurrect that mapping. An explicit title write
+    // against a tombstoned session fails closed instead of silently succeeding.
+    if (current?.deleted === true) {
+      if (entry.explicitTitle !== undefined) throw new SessionTombstonedError(entry.sessionId)
+      if (!existsSync(entry.sessionFile)) return undefined
+    }
+
+    // When updating only the explicit title on an already-mapped live session
+    // with matching cwd/sessionFile, write ONLY `<id>.title` and leave
+    // `<id>.json` untouched so a concurrent deletion tombstone is never overwritten.
+    if (
+      entry.explicitTitle !== undefined &&
+      entry.additionalDirectories === undefined &&
+      current !== null &&
+      !current.deleted &&
+      current.session.cwd === entry.cwd &&
+      current.session.sessionFile === entry.sessionFile
+    ) {
+      const outcome = this.setExplicitTitle(entry.sessionId, entry.explicitTitle)
+      if (!outcome.committed) throw new SessionTombstonedError(entry.sessionId)
+      return outcome.revision
+    }
+
+    let legacyExisting: StoredSession | null = null
+    if (current === null) {
+      try {
+        legacyExisting = this.readLegacy(entry.sessionId)
+      } catch (error) {
+        if (!(error instanceof SessionStoreCorruptError)) throw error
+        // Corrupt legacy map must not block writing a fresh per-session direct record.
+      }
+    }
+    const existing = current === null ? legacyExisting : 'session' in current ? current.session : null
+    // An omitted root list preserves the recorded value (including from legacy
+    // fallback): ordinary metadata refreshes (cwd repairs, discovery
+    // re-mappings) must not clear workspace roots. Explicit titles live solely
+    // in `<id>.title` so cross-process metadata refreshes never touch them.
+    const additionalDirectories = entry.additionalDirectories ?? existing?.additionalDirectories
+    const updatedAt = entry.preserveUpdatedAt && existing?.updatedAt ? existing.updatedAt : new Date().toISOString()
     const record: SessionRecordFile = {
       version: 1,
       session: {
         sessionId: entry.sessionId,
         cwd: entry.cwd,
         sessionFile: entry.sessionFile,
-        updatedAt: new Date().toISOString(),
+        updatedAt,
         ...(additionalDirectories ? { additionalDirectories } : {})
       }
     }
-    writeFileAtomic(this.recordPath(entry.sessionId), JSON.stringify(record, null, 2) + '\n')
+
+    // shortcut: cross-process check-then-write when creating `<id>.json` for an
+    // unmapped session (or rolling back a sidecar) can race a concurrent delete
+    // from another process; upgrade to a lockfile if multi-writer adapters are added.
+    let sidecarRevision: string | undefined
+    if (entry.explicitTitle !== undefined) {
+      const outcome = this.setExplicitTitle(entry.sessionId, entry.explicitTitle)
+      if (!outcome.committed) throw new SessionTombstonedError(entry.sessionId)
+      sidecarRevision = outcome.revision
+    }
+
+    try {
+      writeFileAtomic(this.recordPath(entry.sessionId), JSON.stringify(record, null, 2) + '\n')
+    } catch (error) {
+      // If writing the main record fails after creating/updating the sidecar,
+      // restore the prior sidecar state best-effort so no orphan title leaks.
+      if (entry.explicitTitle !== undefined) {
+        try {
+          if (sidecarRevision) {
+            this.rollbackExplicitTitle(entry.sessionId, sidecarRevision, previousSidecar?.explicitTitle ?? null)
+          } else if (previousSidecar) {
+            writeFileAtomic(this.titleSidecarPath(entry.sessionId), JSON.stringify(previousSidecar, null, 2) + '\n')
+          }
+        } catch {
+          // Best-effort cleanup; original write error takes precedence.
+        }
+      }
+      throw error
+    }
+    return sidecarRevision
   }
 
   delete(sessionId: string): void {
-    // As with upsert, corruption must remain visible for manual repair rather
-    // than being hidden by a valid-looking replacement.
+    // Validate both the direct record and any explicit-title sidecar UP FRONT
+    // before mutating either file so corruption stays visible cleanly.
     this.readDirect(sessionId)
+    this.readTitleSidecarRecord(sessionId)
     // A tombstone (not unlink) is required: unlinking the direct record would
     // let a stale legacy-map entry resurrect the session on the next get().
     const record: SessionRecordFile = { version: 1, deleted: true, sessionId }
     writeFileAtomic(this.recordPath(sessionId), JSON.stringify(record, null, 2) + '\n')
+    // Clear any independent explicit-title sidecar so a later explicit restore
+    // never resurrects a pre-delete title.
+    try {
+      unlinkSync(this.titleSidecarPath(sessionId))
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
   }
 }
