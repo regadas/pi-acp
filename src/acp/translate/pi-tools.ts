@@ -57,13 +57,14 @@ export function toolResultContentBlocks(result: unknown): ToolResultContentBlock
   if (ordered.length) return ordered
 
   // The bash tool frequently returns stdout/stderr in `details` rather than content blocks.
+  // Keep raw line endings (including CRLF) verbatim rather than trimming them away.
   const { stdout, stderr, exitCode } = bashResultFields(result)
-  if (stdout?.trim() || stderr?.trim()) {
+  if (stdout?.length || stderr?.length) {
     const parts: string[] = []
-    if (stdout?.trim()) parts.push(stdout)
-    if (stderr?.trim()) parts.push(`stderr:\n${stderr}`)
+    if (stdout?.length) parts.push(stdout)
+    if (stderr?.length) parts.push(`stderr:\n${stderr}`)
     if (exitCode !== undefined) parts.push(`exit code: ${exitCode}`)
-    return [{ type: 'text', text: parts.join('\n\n').trimEnd() }]
+    return [{ type: 'text', text: parts.join('\n\n') }]
   }
 
   try {

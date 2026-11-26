@@ -1,6 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { getEditOldTexts } from '../../src/acp/translate/tool-calls.js'
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import {
+  getEditOldTexts,
+  resolveValidToolPath,
+  toToolCallLocations,
+  validLocationLine
+} from '../../src/acp/translate/tool-calls.js'
 
 // `oldText` candidates anchor a best-effort line hint for an edit tool call:
 // complete `{ oldText, newText }` pairs are the strongest signal, but an entry
@@ -54,4 +62,48 @@ test('getEditOldTexts: malformed input yields no candidates', () => {
   assert.deepEqual(getEditOldTexts(null), [])
   assert.deepEqual(getEditOldTexts(undefined), [])
   assert.deepEqual(getEditOldTexts('edit'), [])
+})
+
+test('toToolCallLocations & resolveValidToolPath: drops malformed/NUL/non-file/broken-symlink hints and bad lines safely', t => {
+  const root = mkdtempSync(join(tmpdir(), 'pi-acp-tool-loc-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+
+  const filePath = join(root, 'file.txt')
+  const dirPath = join(root, 'subdir')
+  writeFileSync(filePath, 'hello\n', 'utf8')
+  mkdirSync(dirPath)
+
+  // Valid file + valid 1-based line.
+  assert.deepEqual(toToolCallLocations('read', { path: 'file.txt' }, root, 3), [{ path: filePath, line: 3 }])
+
+  // Non-integer, zero, negative, NaN, Infinity line numbers are dropped without dropping the valid path.
+  for (const badLine of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(validLocationLine(badLine), undefined)
+    assert.deepEqual(toToolCallLocations('read', { path: 'file.txt' }, root, badLine), [{ path: filePath }])
+  }
+
+  // NUL, control chars, blank paths, directories are dropped cleanly without throwing.
+  assert.equal(resolveValidToolPath('foo\x00bar.txt', root), undefined)
+  assert.equal(resolveValidToolPath('foo\nbar.txt', root), undefined)
+  assert.equal(resolveValidToolPath('   ', root), undefined)
+  assert.equal(toToolCallLocations('read', { path: 'foo\x00bar.txt' }, root), undefined)
+  assert.equal(toToolCallLocations('write', { path: 'foo\x00bar.txt' }, root), undefined)
+  assert.equal(toToolCallLocations('read', { path: 'subdir' }, root), undefined)
+
+  // Missing target preserved for write, omitted for read.
+  const newTarget = join(root, 'new.txt')
+  assert.deepEqual(toToolCallLocations('write', { path: 'new.txt' }, root), [{ path: newTarget }])
+  assert.equal(toToolCallLocations('read', { path: 'new.txt' }, root), undefined)
+
+  // Broken symlink dropped cleanly without throwing; valid symlink preserved.
+  if (process.platform !== 'win32') {
+    const broken = join(root, 'broken-link')
+    symlinkSync(join(root, 'does-not-exist'), broken)
+    assert.equal(toToolCallLocations('read', { path: broken }, root), undefined)
+    assert.equal(toToolCallLocations('write', { path: broken }, root), undefined)
+
+    const validLink = join(root, 'valid-link')
+    symlinkSync(filePath, validLink)
+    assert.deepEqual(toToolCallLocations('read', { path: validLink }, root, 1), [{ path: validLink, line: 1 }])
+  }
 })

@@ -34,3 +34,14 @@ test('fileSnapshot: bounded regular files, absence, symlinks and raced replaceme
   })
   assert.equal(fileSnapshot(path), undefined, 'a different inode cannot become the pre-mutation snapshot')
 })
+
+test('fileSnapshot: rejects NUL paths safely and preserves CRLF bytes verbatim', t => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'pi-acp-snapshot-crlf-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  assert.equal(fileSnapshot(`${root}/bad\x00path.txt`), undefined)
+  assert.equal(fileSnapshot(''), undefined)
+
+  const crlfPath = join(root, 'win.txt')
+  fs.writeFileSync(crlfPath, 'line1\r\nline2\r\n', 'utf8')
+  assert.equal(fileSnapshot(crlfPath), 'line1\r\nline2\r\n')
+})

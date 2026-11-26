@@ -494,3 +494,30 @@ test('bashOutputDelta: window line count mismatch falls back to text overlap', (
   const previous = truncated(windowText(2, 2000), { totalLines: 2000, totalBytes: 14000, outputLines: 1999 })
   assert.equal(bashOutputDelta(previous.snapshot, lying.snapshot), '\nline2001')
 })
+
+test('bashOrderedContent & bashOutputDelta: preserve CRLF bytes across fences, split boundaries, and rolling windows', () => {
+  // Fenced console block keeps embedded and trailing CRLF verbatim.
+  assert.equal(
+    textContent({ content: [{ type: 'text', text: 'line1\r\nline2\r\n' }] }),
+    '```console\nline1\r\nline2\r\n```'
+  )
+  assert.equal(textContent({ content: [], details: { stdout: 'out\r\n' } }), '```console\nout\r\n```')
+
+  // Split CRLF across consecutive complete snapshots: '\r' then '\nnext\r\n'.
+  const splitDeltas = deltaSequence([complete('a\r'), complete('a\r\nb\r\n')])
+  assert.equal(splitDeltas.join(''), 'a\r\nb\r\n')
+
+  // Rolling truncated window with CRLF lines: open line finishes with '\r\n',
+  // then next CRLF line arrives.
+  const crlfPrefix = 'v\r\n'.repeat(1999)
+  const w1 = crlfPrefix + 'open'
+  const w2 = crlfPrefix + 'open\r'
+  const w3 = 'v\r\n'.repeat(1998) + 'open\r\nnext\r'
+  const b0 = Buffer.byteLength('v\r\n') * 2000
+  const rolling = deltaSequence([
+    truncated(w1, { totalLines: 2001, totalBytes: b0 + 4, outputLines: 2000 }).snapshot,
+    truncated(w2, { totalLines: 2001, totalBytes: b0 + 6, outputLines: 2000 }).snapshot,
+    truncated(w3, { totalLines: 2002, totalBytes: b0 + 11, outputLines: 2000 }).snapshot
+  ])
+  assert.deepEqual(rolling, [w1, '\r\n', 'next\r'])
+})

@@ -5,6 +5,7 @@ export const MAX_SNAPSHOT_BYTES = 1024 * 1024
 
 /** null means absent; undefined means deliberately unavailable (not an empty/new file). */
 export function fileSnapshot(path: string): string | null | undefined {
+  if (!path || path.includes('\0')) return undefined
   let fd: number | undefined
   let found = false
   try {

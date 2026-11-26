@@ -29,6 +29,44 @@ export function appendTitleContext(previous: string | undefined, text: string): 
   return next.length > MAX_TITLE_CONTEXT_LENGTH ? next.slice(-MAX_TITLE_CONTEXT_LENGTH) : next
 }
 
+/** Cap a string by Unicode code points (never splitting surrogate pairs). */
+export function truncateCodePoints(value: string, maxChars: number): string {
+  const chars = Array.from(value)
+  if (chars.length <= maxChars) return value
+  return `${chars
+    .slice(0, Math.max(1, maxChars - 1))
+    .join('')
+    .trimEnd()}…`
+}
+
+/**
+ * Normalize an explicit user-supplied session title (from `session/set_title`
+ * or `/name`): collapse ASCII control characters (including newlines/tabs) to
+ * a single space, trim outer whitespace, preserve intentional punctuation and
+ * inner spaces, and cap by code points so surrogate pairs are never split.
+ * Returns null when the input is not a string or is empty after normalization.
+ */
+export function normalizeExplicitTitle(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  let out = ''
+  let inControl = false
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i)
+    if (code <= 0x1f || code === 0x7f) {
+      if (!inControl) {
+        out += ' '
+        inControl = true
+      }
+    } else {
+      out += value[i]
+      inControl = false
+    }
+  }
+  const trimmed = out.trim()
+  if (!trimmed) return null
+  return truncateCodePoints(trimmed, TITLE_LIMIT)
+}
+
 function normalizeTitle(value: string): string | null {
   const stripped = value
     .replace(/\s+/g, ' ')
@@ -38,13 +76,7 @@ function normalizeTitle(value: string): string | null {
     .replace(/["'`\s.!;:,-]+$/, '')
     .trim()
   if (!stripped) return null
-  const chars = Array.from(stripped)
-  return chars.length <= TITLE_LIMIT
-    ? stripped
-    : `${chars
-        .slice(0, TITLE_LIMIT - 1)
-        .join('')
-        .trimEnd()}…`
+  return truncateCodePoints(stripped, TITLE_LIMIT)
 }
 
 /**

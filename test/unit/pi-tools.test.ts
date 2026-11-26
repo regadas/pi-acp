@@ -97,3 +97,26 @@ test('toolResultToolCallContent: wraps ordered blocks as ACP tool call content',
     ]
   )
 })
+
+test('toolResultContentBlocks: preserves CRLF verbatim in content, details.diff, and details stdout/stderr fallback', () => {
+  assert.deepEqual(
+    toolResultContentBlocks({
+      content: [{ type: 'text', text: 'a\r\nb\r\n' }]
+    }),
+    [{ type: 'text', text: 'a\r\nb\r\n' }]
+  )
+
+  assert.deepEqual(
+    toolResultContentBlocks({
+      details: { diff: '--- a\r\n+++ b\r\n-old\r\n+new\r\n' }
+    }),
+    [{ type: 'text', text: '--- a\r\n+++ b\r\n-old\r\n+new\r\n' }]
+  )
+
+  assert.deepEqual(
+    toolResultContentBlocks({
+      details: { output: 'win-line1\r\nwin-line2\r\n' }
+    }),
+    [{ type: 'text', text: 'win-line1\r\nwin-line2\r\n' }]
+  )
+})

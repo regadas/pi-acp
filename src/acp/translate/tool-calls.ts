@@ -25,6 +25,34 @@ export function getToolPath(args: unknown): string | undefined {
   return undefined
 }
 
+function hasControlChars(value: string): boolean {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i)
+    if (code <= 0x1f || code === 0x7f) return true
+  }
+  return false
+}
+
+/**
+ * Resolve a tool-supplied path against `cwd`, rejecting blank strings, NUL or
+ * control characters, and anything that fails to resolve to an absolute path.
+ */
+export function resolveValidToolPath(rawPath: string | undefined, cwd: string): string | undefined {
+  if (!rawPath || !rawPath.trim() || hasControlChars(rawPath)) return undefined
+  if (hasControlChars(cwd)) return undefined
+  try {
+    const resolvedPath = isAbsolute(rawPath) ? rawPath : resolvePath(cwd, rawPath)
+    return resolvedPath && isAbsolute(resolvedPath) && !hasControlChars(resolvedPath) ? resolvedPath : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Valid ACP 1-based line number (safe positive integer), else undefined. */
+export function validLocationLine(line: unknown): number | undefined {
+  return typeof line === 'number' && Number.isSafeInteger(line) && line >= 1 ? line : undefined
+}
+
 type EditFields = { oldText?: unknown; newText?: unknown }
 type NormalizedEditInput = { record: EditFields; edits: readonly EditFields[] }
 
@@ -86,17 +114,17 @@ export function toToolCallLocations(
   cwd: string,
   line?: number
 ): ToolCallLocation[] | undefined {
-  const path = getToolPath(args)
-  if (!path) return undefined
+  const resolvedPath = resolveValidToolPath(getToolPath(args), cwd)
+  if (!resolvedPath) return undefined
 
-  const resolvedPath = isAbsolute(path) ? path : resolvePath(cwd, path)
+  const validLine = validLocationLine(line)
   let entry: ReturnType<typeof lstatSync>
   try {
     entry = lstatSync(resolvedPath)
   } catch (error) {
     const isMissing = (error as NodeJS.ErrnoException).code === 'ENOENT'
     if (!isMissing || toolName.toLowerCase() !== 'write') return undefined
-    return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
+    return [{ path: resolvedPath, ...(validLine !== undefined ? { line: validLine } : {}) }]
   }
 
   if (entry.isSymbolicLink()) {
@@ -108,7 +136,7 @@ export function toToolCallLocations(
   }
 
   if (!entry.isFile()) return undefined
-  return [{ path: resolvedPath, ...(typeof line === 'number' ? { line } : {}) }]
+  return [{ path: resolvedPath, ...(validLine !== undefined ? { line: validLine } : {}) }]
 }
 
 export function toToolKind(toolName: string): ToolKind {

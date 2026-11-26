@@ -6,7 +6,9 @@ import {
   decodeTitleWidget,
   encodeTitleWidget,
   firstMessageTitle,
-  titleFromModelOutput
+  normalizeExplicitTitle,
+  titleFromModelOutput,
+  truncateCodePoints
 } from '../../src/acp/session-title.js'
 
 test('buildTitlePrompt: caps model input and keeps one neutral excerpt header', () => {
@@ -93,4 +95,25 @@ test('title widget: round-trips through the shared codec and rejects anything el
     provisional: false
   })
   assert.equal(decodeTitleWidget(['{"version":1,"title":"   "}']), null)
+})
+
+test('normalizeExplicitTitle: trims, collapses control chars, rejects empty, and caps without splitting surrogate pairs', () => {
+  assert.equal(normalizeExplicitTitle('  Release   v1.2!  '), 'Release   v1.2!')
+  assert.equal(normalizeExplicitTitle('hello\r\n\tworld\x00again'), 'hello world again')
+  assert.equal(normalizeExplicitTitle('   \n\t\x00  '), null)
+  assert.equal(normalizeExplicitTitle(''), null)
+  assert.equal(normalizeExplicitTitle(null), null)
+  assert.equal(normalizeExplicitTitle(123), null)
+
+  const long = normalizeExplicitTitle(`a${'🚀'.repeat(300)}`)
+  assert.ok(long)
+  assert.equal(Array.from(long).length, 256)
+  assert.equal(long.endsWith('…'), true)
+  assert.equal(/[\uD800-\uDBFF]$/.test(long), false)
+})
+
+test('truncateCodePoints: caps by Unicode code points without splitting surrogate pairs', () => {
+  assert.equal(truncateCodePoints('hello', 10), 'hello')
+  assert.equal(truncateCodePoints('hello world', 6), 'hello…')
+  assert.equal(truncateCodePoints('🚀🔥🎉✨', 3), '🚀🔥…')
 })
