@@ -119,6 +119,7 @@ function startVersionProbe(piCommand: string, cwd: string, invocation: PiInvocat
     child.once('exit', () => {
       exited = true
     })
+    let treeKill: Promise<void> | undefined
     const killProbeTree = () => {
       const kill =
         child.pid === undefined
@@ -132,12 +133,21 @@ function startVersionProbe(piCommand: string, cwd: string, invocation: PiInvocat
         child.kill('SIGKILL')
         return
       }
-      void kill.then(
+      treeKill ??= kill.then(
         result => {
           if (!result.confirmed) console.error(`pi-acp: version probe tree kill unconfirmed (${result.reason})`)
         },
         () => {}
       )
+    }
+    const settleAborted = (reason: unknown) => {
+      // Wait for process-group/tree termination confirmation before settling
+      // abort so a grandchild zombie on Linux is reaped before callers proceed.
+      if (treeKill) {
+        void treeKill.then(() => settle({ error: reason }))
+        return
+      }
+      settle({ error: reason })
     }
     const cleanup = () => {
       clearTimeout(timer)
@@ -159,7 +169,7 @@ function startVersionProbe(piCommand: string, cwd: string, invocation: PiInvocat
     child.stderr.setEncoding('utf8').on('data', chunk => (stderr += chunk))
     child.once('error', error => {
       if (abortedReason !== undefined) {
-        settle({ error: abortedReason })
+        settleAborted(abortedReason)
         return
       }
       const code = (error as NodeJS.ErrnoException).code
@@ -169,7 +179,7 @@ function startVersionProbe(piCommand: string, cwd: string, invocation: PiInvocat
     child.once('close', (code, childSignal) => {
       if (settled) return
       if (abortedReason !== undefined) {
-        settle({ error: abortedReason })
+        settleAborted(abortedReason)
         return
       }
       const output = (stdout.trim() || stderr.trim()).slice(0, 120)
