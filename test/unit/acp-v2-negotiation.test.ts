@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { client, methods, type Implementation } from '@agentclientprotocol/sdk/unstable'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
-import type { WireStream } from '@agentclientprotocol/sdk/experimental/v2'
 import { createPiAcpProtocolRouter } from '../../src/acp/app.js'
 import { acpStreamPair } from '../helpers/fakes.js'
 
@@ -46,7 +45,7 @@ const CLIENT_INFO: Implementation = { name: 'pi-acp-tests', title: 'pi-acp tests
 
 test('router: a v2 initialize selects the v2 chain and its method set only', async () => {
   const [agentSide, clientSide] = streamPair()
-  createPiAcpProtocolRouter().connect(agentSide as unknown as WireStream)
+  createPiAcpProtocolRouter().connect(agentSide as unknown as v2.Stream)
   const conn = v2
     .client({ name: 'pi-acp-tests' })
     .onNotification(v2.methods.client.session.update, () => {})
@@ -87,7 +86,7 @@ test('router: a v2 initialize selects the v2 chain and its method set only', asy
 
 test('router: a client asking for version 1 gets the unchanged v1 chain', async () => {
   const [agentSide, clientSide] = streamPair()
-  createPiAcpProtocolRouter().connect(agentSide as unknown as WireStream)
+  createPiAcpProtocolRouter().connect(agentSide as unknown as v2.Stream)
   const conn = client({ name: 'pi-acp-tests' }).connect(clientSide)
 
   // v1 regression pin: the exact v1 initialize response the v1 chain always gave.
@@ -143,7 +142,7 @@ test('router: the requested version is honored on the raw wire', async () => {
   // its own connection: initialize may be requested once per connection.
   const rawInitialize = async (protocolVersion: number): Promise<unknown> => {
     const [agentSide, clientSide] = streamPair()
-    createPiAcpProtocolRouter().connect(agentSide as unknown as WireStream)
+    createPiAcpProtocolRouter().connect(agentSide as unknown as v2.Stream)
     const writer = clientSide.writable.getWriter()
     const reader = clientSide.readable.getReader()
     await writer.write({
@@ -173,10 +172,12 @@ test('router: the requested version is honored on the raw wire', async () => {
   assert.deepEqual(rejected.error.data.supported, [1, 2])
 })
 
-test('router: a non-initialize first request is rejected and the connection closes', async () => {
-  const [agentSide, clientSide] = streamPair()
-  const router = createPiAcpProtocolRouter()
-  const lifecycle = router.connect(agentSide as unknown as WireStream)
+test('router: a non-initialize first request is rejected without closing the connection', async () => {
+  const agentToClient = new TransformStream<Uint8Array, Uint8Array>()
+  const clientToAgent = new TransformStream<Uint8Array, Uint8Array>()
+  const agentSide = v2.ndJsonStream(agentToClient.writable, clientToAgent.readable)
+  const clientSide = v2.ndJsonStream(clientToAgent.writable, agentToClient.readable)
+  const lifecycle = createPiAcpProtocolRouter().connect(agentSide)
   const writer = clientSide.writable.getWriter()
   const reader = clientSide.readable.getReader()
 
@@ -187,13 +188,18 @@ test('router: a non-initialize first request is rejected and the connection clos
   assert.equal(response.error.code, -32600)
   assert.match(response.error.data ?? response.error.message, /initialize/)
 
-  // The routed connection is closed after the rejection: its lifecycle ends
-  // and it serves nothing further.
-  await withTimeout(
-    Promise.race([
-      lifecycle.closed,
-      new Promise((_resolve, reject) => setTimeout(() => reject(new Error('connection stayed open')), 2_000))
-    ]),
-    'connection close'
-  )
+  // The connection stays open so the client can still send initialize.
+  await writer.write({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'initialize',
+    params: { protocolVersion: 2, info: CLIENT_INFO }
+  })
+  const initResponse = (await withTimeout(reader.read() as Promise<{ value: unknown }>, 'initialize')).value as {
+    result?: { protocolVersion?: number }
+  }
+  assert.equal(initResponse.result?.protocolVersion, 2)
+
+  await clientToAgent.writable.close()
+  await withTimeout(lifecycle.closed, 'connection close')
 })

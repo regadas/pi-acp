@@ -64,6 +64,7 @@ test('app wiring: initialize advertises exactly the implemented capabilities', a
 
 test('app wiring: unimplemented ACP methods are not registered', async () => {
   const conn = connect()
+  await conn.agent.request(methods.agent.initialize, { protocolVersion: 1 })
 
   // `session/set_mode` included: pi thinking levels are exposed exclusively
   // through the standard `thought_level` session config option.

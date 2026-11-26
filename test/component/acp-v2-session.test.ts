@@ -4,7 +4,6 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as v2 from '@agentclientprotocol/sdk/experimental/v2'
-import type { WireStream } from '@agentclientprotocol/sdk/experimental/v2'
 import { ndJsonStream } from '@agentclientprotocol/sdk/unstable'
 import { PiRpcProcess } from '../../src/pi-rpc/process.js'
 import { FakePiRpcProcess, acpStreamPair } from '../helpers/fakes.js'
@@ -77,7 +76,7 @@ function patchSpawn(state: Record<string, unknown>): FakePiRpcProcess & { restor
 function connectV2(onAgent?: (agent: PiAcpAgent | null) => void, store?: SessionStore) {
   const updates: Update[] = []
   const [agentSide, clientSide] = acpStreamPair()
-  createPiAcpProtocolRouter({ onAgent, store }).connect(agentSide as unknown as WireStream)
+  createPiAcpProtocolRouter({ onAgent, store }).connect(agentSide as unknown as v2.Stream)
   const conn = v2
     .client({ name: 'pi-acp-v2-tests' })
     .onNotification(v2.methods.client.session.update, ctx => {
@@ -123,7 +122,7 @@ function connectV2Gated(onAgent?: (agent: PiAcpAgent | null) => void, store?: Se
   })
   const clientToAgent = new TransformStream<Uint8Array, Uint8Array>()
   createPiAcpProtocolRouter({ onAgent, store }).connect(
-    ndJsonStream(agentToClient.writable, clientToAgent.readable) as unknown as WireStream
+    ndJsonStream(agentToClient.writable, clientToAgent.readable) as unknown as v2.Stream
   )
   const conn = v2
     .client({ name: 'pi-acp-v2-tests' })
@@ -881,6 +880,7 @@ test('v2 prompt followed immediately by cancel: cancelled, no full turn', async 
       prompt: [{ type: 'text', text: 'long work' }]
     })
     await conn.agent.notify(v2.methods.agent.session.cancel, { sessionId: 'v2-cancel' })
+    await waitFor(() => proc.abortCount === 1, 'abort dispatched')
     // Real pi settles its aborted run; the deterministic stand-in does the same.
     proc.emit({ type: 'agent_settled' })
     const response = await withTimeout(prompt, 'cancelled prompt')
@@ -1165,6 +1165,21 @@ test('v2 replay: overlapping resume windows keep the replay translation until th
       }
     ],
     leafId: 'e2'
+  }
+
+  // Hold the first load inside replay until the second load enters replay so
+  // both replay windows deterministically overlap under per-task dispatch.
+  let entryReads = 0
+  let releaseFirstRead: () => void = () => {}
+  const firstReadGate = new Promise<void>(resolve => {
+    releaseFirstRead = resolve
+  })
+  const originalGetEntries = proc.getEntries.bind(proc)
+  ;(proc as unknown as { getEntries: () => Promise<unknown> }).getEntries = async () => {
+    entryReads += 1
+    if (entryReads === 1) await firstReadGate
+    else releaseFirstRead()
+    return originalGetEntries()
   }
 
   const { conn, updates } = connectV2(undefined, {

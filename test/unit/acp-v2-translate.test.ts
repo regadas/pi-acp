@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { SessionUpdate } from '@agentclientprotocol/sdk/unstable'
-import { toV2SessionUpdate, v1InitializeRequest } from '../../src/acp/v2/translate.js'
+import { toV2AvailableCommands, toV2SessionUpdate, v1InitializeRequest } from '../../src/acp/v2/translate.js'
 
 test('v1InitializeRequest: a v2 initialize forwards the subagents capability as opted in', () => {
   // Empty capabilities (and none at all): subagents are baseline v2, so the
@@ -56,4 +56,22 @@ test('toV2SessionUpdate: subagent_update and session_message pass through unchan
   for (const update of updates) {
     assert.equal(toV2SessionUpdate(update, undefined), update)
   }
+})
+
+test('toV2AvailableCommands: tags commands with type: command and inputs with type: text', () => {
+  assert.deepEqual(
+    toV2AvailableCommands([
+      { name: 'compact', description: 'Compact context', input: { hint: 'instructions' } },
+      { name: 'clear', description: 'Clear session' }
+    ]),
+    [
+      {
+        type: 'command',
+        name: 'compact',
+        description: 'Compact context',
+        input: { type: 'text', hint: 'instructions' }
+      },
+      { type: 'command', name: 'clear', description: 'Clear session' }
+    ]
+  )
 })

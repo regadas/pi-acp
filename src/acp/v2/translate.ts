@@ -174,9 +174,10 @@ export function toV2ConfigOptions(options: readonly SessionConfigOption[]): v2.S
   })
 }
 
-/** v2 tags the free-text input of a command with `type: "text"`. */
+/** v2 tags commands with `type: "command"` and free-text input with `type: "text"`. */
 export function toV2AvailableCommands(commands: readonly AvailableCommand[]): v2.AvailableCommand[] {
   return commands.map(({ input, ...command }) => ({
+    type: 'command',
     ...command,
     ...(input != null ? { input: { type: 'text', hint: input.hint } } : {})
   }))
