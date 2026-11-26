@@ -37,15 +37,20 @@ export function chunkUpdateKind(update: SessionUpdate): ChunkKind | null {
 }
 
 /**
- * Subagent updates are transparent to the connection's open live message
- * and buffered replay entry: snapshots re-emit every child about once a
- * second while async children are live, and ending the open message on
- * each would chop streamed text into a bubble per snapshot; v2 chunks
- * resume under the same messageId.
+ * Auxiliary updates (subagents, compaction, notices) are transparent to the
+ * connection's open live message and buffered replay entry: ending the open
+ * message on each would chop streamed assistant text into separate bubbles;
+ * v2 chunks resume under the same messageId.
  */
 export function isTransparentUpdate(update: SessionUpdate): boolean {
   const kind = update.sessionUpdate
-  return kind === 'subagent_update' || kind === 'session_message'
+  return (
+    kind === 'subagent_update' ||
+    kind === 'session_message' ||
+    kind === 'compaction_update' ||
+    kind === 'compaction_summary_chunk' ||
+    kind === 'notice'
+  )
 }
 
 /**
@@ -91,7 +96,11 @@ export function toV2SessionUpdate(
       return { sessionUpdate: update.sessionUpdate, configOptions: toV2ConfigOptions(update.configOptions) }
     case 'session_info_update':
     case 'usage_update':
-      // The v1-unstable and v2-stable shapes of these updates are the same.
+    case 'compaction_update':
+    case 'compaction_summary_chunk':
+    case 'notice':
+      // The v1 and v2-stable shapes of these updates are compatible (v1's
+      // explicit compaction status is valid under v2's optional status).
       return update as v2.SessionUpdate
     case 'subagent_update':
     case 'session_message':
@@ -198,6 +207,7 @@ export function v1InitializeRequest(params: v2.InitializeRequest): InitializeReq
     clientInfo: params.info,
     clientCapabilities: {
       ...(elicitation?.form != null ? { elicitation: { form: elicitation.form } } : {}),
+      session: { compaction: {}, notices: {} },
       subagents: {}
     }
   }

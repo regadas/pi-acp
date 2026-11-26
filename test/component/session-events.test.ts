@@ -317,7 +317,7 @@ test('PiAcpSession: emits tool_call + tool_call_update + completes', async () =>
 
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[1]!.update as any).toolCallId, 't1')
-  assert.equal((conn.updates[1]!.update as any).status, 'in_progress')
+  assert.equal((conn.updates[1]!.update as any).status, undefined, 'unchanged status is omitted from tool_call_update')
   assert.equal((conn.updates[1]!.update as any).content, undefined)
   assert.deepEqual((conn.updates[1]!.update as any)._meta, {
     terminal_output: { terminal_id: 't1', data: 'running' }
@@ -394,7 +394,6 @@ test('PiAcpSession: synthesizes starts before prompt-owned completion-only tool 
       title: 'bash',
       kind: 'execute',
       status: 'in_progress',
-      locations: undefined,
       content: [{ type: 'terminal', terminalId: 'missing-bash-start' }],
       _meta: { terminal_info: { terminal_id: 'missing-bash-start', cwd: TEST_CWD } }
     },
@@ -465,7 +464,6 @@ test('PiAcpSession: synthesizes starts for progress-only tool events and keeps s
     {
       sessionUpdate: 'tool_call_update',
       toolCallId: 'missing-read-start',
-      status: 'in_progress',
       content: [{ type: 'content', content: { type: 'text', text: 'partial' } }],
       rawOutput: { content: [{ type: 'text', text: 'partial' }] }
     },
@@ -476,14 +474,12 @@ test('PiAcpSession: synthesizes starts for progress-only tool events and keeps s
       title: 'ls',
       kind: 'execute',
       status: 'in_progress',
-      locations: undefined,
       content: [{ type: 'terminal', terminalId: 'missing-bash-start' }],
       _meta: { terminal_info: { terminal_id: 'missing-bash-start', cwd: TEST_CWD } }
     },
     {
       sessionUpdate: 'tool_call_update',
       toolCallId: 'missing-bash-start',
-      status: 'in_progress',
       _meta: { terminal_output: { terminal_id: 'missing-bash-start', data: 'streaming' } }
     },
     {
@@ -586,7 +582,7 @@ test('PiAcpSession: bash output falls back to standard content without terminal_
 
   const progress = conn.updates[1]!.update as any
   assert.equal(progress.sessionUpdate, 'tool_call_update')
-  assert.equal(progress.status, 'in_progress')
+  assert.equal(progress.status, undefined, 'unchanged status is omitted from tool_call_update')
   assert.equal(progress._meta, undefined)
   assert.deepEqual(progress.content, [{ type: 'content', content: { type: 'text', text: '```console\nrunning\n```' } }])
 
@@ -704,14 +700,14 @@ test('PiAcpSession: suppresses streamed subagent argument deltas but preserves b
     conn.updates.map(entry => [entry.update.sessionUpdate, (entry.update as any).status]),
     [
       ['tool_call', 'pending'],
-      ['tool_call_update', 'pending'],
+      ['tool_call_update', undefined],
       ['tool_call_update', 'in_progress'],
       ['tool_call_update', 'completed']
     ]
   )
   assert.equal((conn.updates[0]!.update as any).rawInput, undefined)
   assert.deepEqual((conn.updates[1]!.update as any).rawInput, finalInput)
-  assert.deepEqual((conn.updates[2]!.update as any).rawInput, finalInput)
+  assert.equal((conn.updates[2]!.update as any).rawInput, undefined, 'unchanged rawInput is omitted')
 })
 
 test('PiAcpSession: preserves tool-result image content in live tool_call_update', async () => {
@@ -1349,11 +1345,14 @@ test('PiAcpSession: emits missing write locations at stream boundaries but not d
 
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: { type: 'toolcall_start', toolCall }
+    assistantMessageEvent: { type: 'toolcall_start', toolCall: { id: toolCall.id, name: toolCall.name } }
   })
   proc.emit({
     type: 'message_update',
-    assistantMessageEvent: { type: 'toolcall_delta', toolCall }
+    assistantMessageEvent: {
+      type: 'toolcall_delta',
+      toolCall: { id: toolCall.id, name: toolCall.name, arguments: { path: filePath, content: 'he' } }
+    }
   })
   proc.emit({
     type: 'message_update',
@@ -1364,10 +1363,10 @@ test('PiAcpSession: emits missing write locations at stream boundaries but not d
 
   assert.equal(conn.updates.length, 3)
   assert.equal(conn.updates[0]!.update.sessionUpdate, 'tool_call')
-  assert.deepEqual((conn.updates[0]!.update as any).locations, [{ path: filePath }])
+  assert.equal((conn.updates[0]!.update as any).locations, undefined)
   assert.equal(conn.updates[1]!.update.sessionUpdate, 'tool_call_update')
   assert.equal((conn.updates[1]!.update as any).locations, undefined)
-  assert.deepEqual((conn.updates[1]!.update as any).rawInput, toolCall.arguments)
+  assert.deepEqual((conn.updates[1]!.update as any).rawInput, { path: filePath, content: 'he' })
   assert.equal(conn.updates[2]!.update.sessionUpdate, 'tool_call_update')
   assert.deepEqual((conn.updates[2]!.update as any).locations, [{ path: filePath }])
 })

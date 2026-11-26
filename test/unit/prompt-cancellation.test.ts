@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import type { PromptRequest, PromptResponse } from '@agentclientprotocol/sdk/unstable'
 import { PiAcpAgent } from '../../src/acp/agent.js'
 import { PiAcpSession } from '../../src/acp/session.js'
+import { getSessionConfiguration } from '../../src/acp/session-config.js'
 import { SessionManager } from '../../src/acp/session-manager.js'
 import { FakeAgentSideConnection, FakePiRpcProcess, asAgentConn } from '../helpers/fakes.js'
 
@@ -216,11 +217,15 @@ test('PiAcpAgent.prompt: generic cancellation settles the session prompt as canc
   const controller = new AbortController()
   const pending = agent.prompt(promptParams('s1'), controller.signal)
 
-  // Wait until the pi prompt is in flight, then stream an update.
+  // Wait until the pi prompt is in flight, then stream an update with owned usage.
   await new Promise(resolve => setTimeout(resolve, 0))
   assert.equal(proc.prompts.length, 1)
   proc.emit({ type: 'agent_start' })
-  proc.emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'partial output' } })
+  proc.emit({
+    type: 'message_update',
+    message: { role: 'assistant', usage: { input: 10, output: 5, totalTokens: 15 } },
+    assistantMessageEvent: { type: 'text_delta', delta: 'partial output' }
+  })
 
   const queued = agent.prompt(promptParams('s1'))
   await new Promise(resolve => setTimeout(resolve, 0))
@@ -238,7 +243,8 @@ test('PiAcpAgent.prompt: generic cancellation settles the session prompt as canc
   assert.equal(proc.abortCount, 1)
 
   // pi settles the aborted run; the ACP prompt must resolve cancelled with
-  // all streamed updates delivered beforehand.
+  // all streamed updates delivered beforehand, using owned-turn usage without
+  // issuing a get_session_stats RPC.
   proc.emit({ type: 'agent_settled' })
 
   const res = await tracked
@@ -246,14 +252,12 @@ test('PiAcpAgent.prompt: generic cancellation settles the session prompt as canc
   assert.deepEqual(res.usage, {
     inputTokens: 10,
     outputTokens: 5,
-    totalTokens: 15,
-    cachedReadTokens: undefined,
-    cachedWriteTokens: undefined
+    totalTokens: 15
   })
   const queuedResponse = await queued
   assert.equal(queuedResponse.stopReason, 'cancelled')
   assert.equal(queuedResponse.usage, undefined, 'never-run queue entries do not inherit active cumulative usage')
-  assert.equal(statsCalls, 1)
+  assert.equal(statsCalls, 0, 'cancelled turns must not query get_session_stats')
   assert.equal(proc.prompts.length, 1)
 
   const delivered = conn.updates.map(u => u.update)
@@ -262,8 +266,6 @@ test('PiAcpAgent.prompt: generic cancellation settles the session prompt as canc
   )
   assert.ok(deltaIndex >= 0, 'streamed update was delivered')
   assert.ok(updatesAtResolve > deltaIndex, 'updates flushed before the prompt response settled')
-  const usageIndex = delivered.findIndex(u => u.sessionUpdate === 'usage_update')
-  assert.ok(usageIndex > deltaIndex && usageIndex < updatesAtResolve, 'usage flushes before settlement')
 })
 
 test('PiAcpAgent.prompt: abort while a completed turn flushes usage preserves the next request', async t => {
@@ -296,7 +298,13 @@ test('PiAcpAgent.prompt: abort while a completed turn flushes usage preserves th
 
   controller.abort()
   usageResult.resolve({ tokens: { input: 1, output: 2, total: 3 } })
-  assert.equal((await first).stopReason, 'cancelled')
+  const firstRes = await first
+  assert.equal(firstRes.stopReason, 'cancelled')
+  assert.equal(
+    firstRes.usage,
+    undefined,
+    'aborted turn must not return cumulative getSessionStats totals when no owned usage was emitted'
+  )
   await new Promise(resolve => setImmediate(resolve))
   assert.deepEqual(
     proc.prompts.map(item => item.message),
@@ -305,6 +313,59 @@ test('PiAcpAgent.prompt: abort while a completed turn flushes usage preserves th
   assert.equal(proc.abortCount, 0)
   proc.emit({ type: 'agent_settled' })
   assert.equal((await second).stopReason, 'end_turn')
+})
+
+test('PiAcpAgent.prompt: cancellation during flushEmits skips getSessionStats completely and returns owned usage', async t => {
+  const conn = new FakeAgentSideConnection()
+  const flushBlocked = deferred<void>()
+  const releaseFlush = deferred<void>()
+  const origUpdate = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async notification => {
+    if (notification.update.sessionUpdate === 'agent_message_chunk') {
+      flushBlocked.resolve()
+      await releaseFlush.promise
+    }
+    await origUpdate(notification)
+  }
+
+  let statsCalls = 0
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: async () => {
+      statsCalls += 1
+      return { tokens: { input: 999, output: 999, total: 1998 } }
+    }
+  })
+  const session = new PiAcpSession({
+    sessionId: 'flush-cancel',
+    cwd: process.cwd(),
+    proc: proc as unknown as PiAcpSession['proc'],
+    conn: asAgentConn(conn)
+  })
+  t.after(() => session.dispose())
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
+  ;(agent as unknown as { sessions: { maybeGet: () => PiAcpSession } }).sessions = { maybeGet: () => session }
+
+  const controller = new AbortController()
+  const pending = agent.prompt(promptParams('flush-cancel'), controller.signal)
+  await new Promise(resolve => setImmediate(resolve))
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_update',
+    message: { role: 'assistant', usage: { input: 14, output: 6, totalTokens: 20 } },
+    assistantMessageEvent: { type: 'text_delta', delta: 'streaming' }
+  })
+  proc.emit({ type: 'agent_settled' })
+  await flushBlocked.promise
+
+  // Abort arrives while completeTurn is awaiting flushEmits().
+  controller.abort()
+  releaseFlush.resolve()
+
+  const res = await pending
+  assert.equal(res.stopReason, 'cancelled')
+  assert.equal(statsCalls, 0, 'cancelling during flushEmits must skip getSessionStats completely')
+  assert.deepEqual(res.usage, { inputTokens: 14, outputTokens: 6, totalTokens: 20 })
 })
 
 test('PiAcpAgent.prompt: cancellation before held dispatch never captures unrelated usage', async () => {
@@ -331,4 +392,257 @@ test('PiAcpAgent.prompt: cancellation before held dispatch never captures unrela
   assert.equal(proc.abortCount, 0)
   proc.emit({ type: 'agent_settled' })
   assert.equal(proc.prompts.length, 0)
+})
+
+test('PiAcpAgent.prompt: abort between runPrompt returning and prompt settling uses ownedUsage, never cumulative statsUsage', async t => {
+  const conn = new FakeAgentSideConnection()
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: async () => ({
+      tokens: { input: 500, output: 200, total: 700 },
+      contextUsage: { tokens: 100, contextWindow: 1000 }
+    })
+  })
+  const session = new PiAcpSession({
+    sessionId: 'late-outer-cancel',
+    cwd: process.cwd(),
+    proc: proc as unknown as PiAcpSession['proc'],
+    conn: asAgentConn(conn)
+  })
+  t.after(() => session.dispose())
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
+  ;(agent as unknown as { sessions: { maybeGet: () => PiAcpSession } }).sessions = { maybeGet: () => session }
+
+  const controller = new AbortController()
+  // Fire abort right as runPrompt's finally block detaches its abort listener
+  // (the exact boundary between runPrompt resolving and prompt settling).
+  const origRemove = controller.signal.removeEventListener.bind(controller.signal)
+  controller.signal.removeEventListener = ((...args: Parameters<AbortSignal['removeEventListener']>) => {
+    origRemove(...args)
+    controller.abort()
+  }) as AbortSignal['removeEventListener']
+
+  const pending = agent.prompt(promptParams('late-outer-cancel'), controller.signal)
+  await new Promise(resolve => setImmediate(resolve))
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_end',
+    message: { role: 'assistant', usage: { input: 12, output: 8, totalTokens: 20 } }
+  })
+  proc.emit({ type: 'agent_settled' })
+
+  const res = await pending
+  assert.equal(res.stopReason, 'cancelled')
+  assert.deepEqual(
+    res.usage,
+    { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+    'late cancel at prompt() boundary must return ownedUsage, never cumulative getSessionStats totals'
+  )
+})
+
+test('PiAcpAgent.prompt: abort while a built-in slash command flushes queued updates settles cancelled with undefined usage and preserves queued prompts', async t => {
+  const conn = new FakeAgentSideConnection()
+  const flushBlocked = deferred<void>()
+  const releaseFlush = deferred<void>()
+  const origUpdate = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async notification => {
+    if (
+      notification.update.sessionUpdate === 'agent_message_chunk' &&
+      notification.update.content.type === 'text' &&
+      notification.update.content.text === 'flush-gate'
+    ) {
+      flushBlocked.resolve()
+      await releaseFlush.promise
+    }
+    await origUpdate(notification)
+  }
+
+  let statsCalls = 0
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: async () => {
+      statsCalls += 1
+      // Queue an unawaited emit during the second getSessionStats (publishUsageAndGet)
+      // so finishAdapterPromptTurn() blocks in flushEmits() after the command body finishes.
+      if (statsCalls === 2) {
+        proc.emit({ type: 'extension_ui_request', id: 'n-flush', method: 'notify', message: 'flush-gate' })
+      }
+      return {
+        totalMessages: 2,
+        tokens: { input: 500, output: 200, total: 700 }
+      }
+    }
+  })
+  const session = new PiAcpSession({
+    sessionId: 'builtin-flush-cancel',
+    cwd: process.cwd(),
+    proc: proc as unknown as PiAcpSession['proc'],
+    conn: asAgentConn(conn)
+  })
+  session.seedSessionConfiguration(await getSessionConfiguration(proc as unknown as PiAcpSession['proc']))
+  t.after(() => session.dispose())
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
+  ;(agent as unknown as { sessions: { maybeGet: () => PiAcpSession } }).sessions = { maybeGet: () => session }
+
+  const controller = new AbortController()
+  const commandPending = agent.prompt(
+    { sessionId: 'builtin-flush-cancel', prompt: [{ type: 'text', text: '/session' }] },
+    controller.signal
+  )
+  // Queue a regular prompt behind the built-in command.
+  const queuedPending = agent.prompt({
+    sessionId: 'builtin-flush-cancel',
+    prompt: [{ type: 'text', text: 'after-command' }]
+  })
+
+  await flushBlocked.promise
+  // Let run(ctx) and syncSessionConfiguration settle so runCommand is parked inside
+  // finishAdapterPromptTurn() before aborting.
+  await new Promise(resolve => setImmediate(resolve))
+  controller.abort()
+  releaseFlush.resolve()
+
+  const commandRes = await commandPending
+  assert.equal(commandRes.stopReason, 'cancelled')
+  assert.equal(commandRes.usage, undefined, 'cancelled built-in command must never return cumulative statsUsage')
+
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(
+    proc.prompts.map(item => item.message),
+    ['after-command'],
+    'request-scoped cancel during built-in flush must not clear queued prompts'
+  )
+  proc.emit({ type: 'agent_start' })
+  proc.emit({ type: 'agent_settled' })
+  assert.equal((await queuedPending).stopReason, 'end_turn')
+})
+
+test('PiAcpAgent.prompt: request-scoped abort during failed turn update flush returns ownedUsage without querying getSessionStats', async t => {
+  const conn = new FakeAgentSideConnection()
+  const flushBlocked = deferred<void>()
+  const releaseFlush = deferred<void>()
+  const origUpdate = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async notification => {
+    if (notification.update.sessionUpdate === 'agent_message_chunk') {
+      flushBlocked.resolve()
+      await releaseFlush.promise
+    }
+    await origUpdate(notification)
+  }
+
+  let statsCalls = 0
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: async () => {
+      statsCalls += 1
+      return { tokens: { input: 999, output: 999, total: 1998 } }
+    }
+  })
+  const session = new PiAcpSession({
+    sessionId: 'failed-turn-flush-abort',
+    cwd: process.cwd(),
+    proc: proc as unknown as PiAcpSession['proc'],
+    conn: asAgentConn(conn)
+  })
+  t.after(() => session.dispose())
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
+  ;(agent as unknown as { sessions: { maybeGet: () => PiAcpSession } }).sessions = { maybeGet: () => session }
+
+  const controller = new AbortController()
+  const pending = agent.prompt(promptParams('failed-turn-flush-abort'), controller.signal)
+  await new Promise(resolve => setImmediate(resolve))
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_update',
+    message: { role: 'assistant', usage: { input: 18, output: 7, totalTokens: 25 } },
+    assistantMessageEvent: { type: 'text_delta', delta: 'partial before fail' }
+  })
+  // Trigger a turn failure (failTurn starts flushing updates behind flushBlocked).
+  proc.emit({ type: 'auto_retry_end', success: false, finalError: 'upstream 500' })
+  proc.emit({ type: 'agent_settled' })
+  await flushBlocked.promise
+
+  // Request-scoped abort lands while failTurn is awaiting flushEmits().
+  controller.abort()
+  releaseFlush.resolve()
+
+  const res = await pending
+  assert.equal(res.stopReason, 'cancelled')
+  assert.equal(statsCalls, 0, 'failed turn aborted during flush must skip getSessionStats')
+  assert.deepEqual(res.usage, { inputTokens: 18, outputTokens: 7, totalTokens: 25 })
+})
+
+test('PiAcpAgent.prompt: request-scoped abort during failTurn second flush still returns ownedUsage with zero getSessionStats calls', async t => {
+  const conn = new FakeAgentSideConnection()
+  const firstFlushBlocked = deferred<void>()
+  const releaseFirstFlush = deferred<void>()
+  const secondFlushBlocked = deferred<void>()
+  const releaseSecondFlush = deferred<void>()
+  const origUpdate = conn.sessionUpdate.bind(conn)
+  conn.sessionUpdate = async notification => {
+    if (
+      notification.update.sessionUpdate === 'agent_message_chunk' &&
+      notification.update.content.type === 'text' &&
+      notification.update.content.text === 'partial before fail'
+    ) {
+      firstFlushBlocked.resolve()
+      await releaseFirstFlush.promise
+    }
+    if (
+      notification.update.sessionUpdate === 'agent_message_chunk' &&
+      notification.update.content.type === 'text' &&
+      notification.update.content.text.startsWith('Queued message')
+    ) {
+      secondFlushBlocked.resolve()
+      await releaseSecondFlush.promise
+    }
+    await origUpdate(notification)
+  }
+
+  let statsCalls = 0
+  const proc = Object.assign(new FakePiRpcProcess(), {
+    getSessionStats: async () => {
+      statsCalls += 1
+      return { tokens: { input: 999, output: 999, total: 1998 } }
+    }
+  })
+  const session = new PiAcpSession({
+    sessionId: 'failed-turn-second-flush-abort',
+    cwd: process.cwd(),
+    proc: proc as unknown as PiAcpSession['proc'],
+    conn: asAgentConn(conn)
+  })
+  t.after(() => session.dispose())
+  const agent = new PiAcpAgent(asAgentConn(conn))
+  ;(agent as unknown as { restoreSession: () => Promise<PiAcpSession> }).restoreSession = async () => session
+  ;(agent as unknown as { sessions: { maybeGet: () => PiAcpSession } }).sessions = { maybeGet: () => session }
+
+  const controller = new AbortController()
+  const pending = agent.prompt(promptParams('failed-turn-second-flush-abort'), controller.signal)
+  await new Promise(resolve => setImmediate(resolve))
+  proc.emit({ type: 'agent_start' })
+  proc.emit({
+    type: 'message_update',
+    message: { role: 'assistant', usage: { input: 22, output: 9, totalTokens: 31 } },
+    assistantMessageEvent: { type: 'text_delta', delta: 'partial before fail' }
+  })
+  proc.emit({ type: 'auto_retry_end', success: false, finalError: 'upstream 502' })
+  proc.emit({ type: 'agent_settled' })
+  await firstFlushBlocked.promise
+
+  // Enqueue a second prompt while the first flush is blocked; its queued notice
+  // will be drained by failTurn's second flush AFTER pendingTurn is cleared.
+  const queued = session.prompt('queued-behind-fail').catch(() => 'rejected')
+  releaseFirstFlush.resolve()
+  await secondFlushBlocked.promise
+
+  // Abort lands during failTurn's second flush (pendingTurn is already null).
+  controller.abort()
+  releaseSecondFlush.resolve()
+
+  const res = await pending
+  await queued
+  assert.equal(res.stopReason, 'cancelled')
+  assert.equal(statsCalls, 0, 'abort during failTurn second flush must never query getSessionStats')
+  assert.deepEqual(res.usage, { inputTokens: 22, outputTokens: 9, totalTokens: 31 })
 })

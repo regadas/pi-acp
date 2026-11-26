@@ -107,7 +107,9 @@ test('router: a client asking for version 1 gets the unchanged v1 chain', async 
       resume: {},
       close: {},
       delete: {},
-      additionalDirectories: {}
+      additionalDirectories: {},
+      title: {},
+      status: {}
     }
   })
 

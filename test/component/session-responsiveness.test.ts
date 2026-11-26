@@ -163,11 +163,7 @@ for (const admission of ['idle', 'staged', 'cancelled'] as const) {
       assert.equal(await prompt, 'cancelled')
     }
     await tick()
-    assert.deepEqual(
-      statuses('autonomous-partial'),
-      ['pending', 'pending'],
-      'staged cancellation cannot close the foreign card'
-    )
+    assert.deepEqual(statuses('autonomous-partial'), ['pending'], 'staged cancellation cannot close the foreign card')
     const cardPresentAtDispatch: boolean[] = []
     const dispatch = proc.prompt.bind(proc)
     proc.prompt = async (...args) => {
@@ -184,7 +180,7 @@ for (const admission of ['idle', 'staged', 'cancelled'] as const) {
     proc.emit({ type: 'agent_end' })
     proc.emit({ type: 'agent_settled' })
     await tick()
-    assert.deepEqual(statuses('autonomous-partial'), ['pending', 'pending', 'failed'])
+    assert.deepEqual(statuses('autonomous-partial'), ['pending', 'failed'])
     proc.emit({
       type: 'message_update',
       assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 0, id: 'autonomous-partial', delta: 'late' }
@@ -218,7 +214,7 @@ for (const admission of ['idle', 'staged', 'cancelled'] as const) {
     await tick()
     assert.deepEqual(
       statuses('autonomous-partial'),
-      ['pending', 'pending', 'failed'],
+      ['pending', 'failed'],
       'late partial delta cannot resurrect the card'
     )
     assert.equal(proc.disposed, false)

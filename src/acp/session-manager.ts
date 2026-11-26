@@ -19,6 +19,10 @@ type SessionCreateParams = {
   supportsTerminalOutputMeta?: boolean
   /** Client negotiated the unstable `subagents` capability (ACP child sessions). */
   supportsSubagentUpdates?: boolean
+  /** Client negotiated `clientCapabilities.session.compaction`. */
+  supportsCompactionUpdates?: boolean
+  /** Client negotiated `clientCapabilities.session.notices`. */
+  supportsNotices?: boolean
   /** Auth methods the owning agent advertised at initialize (for auth-required errors). */
   authMethods?: AuthMethod[]
   supportsElicitationForm?: boolean
@@ -299,6 +303,12 @@ export class SessionManager {
     throw RequestError.internalError({}, 'pi-acp session manager is disposed')
   }
 
+  /** Pure read-only check for an actively usable registered session (no retirement or mutation). */
+  peek(sessionId: string): PiAcpSession | undefined {
+    const session = this.sessions.get(sessionId)
+    return session && !session.isUnavailable() ? session : undefined
+  }
+
   /** Get a registered, usable session if it exists (no throw). */
   maybeGet(sessionId: string): PiAcpSession | undefined {
     const session = this.sessions.get(sessionId)
@@ -460,6 +470,8 @@ export class SessionManager {
       conn: params.conn,
       supportsTerminalOutputMeta: params.supportsTerminalOutputMeta,
       supportsSubagentUpdates: params.supportsSubagentUpdates,
+      supportsCompactionUpdates: params.supportsCompactionUpdates,
+      supportsNotices: params.supportsNotices,
       authMethods: params.authMethods,
       supportsElicitationForm: params.supportsElicitationForm,
       additionalDirectories: params.additionalDirectories

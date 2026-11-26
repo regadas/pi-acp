@@ -1,23 +1,28 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import type { SessionUpdate } from '@agentclientprotocol/sdk/unstable'
-import { toV2AvailableCommands, toV2SessionUpdate, v1InitializeRequest } from '../../src/acp/v2/translate.js'
+import {
+  isTransparentUpdate,
+  toV2AvailableCommands,
+  toV2SessionUpdate,
+  v1InitializeRequest
+} from '../../src/acp/v2/translate.js'
 
-test('v1InitializeRequest: a v2 initialize forwards the subagents capability as opted in', () => {
-  // Empty capabilities (and none at all): subagents are baseline v2, so the
-  // forwarded v1 request opts the engine in on every v2 connection.
+test('v1InitializeRequest: a v2 initialize forwards baseline subagents, compaction, and notices capabilities as opted in', () => {
+  // Empty capabilities (and none at all): subagents, compaction, and notices
+  // are baseline v2, so the forwarded v1 request opts the engine in on every v2 connection.
   for (const capabilities of [{} as const, undefined]) {
     assert.deepEqual(
       v1InitializeRequest({ protocolVersion: 2, info: { name: 'v2-client', version: '0.0.0' }, capabilities }),
       {
         protocolVersion: 1,
         clientInfo: { name: 'v2-client', version: '0.0.0' },
-        clientCapabilities: { subagents: {} }
+        clientCapabilities: { session: { compaction: {}, notices: {} }, subagents: {} }
       }
     )
   }
 
-  // The forwarded elicitation survives alongside the baseline opt-in.
+  // The forwarded elicitation survives alongside the baseline opt-ins.
   assert.deepEqual(
     v1InitializeRequest({
       protocolVersion: 2,
@@ -27,7 +32,11 @@ test('v1InitializeRequest: a v2 initialize forwards the subagents capability as 
     {
       protocolVersion: 1,
       clientInfo: { name: 'v2-client', version: '0.0.0' },
-      clientCapabilities: { elicitation: { form: {} }, subagents: {} }
+      clientCapabilities: {
+        elicitation: { form: {} },
+        session: { compaction: {}, notices: {} },
+        subagents: {}
+      }
     }
   )
 })
@@ -74,4 +83,35 @@ test('toV2AvailableCommands: tags commands with type: command and inputs with ty
       { type: 'command', name: 'clear', description: 'Clear session' }
     ]
   )
+})
+
+test('toV2SessionUpdate & isTransparentUpdate: compaction_update, compaction_summary_chunk, and notice pass through transparently', () => {
+  const updates: SessionUpdate[] = [
+    {
+      sessionUpdate: 'compaction_update',
+      compactionId: 'compaction-1',
+      status: 'in_progress'
+    },
+    {
+      sessionUpdate: 'compaction_summary_chunk',
+      compactionId: 'compaction-1',
+      content: { type: 'text', text: 'Summary of earlier context.' }
+    },
+    {
+      sessionUpdate: 'compaction_update',
+      compactionId: 'compaction-1',
+      status: 'completed'
+    },
+    {
+      sessionUpdate: 'notice',
+      severity: 'warning',
+      title: 'Retrying request',
+      description: 'Retrying (attempt 1/3, waiting 2s)...'
+    }
+  ]
+
+  for (const update of updates) {
+    assert.equal(isTransparentUpdate(update), true, `${update.sessionUpdate} must not split streamed messages`)
+    assert.equal(toV2SessionUpdate(update, undefined), update)
+  }
 })

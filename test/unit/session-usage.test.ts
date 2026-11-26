@@ -90,3 +90,36 @@ test('post-compaction null context is omitted while cumulative usage remains', a
   assert.equal((await session.publishUsageAndGet())?.totalTokens, 3)
   assert.equal(conn.updates.length, 0)
 })
+
+test('publishUsageAndGet: publishes context/cost usage_update even when token totals are absent, deduplicates identical snapshots, and skips dead transport', async () => {
+  const conn = new FakeAgentSideConnection()
+  let calls = 0
+  const proc = new FakePiRpcProcess() as any
+  proc.getSessionStats = async () => {
+    calls += 1
+    return {
+      cost: 0.42,
+      contextUsage: { tokens: 50, contextWindow: 200 }
+    }
+  }
+  const session = new PiAcpSession({ sessionId: 'ctx-only', cwd: '/tmp', proc, conn: asAgentConn(conn) })
+
+  assert.equal(await session.publishUsageAndGet(), undefined)
+  assert.equal(conn.updates.length, 1)
+  assert.deepEqual(conn.updates[0]?.update, {
+    sessionUpdate: 'usage_update',
+    used: 50,
+    size: 200,
+    cost: { amount: 0.42, currency: 'USD' }
+  })
+
+  // Identical snapshot deduplicates cleanly.
+  assert.equal(await session.publishUsageAndGet(), undefined)
+  assert.equal(conn.updates.length, 1)
+
+  // Dead/disposed transport never invokes getSessionStats.
+  const callsBeforeDispose = calls
+  session.dispose()
+  assert.equal(await session.publishUsageAndGet(), undefined)
+  assert.equal(calls, callsBeforeDispose)
+})

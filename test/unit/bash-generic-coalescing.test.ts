@@ -78,8 +78,8 @@ test('PiAcpSession: generic bash updates below the growth threshold coalesce', a
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(steps[0]!)],
-      ['in_progress', fenced(steps[3]!)],
+      [undefined, fenced(steps[0]!)],
+      [undefined, fenced(steps[3]!)],
       ['completed', fenced('final output')]
     ],
     'only the first snapshot, the threshold flush, and the terminal update reach generic clients'
@@ -111,8 +111,8 @@ test('PiAcpSession: generic bash updates flush mid-stream once growth passes the
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(first)],
-      ['in_progress', fenced(second)],
+      [undefined, fenced(first)],
+      [undefined, fenced(second)],
       ['completed', fenced('done')]
     ],
     'each flush carries the whole current snapshot, never a delta'
@@ -140,7 +140,7 @@ test('PiAcpSession: a failed terminal generic bash update always carries its ful
   assert.deepEqual(
     updates.map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(first)],
+      [undefined, fenced(first)],
       ['failed', fenced('boom')]
     ],
     'a suppressed in_progress snapshot never suppresses the terminal failure'
@@ -167,7 +167,7 @@ test('PiAcpSession: an empty generic in_progress bash update emits nothing', asy
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced('first')],
+      [undefined, fenced('first')],
       ['completed', fenced('done')]
     ]
   )
@@ -199,8 +199,8 @@ test('PiAcpSession: coalescing thresholds are tracked per bash tool call', async
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(b1First)],
-      ['in_progress', fenced(b1Flush)],
+      [undefined, fenced(b1First)],
+      [undefined, fenced(b1Flush)],
       ['completed', fenced('done one')]
     ],
     'b1 coalesces against its own last emit regardless of b2 traffic'
@@ -208,7 +208,7 @@ test('PiAcpSession: coalescing thresholds are tracked per bash tool call', async
   assert.deepEqual(
     updatesFor(conn, 'b2').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(b2First)],
+      [undefined, fenced(b2First)],
       ['completed', fenced('done two')]
     ]
   )
@@ -242,9 +242,9 @@ test('PiAcpSession: a coalesced native-measure snapshot never moves the emitted 
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced('x'.repeat(10))],
-      ['in_progress', fenced('y'.repeat(100))],
-      ['in_progress', fenced('z'.repeat(100))],
+      [undefined, fenced('x'.repeat(10))],
+      [undefined, fenced('y'.repeat(100))],
+      [undefined, fenced('z'.repeat(100))],
       ['completed', fenced('done')]
     ],
     'the rendered measure, the kind change, and the native flush emit; the sub-threshold native snapshot coalesces'
@@ -297,8 +297,8 @@ test('PiAcpSession: sub-threshold fallback updates measure escape-aware raw text
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(first)],
-      ['in_progress', fenced(flush)],
+      [undefined, fenced(first)],
+      [undefined, fenced(flush)],
       ['completed', fenced('done')]
     ],
     'only the first snapshot, the raw-growth flush, and the terminal update reach generic clients'
@@ -328,8 +328,8 @@ test('PiAcpSession: escape-heavy growth emits at the threshold the rendered basi
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(first)],
-      ['in_progress', fenced(second)],
+      [undefined, fenced(first)],
+      [undefined, fenced(second)],
       ['completed', fenced('done')]
     ],
     'escape-heavy growth flushes on the escaped byte count, matching the old rendered-basis emission'
@@ -360,8 +360,8 @@ test('PiAcpSession: escape-heavy growth flushes at the production threshold arit
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(first)],
-      ['in_progress', fenced(second)],
+      [undefined, fenced(first)],
+      [undefined, fenced(second)],
       ['completed', fenced('done')]
     ],
     '32,768 added backslashes are 65,536 escaped bytes: the production threshold flushes'
@@ -399,9 +399,9 @@ test('PiAcpSession: capped windows flush on native totalBytes growth at the prod
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced('x'.repeat(1000))],
-      ['in_progress', fenced(window)],
-      ['in_progress', fenced('z'.repeat(51200))],
+      [undefined, fenced('x'.repeat(1000))],
+      [undefined, fenced(window)],
+      [undefined, fenced('z'.repeat(51200))],
       ['completed', fenced('final done\n')]
     ],
     'totalBytes growth flushes the capped window; sub-threshold totalBytes growth stays coalesced'
@@ -431,8 +431,8 @@ test('PiAcpSession: a capped window flushes even when escaping inflated the rend
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', fenced(escaped)],
-      ['in_progress', fenced(window)],
+      [undefined, fenced(escaped)],
+      [undefined, fenced(window)],
       ['completed', fenced('done\n')]
     ],
     'crossing from a rendered measure to native totalBytes always flushes, whatever escaping did to the baseline'
@@ -485,7 +485,7 @@ test('PiAcpSession: an image-only generic in_progress bash update emits immediat
   assert.deepEqual(
     updatesFor(conn, 'b1').map(update => [update.status, update.content]),
     [
-      ['in_progress', [{ type: 'content', content: image }]],
+      [undefined, [{ type: 'content', content: image }]],
       ['completed', fenced('done')]
     ],
     'an image-bearing update has no measurable text basis, so it bypasses text-growth coalescing'

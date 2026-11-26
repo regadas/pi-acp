@@ -19,10 +19,15 @@ import {
   type ResumeSessionRequest,
   type ResumeSessionResponse,
   type SessionInfo,
+  type SessionStatusRequest,
+  type SessionStatusResponse,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
+  type SetSessionTitleRequest,
+  type SetSessionTitleResponse,
   type AuthMethod,
-  type StopReason
+  type StopReason,
+  type Usage
 } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
 import { getAuthMethods } from './auth.js'
@@ -39,7 +44,7 @@ import {
   getSessionConfiguration,
   piModelsList
 } from './session-config.js'
-import { SessionStore } from './session-store.js'
+import { SessionStore, SessionTombstonedError } from './session-store.js'
 import { SessionRepository } from './session-repository.js'
 import { PiRpcRequestTimeoutError } from '../pi-rpc/process.js'
 import { piRecord } from '../pi-rpc/protocol.js'
@@ -49,6 +54,8 @@ import { parseCommandArgs } from './slash-commands.js'
 import { toAvailableCommandsFromPiGetCommands } from './pi-commands.js'
 import { maybeAuthRequiredError } from './auth-required.js'
 import { assertValidSessionCwd, sessionCwdsEquivalent } from './session-cwd.js'
+import { toRequestError } from './session-errors.js'
+import { normalizeExplicitTitle } from './session-title.js'
 import { normalizeAdditionalDirectories, workspaceRootsEquivalent } from './workspace-roots.js'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
@@ -108,6 +115,10 @@ const REPLACEMENT_TERMINATION_TIMEOUT_MS = 5_000
 const LIST_PAGE_SIZE = 50
 const LIST_SNAPSHOT_TTL_MS = 5 * 60_000
 const MAX_LIST_SNAPSHOTS = 16
+
+function isCapabilityObject(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
 
 /** Restore request shape shared by load/resume/prompt/config callers. */
 type SessionRestoreOpts = {
@@ -172,6 +183,9 @@ export class PiAcpAgent {
   // write cannot slip between another write's support check and its
   // post-write verification.
   private readonly configMutationQueues = new Map<string, Promise<void>>()
+  // Serializes explicit title writes per session so concurrent renames and
+  // close/delete drains observe one order.
+  private readonly titleMutationQueues = new Map<string, Promise<void>>()
   private readonly listSnapshots = new Map<
     string,
     { cwd: string | null; sessions: SessionInfo[]; firstOffset: number; expiresAt: number }
@@ -194,6 +208,9 @@ export class PiAcpAgent {
   // Negotiated at initialize: the unstable `subagents` capability gates ACP
   // child-session announcements for pi-subagents activity.
   private supportsSubagentUpdates = false
+  // Negotiated at initialize: `clientCapabilities.session.compaction` and `.notices`.
+  private supportsCompactionUpdates = false
+  private supportsNotices = false
 
   dispose(): void {
     // Marking disposed first lets every in-flight create/restore that crosses
@@ -256,15 +273,18 @@ export class PiAcpAgent {
   private async findStoredSession(
     sessionId: string,
     cwd?: string
-  ): Promise<{ cwd: string; sessionFile: string; additionalDirectories: readonly string[] } | null> {
+  ): Promise<{
+    cwd: string
+    sessionFile: string
+    additionalDirectories: readonly string[]
+  } | null> {
     const session = await this.repository.find(sessionId, cwd)
-    return session
-      ? {
-          cwd: session.cwd,
-          sessionFile: session.sessionFile,
-          additionalDirectories: session.additionalDirectories ?? []
-        }
-      : null
+    if (!session) return null
+    return {
+      cwd: session.cwd,
+      sessionFile: session.sessionFile,
+      additionalDirectories: session.additionalDirectories ?? []
+    }
   }
 
   private assertRequestedSessionCwd(recordedCwd: string, requestedCwd?: string): void {
@@ -311,7 +331,8 @@ export class PiAcpAgent {
       this.restoringSessions.has(sessionId) ||
       this.closingSessions.has(sessionId) ||
       this.deletingSessions.has(sessionId) ||
-      this.configMutationQueues.has(sessionId)
+      this.configMutationQueues.has(sessionId) ||
+      this.titleMutationQueues.has(sessionId)
     ) {
       return
     }
@@ -479,6 +500,14 @@ export class PiAcpAgent {
     }
   }
 
+  private async waitForTitleMutations(sessionId: string): Promise<void> {
+    while (true) {
+      const tail = this.titleMutationQueues.get(sessionId)
+      if (!tail) return
+      await tail
+    }
+  }
+
   private beginSessionClose(sessionId: string): Promise<void> {
     const inProgress = this.closingSessions.get(sessionId)
     if (inProgress) return inProgress
@@ -499,11 +528,11 @@ export class PiAcpAgent {
         // resume that still spawns its child.
         await this.waitForActive(this.activeResumes, sessionId)
         await this.waitForActive(this.activeLoads, sessionId)
-        // Config mutations are tracked as neither prompts nor loads; their
-        // queue tail is the only record of pending writes, so drain it before
-        // the final sweep: a write admitted before the close must not publish
-        // or restore after it.
+        // Config and title mutations are tracked as neither prompts nor loads;
+        // their queue tails are the only record of pending writes, so drain
+        // them before the final sweep.
         await this.waitForConfigMutations(sessionId)
+        await this.waitForTitleMutations(sessionId)
         await this.closeSessionResources(sessionId)
       })
       .finally(() => {
@@ -779,13 +808,21 @@ export class PiAcpAgent {
       proc,
       supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
       supportsSubagentUpdates: this.supportsSubagentUpdates,
+      supportsCompactionUpdates: this.supportsCompactionUpdates,
+      supportsNotices: this.supportsNotices,
       authMethods: this.authMethods,
       supportsElicitationForm: this.supportsElicitationForm,
       additionalDirectories
     })
 
+    let explicitTitle: string | undefined
     try {
       this.store.upsert({ sessionId, cwd, sessionFile: stored.sessionFile, additionalDirectories })
+      // Re-read after upsert inside the cleanup guard so any corrupt/unreadable
+      // `.title` sidecar closes the session and disposes the spawned Pi child.
+      // Trust ONLY this fresh post-upsert read so a title rolled back during
+      // spawn is never resurrected from a stale pre-spawn snapshot.
+      explicitTitle = typeof this.store.get === 'function' ? this.store.get(sessionId)?.explicitTitle : undefined
     } catch (error) {
       if (this.sessions.maybeGet(sessionId) === session && session.proc === proc) {
         this.sessions.close(sessionId)
@@ -793,6 +830,14 @@ export class PiAcpAgent {
         this.sessions.retireProcess(sessionId, proc, [stored.sessionFile])
       }
       throw error
+    }
+
+    if (explicitTitle) {
+      session.seedExplicitTitle(explicitTitle)
+      const reportedName = typeof reportedState.sessionName === 'string' ? reportedState.sessionName : undefined
+      if (reportedName !== explicitTitle && !this.disposed && !session.isUnavailable() && session.proc === proc) {
+        await session.mirrorExplicitTitleToPi(explicitTitle)
+      }
     }
 
     return session
@@ -847,6 +892,7 @@ export class PiAcpAgent {
       | {
           auth?: { terminal?: unknown } | null
           elicitation?: { form?: unknown } | null
+          session?: { compaction?: unknown | null; notices?: unknown | null } | null
           subagents?: unknown | null
           _meta?: Record<string, unknown> | null
         }
@@ -856,6 +902,8 @@ export class PiAcpAgent {
     this.supportsElicitationForm = clientCapabilities?.elicitation?.form != null
     // `subagents` advertises itself with any non-null value (including `{}`).
     this.supportsSubagentUpdates = clientCapabilities?.subagents != null
+    this.supportsCompactionUpdates = isCapabilityObject(clientCapabilities?.session?.compaction)
+    this.supportsNotices = isCapabilityObject(clientCapabilities?.session?.notices)
     // Terminal auth methods are advertised only against the stable v1
     // `auth.terminal` capability; the optional `_meta["terminal-auth"]`
     // launch spec is added only when the client also declared its meta flag.
@@ -892,7 +940,9 @@ export class PiAcpAgent {
           resume: {},
           close: {},
           delete: {},
-          additionalDirectories: {}
+          additionalDirectories: {},
+          title: {},
+          status: {}
         }
       }
     }
@@ -909,6 +959,8 @@ export class PiAcpAgent {
       piCommand: process.env.PI_ACP_PI_COMMAND,
       supportsTerminalOutputMeta: this.supportsTerminalOutputMeta,
       supportsSubagentUpdates: this.supportsSubagentUpdates,
+      supportsCompactionUpdates: this.supportsCompactionUpdates,
+      supportsNotices: this.supportsNotices,
       authMethods: this.authMethods,
       supportsElicitationForm: this.supportsElicitationForm,
       additionalDirectories
@@ -1009,20 +1061,35 @@ export class PiAcpAgent {
       // final client updates the old child can exit and a replacement can
       // register under the same session id, and that replacement is healthy.
       let ranSession: PiAcpSession | undefined
+      let ownedUsage: Usage | undefined
+      let hasOwnedUsage = false
       try {
         if (this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)) {
           return { stopReason: 'cancelled' }
         }
 
-        const response = await this.runPrompt(params, cancellationEpoch, signal, session => {
-          ranSession = session
+        const response = await this.runPrompt(params, cancellationEpoch, signal, {
+          onRestored: session => {
+            ranSession = session
+          },
+          setOwnedUsage: usage => {
+            ownedUsage = usage
+            hasOwnedUsage = true
+          }
         })
-        return this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)
-          ? { ...response, stopReason: 'cancelled' }
-          : response
+        const finalStopReason: StopReason = this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)
+          ? 'cancelled'
+          : response.stopReason
+        if (finalStopReason !== 'cancelled') return response
+        if (!hasOwnedUsage) return { ...response, stopReason: 'cancelled' }
+        const { usage: _discarded, ...rest } = response
+        return { ...rest, stopReason: 'cancelled', ...(ownedUsage !== undefined ? { usage: ownedUsage } : {}) }
       } catch (error) {
         if (this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)) {
-          return { stopReason: 'cancelled' }
+          return {
+            stopReason: 'cancelled',
+            ...(hasOwnedUsage && ownedUsage !== undefined ? { usage: ownedUsage } : {})
+          }
         }
         if (error instanceof PiRpcRequestTimeoutError) {
           // An adapter-handled command (compact, stats, export, ...) timed
@@ -1044,15 +1111,19 @@ export class PiAcpAgent {
     params: PromptRequest,
     cancellationEpoch: number,
     signal?: AbortSignal,
-    onRestored?: (session: PiAcpSession) => void
+    hooks?: {
+      onRestored?: (session: PiAcpSession) => void
+      setOwnedUsage?: (usage: Usage | undefined) => void
+    }
   ): Promise<PromptResponse> {
     const session = await this.restoreSession(params.sessionId)
-    onRestored?.(session)
+    hooks?.onRestored?.(session)
 
     // Cancellation may arrive while restoreSession is spawning and registering
     // the pi subprocess. Do not let work started before that cancellation pass
     // the async restore boundary and reach pi.
     if (this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)) {
+      hooks?.setOwnedUsage?.(undefined)
       return { stopReason: 'cancelled' }
     }
 
@@ -1080,31 +1151,70 @@ export class PiAcpAgent {
         const args = parseCommandArgs(argsString)
 
         if (BUILTIN_COMMAND_NAMES.has(cmd)) {
+          hooks?.setOwnedUsage?.(undefined)
           // Adapter-handled commands share the session FIFO with ordinary
           // prompts: they wait for an active turn and hold later prompts back.
           // pi cannot abort an in-flight manual RPC, so a cancel fails closed by
           // quarantining the channel; the command then settles as cancelled and
           // the next request restores the session on a fresh pi subprocess.
-          const completed = await session.runCommand(
-            async ctx => ({
-              response: await runBuiltinCommand(session, cmd, args, ctx, argsString),
-              usage: await session.publishUsageAndGet()
-            }),
-            requestOwner
-          )
-          if (!completed) return { stopReason: 'cancelled' }
+          const isCancelledNow = () => this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)
+          const completed = await session.runCommand(async ctx => {
+            const response = await runBuiltinCommand(session, cmd, args, ctx, argsString, {
+              persistExplicitTitle: (title, isCommandCancelled) =>
+                this.runExclusiveTitleMutation(session.sessionId, async () => {
+                  if (isCommandCancelled() || isCancelledNow()) return null
+                  this.assertNotDeleting(session.sessionId)
+                  if (typeof this.store.isTombstoned === 'function' && this.store.isTombstoned(session.sessionId)) {
+                    throw RequestError.sessionNotFound(session.sessionId)
+                  }
+                  const stored = typeof this.store.get === 'function' ? this.store.get(session.sessionId) : null
+                  if (!stored) {
+                    return { snapshot: session.beginExplicitTitle(title) }
+                  }
+                  const previousTitle = stored.explicitTitle ?? null
+                  const revision = this.commitExplicitTitle(session.sessionId, stored.cwd, stored.sessionFile, title)
+                  // Claim live generation inside the same serialized step as the
+                  // durable commit so generation order always matches disk order.
+                  const snapshot = session.beginExplicitTitle(title)
+                  return {
+                    snapshot,
+                    rollback: async () => {
+                      if (!revision || typeof this.store.rollbackExplicitTitle !== 'function') return
+                      await this.runExclusiveTitleMutation(session.sessionId, async () => {
+                        try {
+                          this.store.rollbackExplicitTitle(session.sessionId, revision, previousTitle)
+                        } catch {
+                          // Best-effort revision-fenced rollback when Pi rejected set_session_name.
+                        }
+                      })
+                    }
+                  }
+                })
+            })
+            const usage = ctx.cancelled() || isCancelledNow() ? undefined : await session.publishUsageAndGet()
+            return { response, usage }
+          }, requestOwner)
+          if (!completed || isCancelledNow()) return { stopReason: 'cancelled' }
           return { ...completed.response, usage: completed.usage }
         }
       }
 
       // Failures reject with an ACP error (session.PiAcpSession.failTurn);
       // successful turns resolve with a stable ACP stop reason.
-      let usage
+      let usage: Usage | undefined
+      hooks?.setOwnedUsage?.(undefined)
+      const isCancelledNow = () => this.isPromptCancelled(params.sessionId, cancellationEpoch, signal)
       const stopReason: StopReason = await session.prompt(
         message,
         images,
-        async () => {
-          usage = await session.publishUsageAndGet()
+        async ({ cancelled, ownedUsage }) => {
+          hooks?.setOwnedUsage?.(ownedUsage)
+          if (cancelled || isCancelledNow() || session.isUnavailable()) {
+            usage = ownedUsage
+            return
+          }
+          const statsUsage = await session.publishUsageAndGet()
+          usage = isCancelledNow() ? ownedUsage : (statsUsage ?? ownedUsage)
         },
         requestOwner
       )
@@ -1477,6 +1587,141 @@ export class PiAcpAgent {
 
     // Deleting an unknown or already-deleted session succeeds silently.
     return {}
+  }
+
+  private isSessionActivelyOpen(sessionId: string): boolean {
+    return (
+      this.sessions.peek(sessionId) !== undefined &&
+      !this.closingSessions.has(sessionId) &&
+      !this.deletingSessions.has(sessionId) &&
+      !this.activeLoads.has(sessionId)
+    )
+  }
+
+  async sessionStatus(params: SessionStatusRequest): Promise<SessionStatusResponse> {
+    const sessionId = typeof params?.sessionId === 'string' && params.sessionId ? params.sessionId : null
+    if (!sessionId) {
+      throw RequestError.invalidParams({}, 'sessionId must be a non-empty string')
+    }
+
+    if (this.isSessionActivelyOpen(sessionId)) {
+      return { status: 'open' }
+    }
+
+    let record: Awaited<ReturnType<SessionRepository['findReadOnly']>>
+    try {
+      record = await this.repository.findReadOnly(sessionId)
+    } catch (error) {
+      throw toRequestError(error)
+    }
+
+    if (this.isSessionActivelyOpen(sessionId)) {
+      return { status: 'open' }
+    }
+
+    if (record) {
+      return { status: 'saved' }
+    }
+
+    throw RequestError.sessionNotFound(sessionId)
+  }
+
+  private commitExplicitTitle(sessionId: string, cwd: string, sessionFile: string, title: string): string | undefined {
+    try {
+      return this.repository.upsertExplicitTitle({
+        sessionId,
+        cwd,
+        sessionFile,
+        explicitTitle: title
+      })
+    } catch (error) {
+      if (error instanceof SessionTombstonedError) {
+        throw RequestError.sessionNotFound(sessionId)
+      }
+      throw toRequestError(error)
+    }
+  }
+
+  private runExclusiveTitleMutation<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.titleMutationQueues.get(sessionId) ?? Promise.resolve()
+    const result = previous.then(operation)
+    const tail = result.then(
+      () => undefined,
+      () => undefined
+    )
+    this.titleMutationQueues.set(sessionId, tail)
+    void tail.then(() => {
+      if (this.titleMutationQueues.get(sessionId) === tail) this.titleMutationQueues.delete(sessionId)
+    })
+    return result
+  }
+
+  async setSessionTitle(params: SetSessionTitleRequest): Promise<SetSessionTitleResponse> {
+    const sessionId = typeof params?.sessionId === 'string' && params.sessionId ? params.sessionId : null
+    if (!sessionId) {
+      throw RequestError.invalidParams({}, 'sessionId must be a non-empty string')
+    }
+    const title = normalizeExplicitTitle(params?.title)
+    if (!title) {
+      throw RequestError.invalidParams({}, 'title must be a non-empty string')
+    }
+
+    this.assertNotDeleting(sessionId)
+
+    return this.runExclusiveTitleMutation(sessionId, async () => {
+      this.assertNotDeleting(sessionId)
+
+      const live = this.sessions.peek(sessionId)
+      let stored
+      try {
+        stored = this.store.get(sessionId)
+      } catch (error) {
+        throw toRequestError(error)
+      }
+
+      let target: { cwd: string; sessionFile: string } | null = null
+      if (live && stored) {
+        target = { cwd: stored.cwd, sessionFile: stored.sessionFile }
+      } else {
+        let record: Awaited<ReturnType<SessionRepository['findReadOnly']>>
+        try {
+          record = await this.repository.findReadOnly(sessionId)
+        } catch (error) {
+          throw toRequestError(error)
+        }
+        this.assertNotDeleting(sessionId)
+        const liveAfter = this.sessions.peek(sessionId)
+        if (!record && !liveAfter) {
+          throw RequestError.sessionNotFound(sessionId)
+        }
+        if (record) {
+          target = { cwd: record.cwd, sessionFile: record.sessionFile }
+        }
+      }
+
+      // Persist the durable ACP explicit-title overlay atomically BEFORE
+      // mutating live state or mirroring to Pi. Genuine storage I/O failures
+      // propagate as -32603; concurrent tombstones fail closed with -32002.
+      if (target) {
+        this.commitExplicitTitle(sessionId, target.cwd, target.sessionFile, title)
+      } else if (typeof this.store.isTombstoned === 'function' && this.store.isTombstoned(sessionId)) {
+        throw RequestError.sessionNotFound(sessionId)
+      }
+
+      // The ACP explicit title is committed; never fail after this point.
+      const activeLive = this.sessions.peek(sessionId)
+      if (activeLive && !this.closingSessions.has(sessionId) && !this.deletingSessions.has(sessionId)) {
+        await activeLive.applyCommittedExplicitTitle(
+          title,
+          () =>
+            this.sessions.peek(sessionId) !== activeLive ||
+            this.closingSessions.has(sessionId) ||
+            this.deletingSessions.has(sessionId)
+        )
+      }
+
+      return { title }
+    })
   }
 
   // Test seam: deferred scheduling for post-response notifications. Tests

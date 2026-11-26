@@ -46,3 +46,66 @@ test('V2ClientConnection: subagent updates inside a replay window pass through w
     { type: 'text', text: 'world' }
   ])
 })
+
+test('V2ClientConnection: live notice and compaction updates are transparent and keep streamed assistant messageId intact', async () => {
+  const sent: { sessionId: string; update: v2.SessionUpdate }[] = []
+  const ctx = {
+    notify: async (_method: unknown, params: { sessionId: string; update: v2.SessionUpdate }) => {
+      sent.push(params)
+    }
+  } as unknown as v2.AgentContext
+  const conn = new V2ClientConnection(ctx)
+
+  await conn.sessionUpdate({
+    sessionId: 's',
+    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Part 1 ' } }
+  })
+  await conn.sessionUpdate({
+    sessionId: 's',
+    update: {
+      sessionUpdate: 'notice',
+      severity: 'warning',
+      title: 'Retrying request',
+      description: 'Retrying (attempt 1/3, waiting 2s)...'
+    }
+  })
+  await conn.sessionUpdate({
+    sessionId: 's',
+    update: { sessionUpdate: 'compaction_update', compactionId: 'c1', status: 'in_progress' }
+  })
+  await conn.sessionUpdate({
+    sessionId: 's',
+    update: {
+      sessionUpdate: 'compaction_summary_chunk',
+      compactionId: 'c1',
+      content: { type: 'text', text: 'Compacted summary' }
+    }
+  })
+  await conn.sessionUpdate({
+    sessionId: 's',
+    update: { sessionUpdate: 'compaction_update', compactionId: 'c1', status: 'completed' }
+  })
+  await conn.sessionUpdate({
+    sessionId: 's',
+    update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Part 2' } }
+  })
+
+  const chunks = sent.filter(item => item.update.sessionUpdate === 'agent_message_chunk')
+  assert.equal(chunks.length, 2)
+  assert.equal(
+    (chunks[0]!.update as { messageId: string }).messageId,
+    (chunks[1]!.update as { messageId: string }).messageId,
+    'live notice and compaction updates must not split a streamed assistant messageId'
+  )
+  assert.deepEqual(
+    sent.map(item => item.update.sessionUpdate),
+    [
+      'agent_message_chunk',
+      'notice',
+      'compaction_update',
+      'compaction_summary_chunk',
+      'compaction_update',
+      'agent_message_chunk'
+    ]
+  )
+})

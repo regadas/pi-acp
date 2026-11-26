@@ -61,7 +61,6 @@
         "update": {
           "sessionUpdate": "tool_call_update",
           "toolCallId": "t1",
-          "status": "in_progress",
           "_meta": { "terminal_output": { "terminal_id": "t1", "data": "running" } }
         }
       },

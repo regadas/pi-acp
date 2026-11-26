@@ -10,8 +10,7 @@ import type {
 } from '@agentclientprotocol/sdk/unstable'
 import type { AcpClient } from './client.js'
 import { fileSnapshot } from './file-snapshot.js'
-import { isAbsolute, resolve as resolvePath } from 'node:path'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   PiRpcProcess,
   PiRpcRequestTimeoutError,
@@ -52,11 +51,53 @@ import {
   findUniqueLineNumber,
   getEditOldTexts,
   getToolPath,
+  resolveValidToolPath,
   toToolCallLocations,
   toToolKind
 } from './translate/tool-calls.js'
+import {
+  resultHasDetailsDiff,
+  ToolCallStateTracker,
+  type InitialToolCallParams,
+  type ToolCallDeltaPatch
+} from './translate/tool-call-state.js'
+import {
+  addUsage,
+  combineOwnedTurnUsage,
+  extractPiEventUsage,
+  extractPiUsage,
+  parseSessionStatsUsage
+} from './translate/usage.js'
+import {
+  compactPlainTitle,
+  extractCompactionSummary,
+  formatManualCompactionLegacyText,
+  sanitizeErrorDetail,
+  sanitizeNoticeText,
+  sanitizeNoticeTitle,
+  splitNotifyText
+} from './translate/notices.js'
 
 export type StopReason = 'end_turn' | 'cancelled' | 'max_tokens'
+
+export type TurnReleaseContext = {
+  cancelled: boolean
+  ownedUsage?: Usage
+}
+
+export type ExplicitTitleSnapshot = {
+  generation: number
+  previousUserNamed: boolean
+  previousTitle: string | null
+}
+
+type CompactionCard = {
+  id: string
+  reason: string
+  settled: boolean
+  endingQueued: boolean
+  terminalizedByTeardown: boolean
+}
 
 type PendingTurn = {
   owner: string
@@ -64,6 +105,7 @@ type PendingTurn = {
   backgroundActive: boolean
   // Owned-completion failure from the lifecycle extension; Pi still settles the run.
   completionFailure?: Error
+  cancelled: boolean
   cancellationPending: boolean
   piSettled: boolean
   agentRunEverObserved: boolean
@@ -80,7 +122,10 @@ type PendingTurn = {
   promptQueued: boolean
   expectedPromptText: string
   matchingPromptMessagesToSkip: number
-  beforeRelease?: () => Promise<void>
+  completedAttemptUsage: Usage | null
+  currentAttemptUsage: Usage | null
+  usageDelivered: boolean
+  beforeRelease?: (ctx: TurnReleaseContext) => Promise<void>
 }
 
 type QueuedPrompt = {
@@ -90,7 +135,7 @@ type QueuedPrompt = {
   images: unknown[]
   resolve: (reason: StopReason) => void
   reject: (err: unknown) => void
-  beforeRelease?: () => Promise<void>
+  beforeRelease?: (ctx: TurnReleaseContext) => Promise<void>
 }
 
 /** The adapter-handled slash command currently holding the session FIFO. */
@@ -265,6 +310,11 @@ export class PiAcpSession {
   // Never let a generated title replace a name the user or pi already set.
   private sessionNameSeen = false
   private userNamedSession = false
+  private explicitTitleGeneration = 0
+  private explicitTitleValue: string | null = null
+  private explicitTitleSyncDepth = 0
+  private readonly suppressedGeneratedTitles = new Set<string>()
+  private lastPublishedUsageUpdateKey: string | null = null
   private publishedConfigFingerprint: string | undefined
   private publishedThoughtLevel: string | undefined
   private publishedConfigOptions: SessionConfigOption[] = []
@@ -283,6 +333,18 @@ export class PiAcpSession {
   // The unstable `subagents` client capability gates every subagent_update /
   // session_message emission for pi-subagents child sessions.
   private readonly supportsSubagentUpdates: boolean
+  // Negotiated v1 `clientCapabilities.session.compaction` and `.notices`.
+  private readonly supportsCompactionUpdates: boolean
+  private readonly supportsNotices: boolean
+  private activeCompaction: CompactionCard | null = null
+  private manualCompactionEpoch = 0
+  private activeManualCompaction: {
+    epoch: number
+    customInstructions?: string
+    presented: boolean
+    card: CompactionCard | null
+  } | null = null
+  private suppressTrailingManualCompactionEnd = false
   // Auth methods the owning agent advertised at initialize; auth-required
   // errors raised from this session must advertise exactly these.
   private readonly authMethods: AuthMethod[]
@@ -298,6 +360,7 @@ export class PiAcpSession {
   // Some pi events can arrive out of order (e.g. late toolcall_* deltas after execution starts),
   // and clients may hide progress if we ever downgrade back to `pending`.
   private currentToolCalls = new Map<string, 'pending' | 'in_progress'>()
+  private readonly toolCallStates = new ToolCallStateTracker()
   private readonly streamedToolCalls = new Map<number, { id: string; name: string | null; argumentsText: string }>()
   // Tool calls already reported as completed/failed in the current turn.
   private readonly settledToolCallIds = new Set<string>()
@@ -400,6 +463,8 @@ export class PiAcpSession {
     supportsElicitationForm?: boolean
     supportsTerminalOutputMeta?: boolean
     supportsSubagentUpdates?: boolean
+    supportsCompactionUpdates?: boolean
+    supportsNotices?: boolean
     authMethods?: AuthMethod[]
     /** Additional validated workspace roots for this session's child. */
     additionalDirectories?: readonly string[]
@@ -416,6 +481,8 @@ export class PiAcpSession {
     this.supportsElicitationForm = opts.supportsElicitationForm ?? false
     this.supportsTerminalOutputMeta = opts.supportsTerminalOutputMeta ?? false
     this.supportsSubagentUpdates = opts.supportsSubagentUpdates ?? false
+    this.supportsCompactionUpdates = opts.supportsCompactionUpdates ?? false
+    this.supportsNotices = opts.supportsNotices ?? false
     this.authMethods = opts.authMethods ?? []
     this.deferredAdmissionTimeoutMs = opts.deferredAdmissionTimeoutMs ?? DEFERRED_ADMISSION_TIMEOUT_MS
     this.genericBashCoalesceBytes = opts.genericBashCoalesceBytes ?? GENERIC_BASH_COALESCE_BYTES
@@ -458,6 +525,17 @@ export class PiAcpSession {
     // and must not resume into a successful publication or return.
     this.failActiveCommand(failure)
 
+    const cancelledTeardown =
+      termination.expected ||
+      this.closing ||
+      this.disposalExpected ||
+      Boolean(turn && (this.cancelRequested || turn.cancelled)) ||
+      this.isCommandCancelled(this.activeCommand)
+    this.terminalizeCompaction(
+      cancelledTeardown ? 'cancelled' : 'failed',
+      cancelledTeardown ? undefined : terminationError(termination).message
+    )
+
     // Nothing queued may start against a dead child: settle it *before* the
     // parked command's slot is handed on, since releasing that slot runs the
     // next queued prompt or (purely local) built-in.
@@ -480,6 +558,7 @@ export class PiAcpSession {
    */
   private handleChannelUnusable(): void {
     const turn = this.pendingTurn
+    this.terminalizeCompaction('failed', 'pi process channel became unusable')
     this.dispose({ expected: false })
     if (turn && !turn.completionStarted) {
       this.failTurn(
@@ -632,49 +711,24 @@ export class PiAcpSession {
   }
 
   async publishUsageAndGet(opts?: { isStale?: () => boolean }): Promise<Usage | undefined> {
+    if (this.isUnavailable()) return undefined
     let stats: unknown
     try {
       stats = await this.proc.getSessionStats()
     } catch {
       return undefined
     }
-    const record = stats as {
-      tokens?: { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown; total?: unknown }
-      cost?: unknown
-      contextUsage?: { tokens?: unknown; contextWindow?: unknown }
-    }
-    const finite = (value: unknown): number | undefined =>
-      typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
-    const inputTokens = finite(record.tokens?.input)
-    const outputTokens = finite(record.tokens?.output)
-    const totalTokens = finite(record.tokens?.total)
-    if (inputTokens === undefined || outputTokens === undefined || totalTokens === undefined) return undefined
-
-    const used = finite(record.contextUsage?.tokens)
-    const size = finite(record.contextUsage?.contextWindow)
-    if (used !== undefined && size !== undefined) {
-      const amount = finite(record.cost)
-      await this.sendSessionUpdate(
-        {
-          sessionId: this.sessionId,
-          update: {
-            sessionUpdate: 'usage_update',
-            used,
-            size,
-            ...(amount === undefined ? {} : { cost: { amount, currency: 'USD' } })
-          }
-        },
-        { isStale: opts?.isStale }
+    const { usageUpdate, usage } = parseSessionStatsUsage(stats)
+    if (usageUpdate) {
+      await this.enqueueUpdate(
+        usageUpdate.update,
+        () => Boolean(opts?.isStale?.()) || this.lastPublishedUsageUpdateKey === usageUpdate.dedupKey,
+        () => {
+          this.lastPublishedUsageUpdateKey = usageUpdate.dedupKey
+        }
       ).catch(() => {})
     }
-
-    return {
-      inputTokens,
-      outputTokens,
-      totalTokens,
-      cachedReadTokens: finite(record.tokens?.cacheRead),
-      cachedWriteTokens: finite(record.tokens?.cacheWrite)
-    }
+    return usage
   }
 
   currentCustomMessageSequence(): number {
@@ -768,7 +822,7 @@ export class PiAcpSession {
   async prompt(
     message: string,
     images: unknown[] = [],
-    beforeRelease?: () => Promise<void>,
+    beforeRelease?: (ctx: TurnReleaseContext) => Promise<void>,
     requestOwner?: symbol
   ): Promise<StopReason> {
     // Once shutdown starts, no new work may be admitted to this subprocess.
@@ -845,8 +899,9 @@ export class PiAcpSession {
     }
 
     const finishAdapterPromptTurn = this.beginAdapterPromptTurn()
+    let outcome: { value: T } | null = null
     try {
-      const result = await (async () => {
+      const value = await (async () => {
         try {
           return await run(ctx)
         } finally {
@@ -858,23 +913,28 @@ export class PiAcpSession {
       // a child that is gone, so it must not be returned as a success.
       const failure = this.commandTerminalFailure(command)
       if (failure) throw failure
-      return command.cancelled ? null : result
+      if (!command.cancelled) outcome = { value }
     } catch (error) {
       // A cancelled command's RPC rejects because cancellation quarantined the
       // channel; report the cancellation rather than that induced failure. An
       // unexpected termination is a real failure and must still reject.
       const failure = this.commandTerminalFailure(command)
       if (failure) throw failure
-      if (command.cancelled) return null
-      // Command bodies (e.g. provider-backed /compact) hit the same credential
-      // failures as prompt turns; classify before rethrowing. Errors keep their
-      // identity so protocol-meaningful classes (RPC timeouts) survive.
-      throw maybeAuthRequiredError(error, this.authMethods) ?? error
+      if (!command.cancelled) {
+        // Command bodies (e.g. provider-backed /compact) hit the same credential
+        // failures as prompt turns; classify before rethrowing. Errors keep their
+        // identity so protocol-meaningful classes (RPC timeouts) survive.
+        throw maybeAuthRequiredError(error, this.authMethods) ?? error
+      }
     } finally {
       command.requestOwner = undefined
       await finishAdapterPromptTurn()
       this.releaseCommandSlot()
     }
+    const postFlushFailure = this.commandTerminalFailure(command)
+    if (postFlushFailure) throw postFlushFailure
+    if (!outcome || command.cancelled) return null
+    return outcome.value
   }
 
   private releaseCommandSlot(): void {
@@ -1019,13 +1079,40 @@ export class PiAcpSession {
     return Boolean(this.pendingTurn || this.activeCommand)
   }
 
-  private emitQueuedNotice(): void {
+  private emitNotice(opts: {
+    severity: 'info' | 'warning' | 'error'
+    title: string
+    description?: string
+    fallbackText: string
+    preSanitized?: boolean
+  }): void {
+    if (!this.supportsNotices) {
+      this.emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: opts.fallbackText }
+      })
+      return
+    }
+    const title = opts.preSanitized ? opts.title || 'Pi notice' : sanitizeNoticeTitle(opts.title, 'Pi notice')
+    const description = opts.description
+      ? opts.preSanitized
+        ? opts.description
+        : sanitizeNoticeText(opts.description, 400)
+      : ''
     this.emit({
-      sessionUpdate: 'agent_message_chunk',
-      content: {
-        type: 'text',
-        text: `Queued message (position ${this.turnQueue.length}).`
-      }
+      sessionUpdate: 'notice',
+      severity: opts.severity,
+      title,
+      ...(description ? { description } : {})
+    })
+  }
+
+  private emitQueuedNotice(): void {
+    this.emitNotice({
+      severity: 'info',
+      title: 'Message queued',
+      description: `Position ${this.turnQueue.length} in queue.`,
+      fallbackText: `Queued message (position ${this.turnQueue.length}).`
     })
 
     this.publishQueueState(true, this.turnQueue.length)
@@ -1071,18 +1158,23 @@ export class PiAcpSession {
         this.activeCommand?.requestOwner !== requestOwner &&
         (this.pendingTurn?.requestOwner !== requestOwner || this.pendingTurn.completionStarted)
       ) {
+        if (this.pendingTurn?.requestOwner === requestOwner && this.pendingTurn.completionStarted) {
+          this.pendingTurn.cancelled = true
+        }
         return
       }
     }
 
     this.drainPendingUiRequests()
     this.cancelRequested = true
+    if (this.pendingTurn) this.pendingTurn.cancelled = true
 
     const queued = this.turnQueue.splice(0, this.turnQueue.length)
     if (queued.length) {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: 'Cleared queued prompts.' }
+      this.emitNotice({
+        severity: 'info',
+        title: 'Cleared queued prompts',
+        fallbackText: 'Cleared queued prompts.'
       })
       this.publishQueueState(this.isBusy(), 0)
     }
@@ -1090,6 +1182,7 @@ export class PiAcpSession {
     const activeCommand = this.activeCommand
     if (activeCommand) {
       activeCommand.cancelled = true
+      if (this.activeManualCompaction) this.terminalizeCompaction('cancelled')
 
       // A command still waiting for an autonomous run to settle never reached
       // pi: settle it locally instead of leaving it parked on its timeout.
@@ -1215,11 +1308,13 @@ export class PiAcpSession {
   private async runShutdown(): Promise<void> {
     this.drainPendingUiRequests()
     this.cancelRequested = true
+    if (this.pendingTurn) this.pendingTurn.cancelled = true
 
     // An adapter command settles as cancelled when disposal rejects its
     // pending RPC; marking it here keeps that invariant local to the session
     // instead of depending on agent-level cancellation tracking.
     if (this.activeCommand) this.activeCommand.cancelled = true
+    this.terminalizeCompaction('cancelled')
 
     // Drop any held dispatch or parked command admission before the first
     // await so their admission timeouts cannot race shutdown settlement.
@@ -1269,8 +1364,8 @@ export class PiAcpSession {
    * It is opt-in per call so ordinary updates -- including final ones during
    * teardown -- are never suppressed.
    */
-  private enqueueUpdate(update: SessionUpdate, isStale?: () => boolean): Promise<void> {
-    const delivery = this.lastEmit.then(() => {
+  private enqueueUpdate(update: SessionUpdate, isStale?: () => boolean, onDelivered?: () => void): Promise<void> {
+    const delivery = this.lastEmit.then(async () => {
       if (isStale?.()) return
       if (
         (update.sessionUpdate === 'agent_message_chunk' || update.sessionUpdate === 'agent_thought_chunk') &&
@@ -1278,10 +1373,11 @@ export class PiAcpSession {
         update.content.text.length === 0
       )
         return
-      return this.conn.sessionUpdate({
+      await this.conn.sessionUpdate({
         sessionId: this.sessionId,
         update
       })
+      onDelivered?.()
     })
 
     this.lastEmit = delivery.catch(() => {
@@ -1311,8 +1407,13 @@ export class PiAcpSession {
    * the check is re-run inside the queued callback so a title cannot reach the
    * client after its command was cancelled.
    */
-  syncSessionInfo(name: string | undefined, isCancelled?: () => boolean): Promise<void> {
+  syncSessionInfo(
+    name: string | undefined,
+    isCancelled?: () => boolean,
+    opts?: { includeUpdatedAt?: boolean }
+  ): Promise<void> {
     const title = name ?? null
+    const includeUpdatedAt = opts?.includeUpdatedAt ?? true
     const operation = this.sessionInfoSyncTail.then(async () => {
       if (this.disposed || isCancelled?.()) return
       if (this.publishedTitle === title) return this.flushEmits()
@@ -1321,7 +1422,7 @@ export class PiAcpSession {
         {
           sessionUpdate: 'session_info_update',
           title,
-          updatedAt: new Date().toISOString()
+          ...(includeUpdatedAt ? { updatedAt: new Date().toISOString() } : {})
         },
         isCancelled
       )
@@ -1336,6 +1437,391 @@ export class PiAcpSession {
     const previous = this.userNamedSession
     this.userNamedSession = named
     return previous
+  }
+
+  /** Seed an authoritative explicit ACP title on restore/attach before any generated title can fire. */
+  seedExplicitTitle(title: string): void {
+    this.explicitTitleGeneration += 1
+    this.userNamedSession = true
+    this.explicitTitleValue = title
+  }
+
+  /**
+   * Synchronously claim an explicit rename generation before any async work.
+   * Prevents generated titles and stale Pi echoes from overriding it.
+   */
+  beginExplicitTitle(title: string): ExplicitTitleSnapshot {
+    const previousUserNamed = this.userNamedSession
+    const previousTitle = this.explicitTitleValue
+    this.explicitTitleGeneration += 1
+    this.userNamedSession = true
+    this.explicitTitleValue = title
+    return { generation: this.explicitTitleGeneration, previousUserNamed, previousTitle }
+  }
+
+  /** Roll back an uncommitted rename only if no newer rename has landed since. */
+  rollbackExplicitTitle(snapshot: ExplicitTitleSnapshot): void {
+    if (this.explicitTitleGeneration !== snapshot.generation) return
+    this.userNamedSession = snapshot.previousUserNamed
+    this.explicitTitleValue = snapshot.previousTitle
+  }
+
+  isExplicitTitleCurrent(generation: number): boolean {
+    return this.explicitTitleGeneration === generation
+  }
+
+  /**
+   * Publish an already-committed ACP explicit title to the live client (without
+   * bumping `updatedAt`) and mirror best-effort to the owned Pi process.
+   */
+  async applyCommittedExplicitTitle(title: string, isStale: () => boolean): Promise<void> {
+    const snapshot = this.beginExplicitTitle(title)
+    const stale = () => this.disposed || isStale() || !this.isExplicitTitleCurrent(snapshot.generation)
+    this.explicitTitleSyncDepth += 1
+    try {
+      await this.syncSessionInfo(title, stale, { includeUpdatedAt: false }).catch(() => {})
+      if (stale() || this.isUnavailable()) return
+      try {
+        await this.proc.setSessionName(title)
+      } catch {
+        // Mirror failure does not roll back the committed ACP overlay title.
+      }
+    } finally {
+      this.explicitTitleSyncDepth = Math.max(0, this.explicitTitleSyncDepth - 1)
+    }
+  }
+
+  /** Run a native explicit-title write while suppressing Pi's synchronous `session_info_changed` echo. */
+  async withExplicitTitleSync<T>(run: () => Promise<T>): Promise<T> {
+    this.explicitTitleSyncDepth += 1
+    try {
+      return await run()
+    } finally {
+      this.explicitTitleSyncDepth = Math.max(0, this.explicitTitleSyncDepth - 1)
+    }
+  }
+
+  /** Best-effort mirror of a seeded explicit title on restore/attach, fenced against stale echoes. */
+  async mirrorExplicitTitleToPi(title: string): Promise<void> {
+    const gen = this.explicitTitleGeneration
+    await this.withExplicitTitleSync(async () => {
+      if (this.disposed || this.isUnavailable() || !this.isExplicitTitleCurrent(gen)) return
+      try {
+        await this.proc.setSessionName(title)
+      } catch {
+        // Best-effort mirror on attach; ACP explicit title fence remains active.
+      }
+    })
+  }
+
+  beginManualCompaction(customInstructions?: string): number {
+    this.suppressTrailingManualCompactionEnd = false
+    const epoch = ++this.manualCompactionEpoch
+    this.activeManualCompaction = {
+      epoch,
+      customInstructions,
+      presented: false,
+      card: null
+    }
+    return epoch
+  }
+
+  private isCommandCancelled(command: ActiveCommand | null): boolean {
+    return Boolean(command && command.cancelled && !this.commandTerminalFailure(command))
+  }
+
+  private newCompactionCard(reason: string): CompactionCard {
+    return {
+      id: `compaction-${randomUUID()}`,
+      reason,
+      settled: false,
+      endingQueued: false,
+      terminalizedByTeardown: false
+    }
+  }
+
+  private enqueueCompactionTerminal(opts: {
+    card: CompactionCard
+    status: 'completed' | 'failed' | 'cancelled'
+    error?: string
+    fromTeardown?: boolean
+    isCancelled?: () => boolean
+    getFailureError?: () => string | undefined
+  }): Promise<void> {
+    opts.card.endingQueued = true
+    if (opts.fromTeardown) opts.card.terminalizedByTeardown = true
+    if (!this.supportsCompactionUpdates) {
+      opts.card.settled = true
+      if (!opts.fromTeardown && this.activeCompaction === opts.card) this.activeCompaction = null
+      return Promise.resolve()
+    }
+    const delivery = this.lastEmit.then(async () => {
+      if (opts.card.settled) return
+      const cancelled = Boolean(opts.isCancelled?.())
+      const failureError = !cancelled ? opts.getFailureError?.() : undefined
+      const finalStatus = cancelled ? 'cancelled' : failureError ? 'failed' : opts.status
+      const rawError = failureError ?? opts.error
+      const sanitizedError = finalStatus === 'failed' && rawError ? sanitizeErrorDetail(rawError) : undefined
+      opts.card.settled = true
+      if (finalStatus === 'cancelled' || opts.fromTeardown || Boolean(failureError)) {
+        opts.card.terminalizedByTeardown = true
+      } else if (this.activeCompaction === opts.card) {
+        this.activeCompaction = null
+      }
+      await this.conn.sessionUpdate({
+        sessionId: this.sessionId,
+        update: {
+          sessionUpdate: 'compaction_update',
+          compactionId: opts.card.id,
+          status: finalStatus,
+          ...(sanitizedError ? { error: sanitizedError } : {})
+        }
+      })
+    })
+    this.lastEmit = delivery.catch(() => {})
+    return delivery
+  }
+
+  async finishManualCompaction(
+    epoch: number,
+    outcome: { ok: true; result: unknown } | { ok: false; error: unknown },
+    ctx: CommandContext
+  ): Promise<void> {
+    const manual = this.activeManualCompaction
+    if (!manual || manual.epoch !== epoch) return
+    this.activeManualCompaction = null
+
+    const commandAtFinish = this.activeCommand
+    const isCancelled = () =>
+      this.isClosing() || (commandAtFinish ? this.isCommandCancelled(commandAtFinish) : ctx.cancelled())
+    const isFailedTerminal = () => Boolean(commandAtFinish && this.commandTerminalFailure(commandAtFinish))
+
+    if (isCancelled()) {
+      this.terminalizeCompaction('cancelled')
+      return
+    }
+    if (isFailedTerminal()) {
+      if (!outcome.ok) this.suppressTrailingManualCompactionEnd = true
+      return
+    }
+    if (manual.presented) return
+
+    const resolveManualCard = async (): Promise<CompactionCard | null> => {
+      let card =
+        manual.card ??
+        (this.activeCompaction && !this.activeCompaction.settled && !this.activeCompaction.endingQueued
+          ? this.activeCompaction
+          : null)
+      if (!card) {
+        card = this.newCompactionCard('manual')
+        this.activeCompaction = card
+        await ctx.sendSessionUpdate({
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: 'compaction_update',
+            compactionId: card.id,
+            status: 'in_progress'
+          }
+        })
+        if (isCancelled()) {
+          this.terminalizeCompaction('cancelled')
+          return null
+        }
+        if (isFailedTerminal()) return null
+      }
+      return card
+    }
+
+    if (!outcome.ok) {
+      this.suppressTrailingManualCompactionEnd = true
+      const msg = outcome.error instanceof Error ? outcome.error.message : String(outcome.error)
+      if (this.supportsCompactionUpdates) {
+        const card = await resolveManualCard()
+        if (!card) return
+        await this.enqueueCompactionTerminal({
+          card,
+          status: 'failed',
+          error: msg,
+          isCancelled
+        })
+        return
+      }
+      this.terminalizeCompaction('failed', msg)
+      return
+    }
+
+    this.suppressTrailingManualCompactionEnd = true
+    if (this.supportsCompactionUpdates) {
+      const card = await resolveManualCard()
+      if (!card) return
+      const summary = extractCompactionSummary(outcome.result)
+      if (summary) {
+        await ctx.sendSessionUpdate({
+          sessionId: this.sessionId,
+          update: {
+            sessionUpdate: 'compaction_summary_chunk',
+            compactionId: card.id,
+            content: { type: 'text', text: summary }
+          }
+        })
+        if (isCancelled()) {
+          this.terminalizeCompaction('cancelled')
+          return
+        }
+        if (isFailedTerminal()) return
+      }
+      await this.enqueueCompactionTerminal({
+        card,
+        status: 'completed',
+        isCancelled,
+        getFailureError: () => (commandAtFinish ? this.commandTerminalFailure(commandAtFinish)?.message : undefined)
+      })
+      return
+    }
+
+    this.activeCompaction = null
+    await ctx.sendSessionUpdate({
+      sessionId: this.sessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: formatManualCompactionLegacyText(manual.customInstructions, outcome.result)
+        }
+      }
+    })
+  }
+
+  private handleCompactionStart(ev: PiRpcEvent): void {
+    const reason = stringProp(ev, 'reason') ?? 'manual'
+    this.suppressTrailingManualCompactionEnd = false
+
+    if (
+      this.supportsCompactionUpdates &&
+      this.activeCompaction &&
+      !this.activeCompaction.settled &&
+      !this.activeCompaction.endingQueued
+    ) {
+      if (reason === 'overflow' && this.activeCompaction.reason === 'overflow') {
+        return
+      }
+      this.terminalizeCompaction('cancelled')
+    }
+
+    const card = this.newCompactionCard(reason)
+    this.activeCompaction = card
+    if (this.activeManualCompaction && !this.activeManualCompaction.presented) {
+      this.activeManualCompaction.card = card
+    }
+
+    if (this.supportsCompactionUpdates) {
+      this.emit({
+        sessionUpdate: 'compaction_update',
+        compactionId: card.id,
+        status: 'in_progress'
+      })
+      return
+    }
+
+    if (this.activeManualCompaction && !this.activeManualCompaction.presented) {
+      // Legacy manual /compact renders one concise completion block rather than
+      // duplicating progress + completion text.
+      return
+    }
+    const label =
+      reason === 'overflow'
+        ? 'Context overflow; compacting to recover...'
+        : reason === 'threshold'
+          ? 'Context nearing limit; compacting...'
+          : 'Compacting context...'
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: label } satisfies ContentBlock
+    })
+  }
+
+  private handleCompactionEnd(ev: PiRpcEvent): void {
+    const reason = stringProp(ev, 'reason') ?? this.activeCompaction?.reason ?? 'manual'
+    if (this.suppressTrailingManualCompactionEnd && (reason === 'manual' || !ev.reason)) {
+      this.suppressTrailingManualCompactionEnd = false
+      if (this.activeCompaction?.settled || this.activeCompaction?.terminalizedByTeardown) {
+        this.activeCompaction = null
+      }
+      return
+    }
+    if (this.activeCompaction?.settled === true || this.activeCompaction?.terminalizedByTeardown === true) {
+      // Drop one late end belonging to an already-terminalized card (abort/exit),
+      // then clear the spent entry so a later standalone compaction_end works.
+      const matchesSettled = !ev.reason || ev.reason === this.activeCompaction.reason
+      this.activeCompaction = null
+      if (matchesSettled) return
+    }
+
+    const errorMessage = stringProp(ev, 'errorMessage')
+    const aborted = (ev as { aborted?: unknown }).aborted === true
+    const manual =
+      this.activeManualCompaction && !this.activeManualCompaction.presented ? this.activeManualCompaction : null
+    if (manual) manual.presented = true
+
+    if (this.supportsCompactionUpdates) {
+      let card =
+        this.activeCompaction && !this.activeCompaction.settled && !this.activeCompaction.endingQueued
+          ? this.activeCompaction
+          : null
+      if (!card) {
+        card = this.newCompactionCard(reason)
+        this.activeCompaction = card
+      }
+      const commandAtEvent = manual ? this.activeCommand : null
+      if (commandAtEvent && this.commandTerminalFailure(commandAtEvent)) return
+      const turnAtEvent = manual ? null : this.pendingTurn
+      const isCancelled = () =>
+        this.isClosing() || Boolean(turnAtEvent?.cancelled) || this.isCommandCancelled(commandAtEvent)
+      const summary = !errorMessage && !aborted ? extractCompactionSummary(ev.result) : null
+      if (summary) {
+        void this.enqueueUpdate(
+          {
+            sessionUpdate: 'compaction_summary_chunk',
+            compactionId: card.id,
+            content: { type: 'text', text: summary }
+          },
+          () => isCancelled() || Boolean(commandAtEvent && this.commandTerminalFailure(commandAtEvent))
+        )
+      }
+      const status = errorMessage ? 'failed' : aborted ? 'cancelled' : 'completed'
+      void this.enqueueCompactionTerminal({
+        card,
+        status,
+        error: errorMessage ?? undefined,
+        isCancelled,
+        getFailureError: () => (commandAtEvent ? this.commandTerminalFailure(commandAtEvent)?.message : undefined)
+      })
+      return
+    }
+
+    this.activeCompaction = null
+    const text = errorMessage
+      ? `Compaction failed: ${errorMessage}`
+      : aborted
+        ? 'Compaction aborted.'
+        : manual
+          ? formatManualCompactionLegacyText(manual.customInstructions, ev.result)
+          : 'Compaction finished; context was summarized to continue the session.'
+    this.emit({
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text } satisfies ContentBlock
+    })
+  }
+
+  private terminalizeCompaction(status: 'cancelled' | 'failed', error?: string): void {
+    const card = this.activeCompaction
+    if (!card || card.settled) return
+    void this.enqueueCompactionTerminal({
+      card,
+      status,
+      error,
+      fromTeardown: true
+    })
   }
 
   private titleSuperseded(): boolean {
@@ -1358,6 +1844,7 @@ export class PiAcpSession {
     // write below. A rename that reaches pi inside that one write's round trip
     // cannot be withdrawn without a conditional write in pi's RPC, so the
     // adapter assumes one writer per session, as the reference agents do.
+    this.suppressedGeneratedTitles.add(payload.title)
     try {
       await this.proc.setSessionName(payload.title)
     } catch {
@@ -1450,6 +1937,15 @@ export class PiAcpSession {
     await this.lastEmit
   }
 
+  private emitToolCallInitial(params: InitialToolCallParams): void {
+    this.emit(this.toolCallStates.begin(params))
+  }
+
+  private emitToolCallDelta(toolCallId: string, patch: ToolCallDeltaPatch): void {
+    const update = this.toolCallStates.delta(toolCallId, patch)
+    if (update) this.emit(update)
+  }
+
   private emitBashToolCall(params: {
     sessionUpdate: 'tool_call' | 'tool_call_update'
     toolCallId: string
@@ -1457,18 +1953,31 @@ export class PiAcpSession {
     args: unknown
     status: 'pending' | 'in_progress'
     locations?: ToolCallLocation[]
+    clearLocations?: boolean
     includeTerminal: boolean
   }): void {
     this.bashToolCallIds.add(params.toolCallId)
     const includeTerminal = params.includeTerminal && this.supportsTerminalOutputMeta
-    this.emit({
-      sessionUpdate: params.sessionUpdate,
-      toolCallId: params.toolCallId,
-      ...(params.sessionUpdate === 'tool_call' ? { name: params.toolName } : {}),
-      title: bashCommand(params.args) ?? params.toolName,
+    const title = bashCommand(params.args) ?? params.toolName
+    if (params.sessionUpdate === 'tool_call') {
+      this.emitToolCallInitial({
+        toolCallId: params.toolCallId,
+        name: params.toolName,
+        title,
+        kind: 'execute',
+        status: params.status,
+        locations: params.locations,
+        ...(includeTerminal ? { content: bashTerminalContent(params.toolCallId) } : {}),
+        ...(includeTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {})
+      })
+      return
+    }
+    this.emitToolCallDelta(params.toolCallId, {
+      title,
       kind: 'execute',
       status: params.status,
       locations: params.locations,
+      clearLocations: params.clearLocations,
       ...(includeTerminal ? { content: bashTerminalContent(params.toolCallId) } : {}),
       ...(includeTerminal ? { _meta: bashTerminalInfoMeta(params.toolCallId, this.cwd) } : {})
     })
@@ -1532,9 +2041,7 @@ export class PiAcpSession {
         if (rawText || imageBearing) this.genericBashSnapshots.set(params.toolCallId, params.result)
         const content = this.coalescedGenericBashUpdate(params.toolCallId, params.result, rawText, imageBearing)
         if (content) {
-          this.emit({
-            sessionUpdate: 'tool_call_update',
-            toolCallId: params.toolCallId,
+          this.emitToolCallDelta(params.toolCallId, {
             status: params.status,
             content
           })
@@ -1542,9 +2049,7 @@ export class PiAcpSession {
         return
       }
       const content = bashOrderedContent(params.result)
-      this.emit({
-        sessionUpdate: 'tool_call_update',
-        toolCallId: params.toolCallId,
+      this.emitToolCallDelta(params.toolCallId, {
         status: params.status,
         ...(content.length ? { content } : {})
       })
@@ -1563,17 +2068,16 @@ export class PiAcpSession {
       content: { type: 'image', data: image.data, mimeType: image.mimeType }
     }))
 
-    this.emit({
-      sessionUpdate: 'tool_call_update',
-      toolCallId: params.toolCallId,
+    const meta: Record<string, unknown> = {
+      ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
+      ...(params.status === 'completed' || params.status === 'failed'
+        ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
+        : {})
+    }
+    this.emitToolCallDelta(params.toolCallId, {
       status: params.status,
       ...(imageContent.length ? { content: [...bashTerminalContent(params.toolCallId), ...imageContent] } : {}),
-      _meta: {
-        ...(delta ? bashTerminalOutputMeta(params.toolCallId, delta) : {}),
-        ...(params.status === 'completed' || params.status === 'failed'
-          ? bashTerminalExitMeta(params.toolCallId, bashExitCode(params.result, Boolean(params.isError)))
-          : {})
-      }
+      ...(Object.keys(meta).length ? { _meta: meta } : {})
     })
   }
 
@@ -1590,25 +2094,27 @@ export class PiAcpSession {
     toolName: string
     status: 'pending' | 'in_progress'
     locations?: ToolCallLocation[]
+    clearLocations?: boolean
     rawInput?: unknown
   }): void {
-    const common = {
-      toolCallId: params.toolCallId,
-      status: params.status,
-      ...(params.locations ? { locations: params.locations } : {}),
-      ...(params.rawInput === undefined ? {} : { rawInput: params.rawInput })
+    if (!params.existing) {
+      this.emitToolCallInitial({
+        toolCallId: params.toolCallId,
+        name: params.name,
+        title: params.toolName,
+        kind: toToolKind(params.toolName),
+        status: params.status,
+        locations: params.locations,
+        rawInput: params.rawInput
+      })
+      return
     }
-    this.emit(
-      params.existing
-        ? { sessionUpdate: 'tool_call_update' as const, ...common }
-        : {
-            sessionUpdate: 'tool_call' as const,
-            ...common,
-            ...(params.name ? { name: params.name } : {}),
-            title: params.toolName,
-            kind: toToolKind(params.toolName)
-          }
-    )
+    this.emitToolCallDelta(params.toolCallId, {
+      status: params.status,
+      locations: params.locations,
+      clearLocations: params.clearLocations,
+      rawInput: params.rawInput
+    })
   }
 
   /**
@@ -1620,7 +2126,10 @@ export class PiAcpSession {
   private ensureToolCallStarted(toolCallId: string, name: string | null, args: unknown): boolean {
     const toolName = name ?? 'tool'
     if (this.settledToolCallIds.has(toolCallId)) return false
-    if (this.currentToolCalls.has(toolCallId)) return true
+    if (this.currentToolCalls.has(toolCallId)) {
+      this.currentToolCalls.set(toolCallId, 'in_progress')
+      return true
+    }
 
     this.currentToolCalls.set(toolCallId, 'in_progress')
     const locations = toToolCallLocations(toolName, args, this.cwd)
@@ -1657,6 +2166,7 @@ export class PiAcpSession {
       if (call.id === toolCallId) this.streamedToolCalls.delete(index)
     }
     this.currentToolCalls.delete(toolCallId)
+    this.toolCallStates.delete(toolCallId)
     this.fileSnapshots.delete(toolCallId)
     this.fileMutationToolCallIds.delete(toolCallId)
     this.bashToolCallIds.delete(toolCallId)
@@ -1672,9 +2182,7 @@ export class PiAcpSession {
       // only exist in a snapshot coalescing suppressed.
       const snapshot = this.genericBashSnapshots.get(toolCallId)
       const content = snapshot === undefined ? [] : bashOrderedContent(snapshot)
-      this.emit({
-        sessionUpdate: 'tool_call_update',
-        toolCallId,
+      this.emitToolCallDelta(toolCallId, {
         status: 'failed',
         ...(content.length ? { content } : {}),
         ...(this.bashToolCallIds.has(toolCallId) && this.supportsTerminalOutputMeta
@@ -1683,6 +2191,7 @@ export class PiAcpSession {
       })
       this.cleanupToolCall(toolCallId)
     }
+    this.toolCallStates.clear()
     this.streamedToolCalls.clear()
     this.fileSnapshots.clear()
     this.fileMutationToolCallIds.clear()
@@ -1704,6 +2213,7 @@ export class PiAcpSession {
       owner: crypto.randomUUID(),
       requestOwner: t.requestOwner,
       backgroundActive: false,
+      cancelled: false,
       cancellationPending: false,
       piSettled: false,
       agentRunEverObserved: false,
@@ -1716,6 +2226,9 @@ export class PiAcpSession {
       promptQueued: false,
       expectedPromptText: t.message,
       matchingPromptMessagesToSkip: 0,
+      completedAttemptUsage: null,
+      currentAttemptUsage: null,
+      usageDelivered: false,
       beforeRelease: t.beforeRelease
     }
     this.pendingTurn = turn
@@ -1905,17 +2418,30 @@ export class PiAcpSession {
    * `session/update` so turn-bound notifications are delivered in-turn,
    * resolve, and only then start the next queued adapter prompt.
    */
+  private deliverTurnUsageOnce(turn: PendingTurn, cancelled: boolean): Promise<void> {
+    if (turn.usageDelivered || !turn.promptDispatched || !turn.beforeRelease) return Promise.resolve()
+    turn.usageDelivered = true
+    const ownedUsage = combineOwnedTurnUsage(turn.completedAttemptUsage, turn.currentAttemptUsage)
+    return turn.beforeRelease({ cancelled, ownedUsage }).catch(() => {
+      // Usage capture/publication is best-effort and must not strand the FIFO.
+    })
+  }
+
   private completeTurn(turn: PendingTurn): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
-    if (turn.piRunOwned || !this.piBusyOutOfBand) this.terminalizeToolCalls()
+    if (turn.piRunOwned || !this.piBusyOutOfBand) {
+      this.terminalizeToolCalls()
+      this.terminalizeCompaction(this.cancelRequested || turn.cancelled ? 'cancelled' : 'failed')
+    }
     this.clearDeferredDispatch()
     this.settleSubagentChildren()
-    const reason: StopReason = this.cancelRequested
-      ? 'cancelled'
-      : this.lastDoneReason === 'length'
-        ? 'max_tokens'
-        : 'end_turn'
+    const reason: StopReason =
+      this.cancelRequested || turn.cancelled
+        ? 'cancelled'
+        : this.lastDoneReason === 'length'
+          ? 'max_tokens'
+          : 'end_turn'
 
     void (async () => {
       try {
@@ -1924,7 +2450,8 @@ export class PiAcpSession {
           await this.syncSessionConfiguration(undefined, undefined, () => this.isClosing()).catch(() => {})
         }
         await this.flushEmits()
-        if (turn.promptDispatched) await turn.beforeRelease?.()
+        const finalCancelled = reason === 'cancelled' || this.cancelRequested || turn.cancelled
+        await this.deliverTurnUsageOnce(turn, finalCancelled)
       } catch {
         // Usage capture/publication is best-effort and must not strand the FIFO.
       } finally {
@@ -1940,7 +2467,13 @@ export class PiAcpSession {
   private failTurn(turn: PendingTurn, err: unknown, piSettled = false): void {
     if (this.pendingTurn !== turn || turn.completionStarted) return
     turn.completionStarted = true
-    if (turn.piRunOwned || !this.piBusyOutOfBand) this.terminalizeToolCalls()
+    if (turn.piRunOwned || !this.piBusyOutOfBand) {
+      this.terminalizeToolCalls()
+      this.terminalizeCompaction(
+        this.cancelRequested ? 'cancelled' : 'failed',
+        this.cancelRequested ? undefined : err instanceof Error ? err.message : String(err)
+      )
+    }
     this.clearDeferredDispatch()
     this.settleSubagentChildren()
 
@@ -1955,30 +2488,32 @@ export class PiAcpSession {
       .then(() => this.flushEmits())
       .finally(() => {
         const cancelled = this.cancelRequested
-        const queued = this.turnQueue.splice(0, this.turnQueue.length)
-        this.pendingTurn = null
+        void this.deliverTurnUsageOnce(turn, true).finally(() => {
+          const queued = this.turnQueue.splice(0, this.turnQueue.length)
+          this.pendingTurn = null
 
-        // Queue notifications may have been appended while the first flush was
-        // blocked. Capture and flush them after closing the queue, before settling
-        // either the failed request or any drained queued requests.
-        void this.flushEmits().finally(() => {
-          if (cancelled) {
-            // ACP cancellation semantics dominate all underlying failures,
-            // including auth-looking stderr from a process being torn down.
-            turn.resolve('cancelled')
-            this.settleCancelledQueue(queued)
-          } else {
-            // Non-auth, non-cancel failures must reject the ACP request rather
-            // than masquerade as a successful end_turn.
-            const failure = this.toTurnFailure(err)
-            turn.reject(failure)
-            this.rejectQueued(queued, failure)
-          }
+          // Queue notifications may have been appended while the first flush was
+          // blocked. Capture and flush them after closing the queue, before settling
+          // either the failed request or any drained queued requests.
+          void this.flushEmits().finally(() => {
+            if (cancelled) {
+              // ACP cancellation semantics dominate all underlying failures,
+              // including auth-looking stderr from a process being torn down.
+              turn.resolve('cancelled')
+              this.settleCancelledQueue(queued)
+            } else {
+              // Non-auth, non-cancel failures must reject the ACP request rather
+              // than masquerade as a successful end_turn.
+              const failure = this.toTurnFailure(err)
+              turn.reject(failure)
+              this.rejectQueued(queued, failure)
+            }
 
-          // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
-          // new prompt can start after the atomic queue close above; in that case
-          // its own running metadata is authoritative and must not be overwritten.
-          if (!this.isBusy()) this.publishQueueState(false, 0)
+            // Do not auto-run drained prompts: pi may be unhealthy. A genuinely
+            // new prompt can start after the atomic queue close above; in that case
+            // its own running metadata is authoritative and must not be overwritten.
+            if (!this.isBusy()) this.publishQueueState(false, 0)
+          })
         })
       })
   }
@@ -2148,13 +2683,26 @@ export class PiAcpSession {
         const name = ev.name
         if (name !== undefined && typeof name !== 'string') break
         if (name?.trim()) this.sessionNameSeen = true
+        // Suppress synchronous native echoes while an explicit title sync or
+        // restore mirror is in flight so they cannot bump updatedAt or publish
+        // a pre-response update before the caller commits/publishes.
+        if (this.explicitTitleSyncDepth > 0) break
+        if (
+          this.explicitTitleValue !== null &&
+          name !== this.explicitTitleValue &&
+          name !== undefined &&
+          this.suppressedGeneratedTitles.has(name)
+        ) {
+          break
+        }
         // A claimed FIFO slot may still be parked behind foreign work. Capture
         // only an executing command so its echo keeps that command's lifetime.
         const command = this.activeAdapterPromptTurns > 0 ? this.activeCommand : null
         const isCancelled = command
           ? () => command.cancelled || Boolean(this.commandTerminalFailure(command))
           : undefined
-        void this.syncSessionInfo(name, isCancelled).catch(() => {})
+        const includeUpdatedAt = !(this.explicitTitleValue !== null && name === this.explicitTitleValue)
+        void this.syncSessionInfo(name, isCancelled, { includeUpdatedAt }).catch(() => {})
         break
       }
 
@@ -2196,6 +2744,10 @@ export class PiAcpSession {
 
       case 'message_update': {
         const ame = ev.assistantMessageEvent as PiAssistantMessageEvent | undefined
+        if (ownsPiTurn && turn) {
+          const sample = extractPiEventUsage(ev, ame)
+          if (sample) turn.currentAttemptUsage = sample
+        }
 
         if (ame?.type === 'text_delta' && typeof ame.delta === 'string') {
           this.emit({
@@ -2225,20 +2777,33 @@ export class PiAcpSession {
                 partialArgs?: unknown
               }
             | undefined
+          const bufferedBefore = this.streamedToolCalls.get(contentIndex)
+          const explicitId =
+            typeof whole?.id === 'string' && whole.id ? whole.id : typeof ame.id === 'string' && ame.id ? ame.id : ''
+          const toolCallId = explicitId || bufferedBefore?.id || ''
+
+          if (toolCallId) {
+            if (this.settledToolCallIds.has(toolCallId) || this.currentToolCalls.get(toolCallId) === 'in_progress') {
+              if (ame.type === 'toolcall_end' && bufferedBefore?.id === toolCallId) {
+                this.streamedToolCalls.delete(contentIndex)
+              }
+              break
+            }
+          }
+
           if (ame.type === 'toolcall_start') {
-            const id = typeof ame.id === 'string' ? ame.id : typeof whole?.id === 'string' ? whole.id : ''
+            if (!explicitId) break
             const name =
               typeof ame.toolName === 'string' ? ame.toolName : typeof whole?.name === 'string' ? whole.name : null
-            if (this.settledToolCallIds.has(id)) break
-            if (id)
-              this.streamedToolCalls.set(contentIndex, {
-                id,
-                name,
-                argumentsText: ''
-              })
+            this.streamedToolCalls.set(contentIndex, {
+              id: explicitId,
+              name,
+              argumentsText: ''
+            })
           }
           const buffered = this.streamedToolCalls.get(contentIndex)
-          if (ame.type === 'toolcall_delta' && buffered) {
+          const matchedBuffer = buffered && (!explicitId || buffered.id === explicitId) ? buffered : undefined
+          if (ame.type === 'toolcall_delta' && matchedBuffer) {
             const delta =
               typeof ame.argumentsDelta === 'string'
                 ? ame.argumentsDelta
@@ -2247,20 +2812,18 @@ export class PiAcpSession {
                   : typeof whole?.partialArgs === 'string'
                     ? whole.partialArgs
                     : ''
-            buffered.argumentsText += delta
+            matchedBuffer.argumentsText += delta
           }
 
-          const toolCallId = String(whole?.id ?? ame.id ?? buffered?.id ?? '')
           const name =
             typeof whole?.name === 'string'
               ? whole.name
               : typeof ame.toolName === 'string'
                 ? ame.toolName
-                : buffered?.name
-          const toolName = String(whole?.name ?? ame.toolName ?? buffered?.name ?? 'tool')
+                : matchedBuffer?.name
+          const toolName = String(whole?.name ?? ame.toolName ?? matchedBuffer?.name ?? 'tool')
 
           if (toolCallId) {
-            if (this.settledToolCallIds.has(toolCallId)) break
             if (toolName === 'subagent') this.subagentToolCallIds.add(toolCallId)
             if (ame.type === 'toolcall_delta' && this.subagentToolCallIds.has(toolCallId)) break
 
@@ -2269,7 +2832,7 @@ export class PiAcpSession {
                 ? whole.arguments
                 : (() => {
                     const s =
-                      typeof whole?.partialArgs === 'string' ? whole.partialArgs : (buffered?.argumentsText ?? '')
+                      typeof whole?.partialArgs === 'string' ? whole.partialArgs : (matchedBuffer?.argumentsText ?? '')
                     if (!s) return undefined
                     try {
                       return JSON.parse(s)
@@ -2277,10 +2840,13 @@ export class PiAcpSession {
                       return { partialArgs: s }
                     }
                   })()
-            if (ame.type === 'toolcall_end') this.streamedToolCalls.delete(contentIndex)
+            if (ame.type === 'toolcall_end' && buffered?.id === toolCallId) {
+              this.streamedToolCalls.delete(contentIndex)
+            }
 
             const locations =
               ame.type === 'toolcall_delta' ? undefined : toToolCallLocations(toolName, rawInput, this.cwd)
+            const clearLocations = ame.type !== 'toolcall_delta' && locations === undefined
             const existingStatus = this.currentToolCalls.get(toolCallId)
             // IMPORTANT: never downgrade status (e.g. if we already marked in_progress via tool_execution_start).
             const status = existingStatus ?? 'pending'
@@ -2294,6 +2860,7 @@ export class PiAcpSession {
                 args: rawInput,
                 status,
                 locations,
+                clearLocations,
                 includeTerminal: !existingStatus
               })
             } else {
@@ -2307,6 +2874,7 @@ export class PiAcpSession {
                 toolName,
                 status,
                 locations,
+                clearLocations,
                 rawInput
               })
             }
@@ -2326,8 +2894,17 @@ export class PiAcpSession {
               content?: unknown
               stopReason?: unknown
               errorMessage?: unknown
+              usage?: unknown
             }
           | undefined
+
+        if (message?.role === 'assistant' && ownsPiTurn && turn) {
+          const sample = extractPiUsage(message.usage) ?? turn.currentAttemptUsage
+          if (sample) {
+            turn.completedAttemptUsage = addUsage(turn.completedAttemptUsage, sample)
+            turn.currentAttemptUsage = null
+          }
+        }
 
         // pi >= 1.2 delivers every assistant boundary — including terminal
         // failures — through `message_end`; `done`/`error` never arrive as
@@ -2402,6 +2979,7 @@ export class PiAcpSession {
             args,
             status: 'in_progress',
             locations,
+            clearLocations: locations === undefined,
             includeTerminal: !existingStatus
           })
           break
@@ -2412,10 +2990,8 @@ export class PiAcpSession {
         let snapshotOldText: string | null | undefined
         if (isFileMutation) {
           this.fileMutationToolCallIds.add(toolCallId)
-          const p = getToolPath(args)
-          if (p) {
-            // ACP Diff requires an absolute path; pi may report a cwd-relative one.
-            const abs = isAbsolute(p) ? p : resolvePath(this.cwd, p)
+          const abs = resolveValidToolPath(getToolPath(args), this.cwd)
+          if (abs) {
             snapshotOldText = fileSnapshot(abs)
             if (snapshotOldText !== undefined) {
               this.fileSnapshots.set(toolCallId, {
@@ -2444,6 +3020,7 @@ export class PiAcpSession {
           toolName,
           status: 'in_progress',
           locations,
+          clearLocations: locations === undefined,
           rawInput: args
         })
 
@@ -2462,14 +3039,24 @@ export class PiAcpSession {
         }
         if (this.subagentToolCallIds.has(toolCallId)) break
 
-        const content = this.fileMutationToolCallIds.has(toolCallId) ? [] : toolResultToolCallContent(partial)
+        if (this.fileMutationToolCallIds.has(toolCallId)) {
+          const previewDiff = (partial as { details?: { diff?: unknown } } | null | undefined)?.details?.diff
+          if (typeof previewDiff === 'string' && previewDiff.trim()) {
+            const previewContent = toolResultToolCallContent(partial)
+            this.toolCallStates.recordDiffPreview(toolCallId, previewContent)
+            this.emitToolCallDelta(toolCallId, {
+              status: 'in_progress',
+              ...(previewContent.length ? { content: previewContent } : {})
+            })
+          }
+          break
+        }
 
-        this.emit({
-          sessionUpdate: 'tool_call_update',
-          toolCallId,
+        const content = toolResultToolCallContent(partial)
+        this.emitToolCallDelta(toolCallId, {
           status: 'in_progress',
-          content: content.length ? content : undefined,
-          ...(this.fileMutationToolCallIds.has(toolCallId) ? {} : { rawOutput: partial })
+          ...(content.length ? { content } : {}),
+          rawOutput: partial
         })
         break
       }
@@ -2494,6 +3081,7 @@ export class PiAcpSession {
         }
 
         const orderedContent = toolResultToolCallContent(result)
+        const diffPreview = this.toolCallStates.getDiffPreview(toolCallId)
 
         const snapshot = this.fileSnapshots.get(toolCallId)
         let content: ToolCallContent[] | undefined
@@ -2519,15 +3107,20 @@ export class PiAcpSession {
           // blocks are still preserved after it.
           const images = orderedContent.filter(item => item.type === 'content' && item.content.type === 'image')
           if (images.length) content = [...content, ...images]
+        } else if (!isError && diffPreview?.hadDiffPreview && !resultHasDetailsDiff(result)) {
+          // Final diff generation failed after a diff preview was already shown:
+          // preserve the prior diff preview instead of overwriting it with terse text.
+          const images = orderedContent.filter(item => item.type === 'content' && item.content.type === 'image')
+          if (images.length && diffPreview.lastDiffContent?.length) {
+            content = [...diffPreview.lastDiffContent, ...images]
+          }
         } else if (orderedContent.length) {
           content = orderedContent
         }
 
-        this.emit({
-          sessionUpdate: 'tool_call_update',
-          toolCallId,
+        this.emitToolCallDelta(toolCallId, {
           status: isError ? 'failed' : 'completed',
-          content,
+          ...(content !== undefined ? { content } : {}),
           ...(hasStructuredDiff ? {} : { rawOutput: result })
         })
 
@@ -2541,30 +3134,34 @@ export class PiAcpSession {
       }
 
       case 'summarization_retry_scheduled': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: `Summarization: ${formatAutoRetryMessage(ev)}` }
+        const detail = formatAutoRetryMessage(ev)
+        this.emitNotice({
+          severity: 'warning',
+          title: 'Retrying summarization',
+          description: detail,
+          fallbackText: `Summarization: ${detail}`
         })
         break
       }
 
       case 'summarization_retry_attempt_start':
       case 'summarization_retry_finished': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: {
-            type: 'text',
-            text:
-              type === 'summarization_retry_finished' ? 'Summarization retry finished.' : 'Retrying summarization...'
-          }
+        const finished = type === 'summarization_retry_finished'
+        this.emitNotice({
+          severity: 'info',
+          title: finished ? 'Summarization retry finished' : 'Retrying summarization',
+          fallbackText: finished ? 'Summarization retry finished.' : 'Retrying summarization...'
         })
         break
       }
 
       case 'auto_retry_start': {
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: formatAutoRetryMessage(ev) } satisfies ContentBlock
+        const detail = formatAutoRetryMessage(ev)
+        this.emitNotice({
+          severity: 'warning',
+          title: 'Retrying request',
+          description: detail,
+          fallbackText: detail
         })
         break
       }
@@ -2574,17 +3171,22 @@ export class PiAcpSession {
           const finalError = stringProp(ev, 'finalError')
           const text = finalError ? `Automatic retry failed: ${finalError}` : 'Automatic retry failed.'
           if (ownsPiTurn || (!turn && !this.piBusyOutOfBand)) this.turnFailure = new Error(text)
-          this.emit({
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text } satisfies ContentBlock
+          this.emitNotice({
+            severity: 'error',
+            title: 'Automatic retry failed',
+            ...(finalError ? { description: sanitizeErrorDetail(finalError) } : {}),
+            fallbackText: text,
+            preSanitized: true
           })
           break
         }
 
         if (ownsPiTurn || (!turn && !this.piBusyOutOfBand)) this.turnFailure = null
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: 'Retry finished, resuming.' } satisfies ContentBlock
+        this.emitNotice({
+          severity: 'info',
+          title: 'Retry succeeded',
+          description: 'Resuming response.',
+          fallbackText: 'Retry finished, resuming.'
         })
         break
       }
@@ -2722,32 +3324,12 @@ export class PiAcpSession {
       }
 
       case 'compaction_start': {
-        const reason = stringProp(ev, 'reason')
-        const label =
-          reason === 'overflow'
-            ? 'Context overflow; compacting to recover...'
-            : reason === 'threshold'
-              ? 'Context nearing limit; compacting...'
-              : 'Compacting context...'
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text: label } satisfies ContentBlock
-        })
+        this.handleCompactionStart(ev)
         break
       }
 
       case 'compaction_end': {
-        const errorMessage = stringProp(ev, 'errorMessage')
-        const aborted = (ev as { aborted?: unknown }).aborted === true
-        const text = errorMessage
-          ? `Compaction failed: ${errorMessage}`
-          : aborted
-            ? 'Compaction aborted.'
-            : 'Compaction finished; context was summarized to continue the session.'
-        this.emit({
-          sessionUpdate: 'agent_message_chunk',
-          content: { type: 'text', text } satisfies ContentBlock
-        })
+        this.handleCompactionEnd(ev)
         break
       }
 
@@ -2889,9 +3471,17 @@ export class PiAcpSession {
     }
 
     if (method === 'notify') {
-      this.emit({
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: stringProp(ev, 'message') ?? 'Pi notification' } satisfies ContentBlock
+      const rawMessage = stringProp(ev, 'message')
+      const notifyType = stringProp(ev, 'notifyType')?.toLowerCase()
+      const severity: 'info' | 'warning' | 'error' =
+        notifyType === 'error' ? 'error' : notifyType === 'warning' || notifyType === 'warn' ? 'warning' : 'info'
+      const { title, description } = splitNotifyText(rawMessage)
+      this.emitNotice({
+        severity,
+        title,
+        ...(description ? { description } : {}),
+        fallbackText: rawMessage ?? 'Pi notification',
+        preSanitized: true
       })
       return
     }
@@ -3046,7 +3636,8 @@ export class PiAcpSession {
 
 function extensionUiToolCall(id: string, ev: PiRpcEvent) {
   const method = stringProp(ev, 'method') ?? 'ui'
-  const title = stringProp(ev, 'title') ?? `Pi ${method}`
+  const fallback = method === 'confirm' ? 'Pi confirmation' : method === 'select' ? 'Pi choice' : `Pi ${method}`
+  const title = compactPlainTitle(stringProp(ev, 'title')) ?? compactPlainTitle(stringProp(ev, 'message')) ?? fallback
   const rawInput: Record<string, unknown> = { method }
 
   for (const key of EXTENSION_UI_RAW_INPUT_KEYS) {

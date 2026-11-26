@@ -110,6 +110,7 @@ export async function replaySessionHistory({
   )
 
   const replayedToolCallIds = new Set<string>()
+  const settledToolCallIds = new Set<string>()
   // Assistant tool calls that never see a durable toolResult on the
   // branch; closed as failed after the walk (see below).
   const openToolCalls = new Map<string, { isBash: boolean }>()
@@ -164,7 +165,11 @@ export async function replaySessionHistory({
         }
 
         // Reconstruct the tool call from the assistant block; the matching
-        // toolResult later upgrades it to its terminal status.
+        // toolResult later upgrades it to its terminal status. Skip duplicates
+        // so repeated IDs cannot downgrade a settled call or re-open it.
+        if (replayedToolCallIds.has(block.toolCallId) || settledToolCallIds.has(block.toolCallId)) {
+          continue
+        }
         replayedToolCallIds.add(block.toolCallId)
         const isBash = isBashTool(block.toolName)
         openToolCalls.set(block.toolCallId, { isBash })
@@ -177,6 +182,7 @@ export async function replaySessionHistory({
               })
             : undefined
         ) as { name?: unknown } | undefined
+        const locations = toToolCallLocations(block.toolName, block.rawInput, cwd)
         await sendUpdate({
           sessionId: session.sessionId,
           update: {
@@ -187,7 +193,7 @@ export async function replaySessionHistory({
             kind: isBash ? 'execute' : toToolKind(block.toolName),
             status: 'pending',
             rawInput: block.rawInput,
-            locations: toToolCallLocations(block.toolName, block.rawInput, cwd),
+            ...(locations ? { locations } : {}),
             ...(isBash && supportsTerminalOutputMeta
               ? {
                   content: bashTerminalContent(block.toolCallId),
@@ -220,9 +226,11 @@ export async function replaySessionHistory({
     if (role === 'toolResult') {
       const toolName = String(m?.toolName ?? 'tool')
       const toolCallId = typeof m?.toolCallId === 'string' && m.toolCallId ? m.toolCallId : `pi-load-${entryId}`
+      if (settledToolCallIds.has(toolCallId)) continue
       const isError = Boolean(m?.isError)
       const alreadyReplayed = replayedToolCallIds.has(toolCallId)
       replayedToolCallIds.add(toolCallId)
+      settledToolCallIds.add(toolCallId)
       openToolCalls.delete(toolCallId)
 
       if (isBashTool(toolName)) {
@@ -302,7 +310,7 @@ export async function replaySessionHistory({
           sessionUpdate: 'tool_call_update',
           toolCallId,
           status: isError ? 'failed' : 'completed',
-          content: content.length ? content : null,
+          ...(content.length ? { content } : {}),
           rawOutput: m
         }
       })

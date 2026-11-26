@@ -2,7 +2,9 @@ import { RequestError, type AvailableCommand, type PromptResponse } from '@agent
 import { open } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import type { CommandContext, PiAcpSession } from './session.js'
+import type { CommandContext, ExplicitTitleSnapshot, PiAcpSession } from './session.js'
+import { toRequestError } from './session-errors.js'
+import { normalizeExplicitTitle } from './session-title.js'
 import { piRecord } from '../pi-rpc/protocol.js'
 
 export function builtinAvailableCommands(): AvailableCommand[] {
@@ -68,6 +70,11 @@ async function hasExportableSessionFile(path: string): Promise<boolean> {
   }
 }
 
+export type PersistExplicitTitleResult = {
+  snapshot: ExplicitTitleSnapshot
+  rollback?: () => Promise<void> | void
+}
+
 /**
  * `rawArgs` is the unparsed remainder after the command name, preserved
  * verbatim for free-text commands (/name, /compact) so apostrophes, quotes
@@ -78,7 +85,10 @@ export async function runBuiltinCommand(
   cmd: string,
   args: string[],
   ctx: CommandContext,
-  rawArgs: string
+  rawArgs: string,
+  opts?: {
+    persistExplicitTitle?: (title: string, isCancelled: () => boolean) => Promise<PersistExplicitTitleResult | null>
+  }
 ): Promise<PromptResponse> {
   const say = (text: string) =>
     ctx.sendSessionUpdate({
@@ -98,21 +108,15 @@ export async function runBuiltinCommand(
 
   if (cmd === 'compact') {
     const customInstructions = rawArgs.trim() || undefined
-    const res = await session.proc.compact(customInstructions)
-
-    const r = res && typeof res === 'object' ? (res as { tokensBefore?: unknown; summary?: unknown }) : null
-    const tokensBefore = typeof r?.tokensBefore === 'number' ? r.tokensBefore : null
-    const summary = typeof r?.summary === 'string' ? r.summary : null
-
-    const headerLines = [
-      `Compaction completed.${customInstructions ? ' (custom instructions applied)' : ''}`,
-      tokensBefore !== null ? `Tokens before: ${tokensBefore}` : null
-    ].filter(Boolean)
-
-    const text = headerLines.join('\n') + (summary ? `\n\n${summary}` : '')
-
-    await say(text)
-
+    const epoch = session.beginManualCompaction(customInstructions)
+    let res: unknown
+    try {
+      res = await session.proc.compact(customInstructions)
+    } catch (error) {
+      await session.finishManualCompaction(epoch, { ok: false, error }, ctx)
+      throw error
+    }
+    await session.finishManualCompaction(epoch, { ok: true, result: res }, ctx)
     return { stopReason: 'end_turn' }
   }
 
@@ -145,20 +149,52 @@ export async function runBuiltinCommand(
   }
 
   if (cmd === 'name') {
-    const name = rawArgs.trim()
+    const name = normalizeExplicitTitle(rawArgs)
     if (!name) {
       await say('Usage: /name <name>')
       return { stopReason: 'end_turn' }
     }
 
-    // A user rename is authoritative: a generated title must never replace it.
-    const wasNamed = session.markUserSessionName()
+    if (ctx.cancelled()) return { stopReason: 'end_turn' }
+
+    // Durable-first overlay commit matching session/set_title: storage failures
+    // fail closed before mutating live state, calling Pi, or reporting success.
+    // Claiming live generation inside persistExplicitTitle keeps generation
+    // order aligned with disk revision order.
+    let snapshot: ExplicitTitleSnapshot
+    let rollbackOverlay: (() => Promise<void> | void) | undefined
+    if (opts?.persistExplicitTitle) {
+      try {
+        const persisted = await opts.persistExplicitTitle(name, ctx.cancelled)
+        if (!persisted) return { stopReason: 'end_turn' }
+        snapshot = persisted.snapshot
+        rollbackOverlay = persisted.rollback
+      } catch (e: unknown) {
+        throw toRequestError(e)
+      }
+    } else {
+      snapshot = session.beginExplicitTitle(name)
+    }
+
+    // Recheck cancellation after acquiring the serialized title queue and before
+    // mirroring to Pi: roll back any just-committed overlay if cancelled in flight.
+    if (ctx.cancelled()) {
+      if (session.isExplicitTitleCurrent(snapshot.generation)) {
+        await rollbackOverlay?.()
+      }
+      session.rollbackExplicitTitle(snapshot)
+      return { stopReason: 'end_turn' }
+    }
 
     try {
-      await session.proc.setSessionName(name)
+      await session.withExplicitTitleSync(() => session.proc.setSessionName(name))
     } catch (e: unknown) {
-      // A failed rename leaves the session as it was named before this attempt.
-      session.markUserSessionName(wasNamed)
+      // A failed rename leaves the session as it was named before this attempt
+      // unless a newer explicit rename has already superseded it.
+      if (session.isExplicitTitleCurrent(snapshot.generation)) {
+        await rollbackOverlay?.()
+      }
+      session.rollbackExplicitTitle(snapshot)
       const msg = String(e instanceof Error ? e.message : e)
       const hint = /set_session_name/i.test(msg)
         ? ' This requires a newer pi version that supports `set_session_name` in RPC mode.'
@@ -173,7 +209,9 @@ export async function runBuiltinCommand(
     // is re-checked inside the serialized publication queue, where this can
     // wait behind unrelated session-info work.
     if (ctx.cancelled()) return { stopReason: 'end_turn' }
-    await session.syncSessionInfo(name, ctx.cancelled)
+    await session.syncSessionInfo(name, () => ctx.cancelled() || !session.isExplicitTitleCurrent(snapshot.generation), {
+      includeUpdatedAt: false
+    })
 
     await say(`Session name set: ${name}`)
 

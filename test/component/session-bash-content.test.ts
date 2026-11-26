@@ -291,8 +291,8 @@ test('PiAcpSession: identical rolling windows with progress still append the new
   )
   assert.deepEqual(
     retransmitted,
-    [window, undefined, annotation],
-    'a retransmitted window without progress appends nothing; the final annotation still lands once'
+    [window, annotation],
+    'a retransmitted window without progress emits no empty update; the final annotation still lands once'
   )
 })
 
@@ -341,8 +341,8 @@ test('PiAcpSession: a blank tail line survives zero-text progress and the next l
   )
   assert.deepEqual(
     deltas,
-    [w1, '\n', undefined, '\nnext', annotation],
-    'the open line, its terminator, the blank line via state, then the next line behind its separator'
+    [w1, '\n', '\nnext', annotation],
+    'the open line, its terminator, the blank line via state (no empty update), then the next line behind its separator'
   )
 })
 
@@ -409,8 +409,8 @@ test('PiAcpSession: terminal deltas keep a verbatim tail terminator after a trim
   )
   assert.deepEqual(
     deltas,
-    [giantTail, undefined, 'v\n', wWindow, annotation],
-    'the empty snapshot emits nothing, the verbatim terminator is real, and the joined window follows it directly'
+    [giantTail, 'v\n', wWindow, annotation],
+    'the empty snapshot emits no update, the verbatim terminator is real, and the joined window follows it directly'
   )
 })
 

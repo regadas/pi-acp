@@ -59,7 +59,6 @@
         "update": {
           "sessionUpdate": "tool_call_update",
           "toolCallId": "t1",
-          "status": "in_progress",
           "content": [{ "type": "content", "content": { "type": "text", "text": "```console\nrunning\n```" } }]
         }
       },

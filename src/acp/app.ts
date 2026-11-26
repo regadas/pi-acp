@@ -81,6 +81,8 @@ export function createPiAcpAgentApp(opts?: {
     .onRequest(methods.agent.session.resume, ctx => getInitializedAgent().resumeSession(ctx.params))
     .onRequest(methods.agent.session.close, ctx => getInitializedAgent().closeSession(ctx.params))
     .onRequest(methods.agent.session.delete, ctx => getInitializedAgent().deleteSession(ctx.params))
+    .onRequest(methods.agent.session.status, ctx => getInitializedAgent().sessionStatus(ctx.params))
+    .onRequest(methods.agent.session.setTitle, ctx => getInitializedAgent().setSessionTitle(ctx.params))
     .onRequest(methods.agent.session.setConfigOption, ctx => getInitializedAgent().setSessionConfigOption(ctx.params))
     .onRequest(methods.agent.session.prompt, ctx => getInitializedAgent().prompt(ctx.params, ctx.signal))
     .onNotification(methods.agent.session.cancel, ctx => getInitializedAgent().cancel(ctx.params))
