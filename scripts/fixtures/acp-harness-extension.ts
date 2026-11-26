@@ -152,6 +152,40 @@ export default function (pi: import('@earendil-works/pi-coding-agent').Extension
     ],
     streamSimple(model, context, options) {
       const stream = createAssistantMessageEventStream()
+      // Exclude one-shot session-title generation calls from workspace-instruction
+      // receipts and async delivery gates: they are auxiliary extension calls with
+      // no session system prompt, not conversation turns.
+      const isTitleRequest =
+        context.systemPrompt === undefined &&
+        context.messages.length === 1 &&
+        context.messages[0]?.role === 'user' &&
+        JSON.stringify(context.messages[0].content).includes('Generate a very short title for this conversation')
+      if (isTitleRequest) {
+        const titleMessage = {
+          role: 'assistant' as const,
+          content: [{ type: 'text' as const, text: '{"title":"Eval session"}' }],
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          usage: {
+            input: 1,
+            output: 1,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+          },
+          stopReason: 'stop' as const,
+          timestamp: Date.now()
+        }
+        queueMicrotask(() => {
+          stream.push({ type: 'start', partial: titleMessage })
+          stream.push({ type: 'text_delta', contentIndex: 0, delta: '{"title":"Eval session"}', partial: titleMessage })
+          stream.push({ type: 'done', reason: 'stop', message: titleMessage })
+          stream.end()
+        })
+        return stream
+      }
       reportStatus?.(
         'eval-ws-request',
         JSON.stringify({
